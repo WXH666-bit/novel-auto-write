@@ -1,0 +1,13 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+SQLAlchemy==2.0.52
+alembic==1.19.1
+aiosqlite==0.22.1
+pydantic==2.13.5
+pydantic-settings==2.15.0
+openai==3.6.0
+httpx==0.28.1
+python-multipart==0.0.32
+keyring==25.7.0
+charset-normalizer==3.5.1
+orjson==3.12.0

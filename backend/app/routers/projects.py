@@ -1,0 +1,177 @@
+"""Project and story-map endpoints."""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Response, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..db import get_db, rebuild_search_index
+from ..models import AuditLog, CanonItem, Chapter, PlotThread, Project, TimelineEvent, utcnow
+from ..schemas import (
+    CanonItemRead,
+    PlotThreadRead,
+    ProjectCreate,
+    ProjectRead,
+    ProjectUpdate,
+    StoryMapResponse,
+    TimelineEventRead,
+)
+from . import chapter_payload, require_project
+
+router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+
+@router.get("", response_model=list[ProjectRead])
+def list_projects(db: Session = Depends(get_db)) -> list[ProjectRead]:
+    projects = db.scalars(select(Project).order_by(Project.updated_at.desc())).all()
+    return [ProjectRead.model_validate(project) for project in projects]
+
+
+@router.post("", response_model=ProjectRead, status_code=status.HTTP_201_CREATED)
+def create_project(payload: ProjectCreate, db: Session = Depends(get_db)) -> ProjectRead:
+    project = Project(
+        name=payload.name or payload.title or "未命名项目",
+        description=payload.description,
+        story_bible=payload.story_bible,
+        source_hash=payload.source_hash,
+        source_filename=payload.source_filename,
+        source_encoding=payload.source_encoding,
+        genre=payload.genre,
+        viewpoint=payload.viewpoint,
+        style=payload.style,
+        target_word_count=payload.target_word_count,
+        must_happen=payload.must_happen,
+        must_not_happen=payload.must_not_happen,
+        hard_constraints=payload.hard_constraints,
+        outline=payload.outline,
+    )
+    db.add(project)
+    db.flush()
+    db.add(
+        AuditLog(
+            project=project,
+            action="project.created",
+            entity_type="project",
+            entity_id=project.id,
+        )
+    )
+    db.commit()
+    db.refresh(project)
+    return ProjectRead.model_validate(project)
+
+
+@router.get("/{project_id}", response_model=ProjectRead)
+def get_project(project_id: str, db: Session = Depends(get_db)) -> ProjectRead:
+    return ProjectRead.model_validate(require_project(db, project_id))
+
+
+@router.patch("/{project_id}", response_model=ProjectRead)
+def update_project(
+    project_id: str, payload: ProjectUpdate, db: Session = Depends(get_db)
+) -> ProjectRead:
+    project = require_project(db, project_id)
+    values = payload.model_dump(exclude_unset=True)
+    # Rebuild state is an integrity gate, not a client-editable preference.
+    values.pop("needs_rebuild", None)
+    title = values.pop("title", None)
+    if title is not None:
+        values["name"] = title
+    before = {key: getattr(project, key) for key in values if hasattr(project, key)}
+    for key, value in values.items():
+        if hasattr(project, key):
+            setattr(project, key, value)
+    project.updated_at = utcnow()
+    db.add(
+        AuditLog(
+            project_id=project.id,
+            action="project.updated",
+            entity_type="project",
+            entity_id=project.id,
+            before_json=before,
+            after_json={key: getattr(project, key) for key in values if hasattr(project, key)},
+        )
+    )
+    db.commit()
+    db.refresh(project)
+    return ProjectRead.model_validate(project)
+
+
+@router.post("/{project_id}/memory/rebuild", response_model=ProjectRead)
+def rebuild_project_memory(project_id: str, db: Session = Depends(get_db)) -> ProjectRead:
+    """Promote edited chapter text and quarantine stale derived memory."""
+
+    project = require_project(db, project_id)
+    if not project.needs_rebuild:
+        return ProjectRead.model_validate(project)
+    chapters = db.scalars(
+        select(Chapter).where(
+            Chapter.project_id == project.id,
+            Chapter.status == "needs_review",
+        )
+    ).all()
+    promoted: list[str] = []
+    for chapter in chapters:
+        if chapter.current_revision_id:
+            chapter.accepted_revision_id = chapter.current_revision_id
+            chapter.status = "confirmed"
+            chapter.confirmed_at = utcnow()
+            chapter.summary = None
+            chapter.summary_status = "current"
+            promoted.append(chapter.id)
+    project.needs_rebuild = False
+    db.add(
+        AuditLog(
+            project_id=project.id,
+            action="project.memory_rebuilt",
+            entity_type="project",
+            entity_id=project.id,
+            after_json={
+                "memory_epoch": project.memory_epoch,
+                "promoted_chapter_ids": promoted,
+                "stale_canon_kept_quarantined": True,
+            },
+        )
+    )
+    db.commit()
+    rebuild_search_index(db_engine=db.get_bind())
+    db.refresh(project)
+    return ProjectRead.model_validate(project)
+
+
+@router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project(project_id: str, db: Session = Depends(get_db)) -> Response:
+    project = require_project(db, project_id)
+    db.delete(project)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{project_id}/story-map", response_model=StoryMapResponse)
+def story_map(project_id: str, db: Session = Depends(get_db)) -> StoryMapResponse:
+    project = require_project(db, project_id)
+    chapters = db.scalars(
+        select(Chapter)
+        .where(Chapter.project_id == project_id)
+        .order_by(Chapter.sort_order, Chapter.chapter_number)
+    ).all()
+    canon_items = db.scalars(
+        select(CanonItem).where(CanonItem.project_id == project_id).order_by(CanonItem.created_at)
+    ).all()
+    events = db.scalars(
+        select(TimelineEvent)
+        .where(TimelineEvent.project_id == project_id)
+        .order_by(TimelineEvent.sequence)
+    ).all()
+    threads = db.scalars(
+        select(PlotThread)
+        .where(PlotThread.project_id == project_id)
+        .order_by(PlotThread.created_at)
+    ).all()
+    return StoryMapResponse(
+        project=ProjectRead.model_validate(project),
+        chapters=[chapter_payload(chapter) for chapter in chapters],
+        canon_items=[CanonItemRead.model_validate(item) for item in canon_items],
+        timeline_events=[TimelineEventRead.model_validate(event) for event in events],
+        plot_threads=[PlotThreadRead.model_validate(thread) for thread in threads],
+    )
