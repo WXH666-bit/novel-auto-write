@@ -103,7 +103,7 @@ import AuthScreen, {
   AccountSecurityView,
   getAuthViewFromPath,
 } from "./AuthScreen";
-import InkLandscape from "./InkLandscape";
+import InkLandscape, { InkInteractionLayer } from "./InkLandscape";
 import type {
   AuditIssue,
   CanonChange,
@@ -915,6 +915,7 @@ function Workspace({
   return (
     <div className="app-shell">
       <InkLandscape className="workspace-ink" />
+      <InkInteractionLayer />
       <div
         className="workspace-stage"
         ref={workspaceStageRef}
@@ -1637,6 +1638,7 @@ function WritingDesk({
         />
         {activeChapter ? (
           <EditorPaper
+            key={activeChapter.id}
             chapter={activeChapter}
             content={activeContent}
             onChange={onContentChange}
@@ -3103,7 +3105,9 @@ function JobStrip({
     job.status === "awaiting_review" || job.status === "completed";
   const stalled = job.status === "needs_retry" || job.status === "failed";
   return (
-    <div className={`job-strip ${complete ? "job-ready" : ""}`}>
+    <div
+      className={`job-strip ${complete ? "job-ready" : stalled ? "job-stalled" : "job-running"}`}
+    >
       <div className="job-strip-main">
         <span className={`job-icon ${complete ? "ready" : ""}`}>
           {complete ? (

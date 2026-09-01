@@ -26,7 +26,7 @@ import {
   verifyEmail,
 } from "./api";
 import type { AuthConfig, AuthMode, AuthSession, AuthView } from "./types";
-import InkLandscape from "./InkLandscape";
+import InkLandscape, { InkInteractionLayer } from "./InkLandscape";
 
 type AuthScreenProps = {
   initialView?: AuthView;
@@ -344,6 +344,7 @@ export default function AuthScreen({
 
   return (
     <div className="auth-shell">
+      <InkInteractionLayer />
       <div className="auth-manuscript" aria-hidden="true">
         <InkLandscape className="auth-ink" tone="dark" />
         <div className="auth-manuscript-top">
@@ -365,7 +366,7 @@ export default function AuthScreen({
       </div>
 
       <main className="auth-panel">
-        <div className="auth-panel-inner">
+        <div className="auth-panel-inner" key={currentView}>
           <div className="auth-panel-head">
             <span className="auth-panel-kicker">{copy.eyebrow}</span>
             <div className="auth-panel-lock"><LockKeyhole size={14} /> 私有工作区</div>
@@ -475,6 +476,7 @@ export function AccountSecurityView({
 
   return (
     <div className="account-page">
+      <InkInteractionLayer />
       <div className="account-page-top"><button className="back-to-library" onClick={onBack}><ChevronLeft size={15} /> 返回工作台</button><span className="settings-version">ACCOUNT / SECURITY</span></div>
       <div className="account-hero"><div><p className="eyebrow">ACCOUNT LEDGER</p><h1>账号与安全</h1><p>这是你的私有工作区边界。小说、章节、正典、任务、审核包和 Provider 都只属于当前账号。</p></div><div className="account-seal"><ShieldCheck size={21} /><span>SESSION<br />SEALED</span></div></div>
       <div className="account-layout">
