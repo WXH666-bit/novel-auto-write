@@ -62,6 +62,39 @@ def _source(
     )
 
 
+def _constraint_items(value: Any) -> list[Any]:
+    """Return project constraint values as displayable, non-empty items.
+
+    The current schema stores these fields as JSON lists, while legacy callers
+    and small test doubles may still provide a single string or another scalar.
+    Treat strings as one item (rather than iterating characters) and preserve
+    structured values for the JSON-safe ``safe_text`` formatter below.
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [item for item in value if safe_text(item).strip()]
+    rendered = safe_text(value).strip()
+    return [value] if rendered else []
+
+
+def _constraint_excerpt(label: str, value: Any) -> str:
+    """Render a project constraint list with an explicit, stable structure."""
+
+    items = _constraint_items(value)
+    if not items:
+        return ""
+    lines = [f"{label}："]
+    for index, item in enumerate(items, start=1):
+        rendered = safe_text(item).strip()
+        if rendered:
+            lines.append(f"{index}. {rendered}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def _current_revision(session: Any, chapter: Any, *, accepted_only: bool = False) -> Any | None:
     field = "accepted_revision_id" if accepted_only else "current_revision_id"
     revision_id = _value(chapter, field)
@@ -145,13 +178,29 @@ def build_context(
     if not story_bible:
         story_bible = safe_text(_value(project, "description", ""))
     hard_constraints = _value(project, "hard_constraints", [])
-    if hard_constraints:
-        story_bible = (story_bible + "\n硬约束：" + safe_text(hard_constraints)).strip()
+    hard_excerpt = _constraint_excerpt("硬约束", hard_constraints)
+    if hard_excerpt:
+        # Keep hard constraints in the mandatory story-bible section so they
+        # are never trimmed when the context budget is exhausted.
+        story_bible = (story_bible + "\n" + hard_excerpt).strip()
     outline = safe_text(_value(project, "outline", ""))
     if story_bible:
         mandatory.append(_source("project", project, "故事圣经", story_bible))
     if outline:
         mandatory.append(_source("outline", project, "当前大纲", outline))
+
+    # Project-level generation requirements are durable story settings, not
+    # optional search context.  Keep both lists mandatory and label them
+    # separately so every generation role can distinguish positive and
+    # negative requirements.  They remain in the project row after a run or
+    # review decision; users can edit or clear them explicitly.
+    for label, values in (
+        ("必须发生", _value(project, "must_happen", [])),
+        ("禁止发生", _value(project, "must_not_happen", [])),
+    ):
+        excerpt = _constraint_excerpt(label, values)
+        if excerpt:
+            mandatory.append(_source("project_constraint", project, label, excerpt))
 
     canon_rows = (
         (

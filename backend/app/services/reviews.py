@@ -609,6 +609,7 @@ def accept_review(
         bundle.status = "force_accepted" if serious else "accepted"
         bundle.force_accept_reason = reason or None
         bundle.resolved_at = utcnow()
+        next_run = None
         run = (
             session.scalar(
                 select(GenerationRun).where(GenerationRun.id == bundle.generation_run_id)
@@ -629,6 +630,12 @@ def accept_review(
             if job is not None:
                 job.state = "completed"
                 job.current_stage = "completed"
+            # Allocate only the next chapter, and do so before the acceptance
+            # transaction commits.  Its execution will happen after this
+            # request returns, so its context sees the newly committed canon.
+            from .generation import queue_next_batch_run
+
+            next_run = queue_next_batch_run(session, project, run)
         session.add(
             AuditLog(
                 project_id=project.id,
@@ -643,6 +650,7 @@ def accept_review(
                     "chapter_current_revision_id": revision.id,
                     "canon_items_added": [str(item.id) for item in created],
                     "pre_commit_backup": str(backup_path) if backup_path else None,
+                    "next_generation_run_id": str(next_run.id) if next_run else None,
                 },
                 reason=reason or None,
             )

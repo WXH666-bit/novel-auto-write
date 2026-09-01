@@ -98,6 +98,7 @@ import {
   retryGeneration,
   testProvider,
   updateChapter,
+  updateProject,
 } from "./api";
 import AuthScreen, {
   AccountSecurityView,
@@ -134,6 +135,58 @@ const jobPhases: Array<{ key: JobStatus; label: string }> = [
   { key: "revising", label: "定向修订" },
   { key: "awaiting_review", label: "等待审核" },
 ];
+
+type GenerationFormState = {
+  mode: string;
+  chapter_count: number;
+  word_target: number;
+  must: string;
+  must_not: string;
+  revision_rounds: number;
+};
+
+const DEFAULT_GENERATION_WORD_TARGET = 3500;
+
+function clampGenerationWordTarget(value: unknown) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_GENERATION_WORD_TARGET;
+  }
+  return Math.min(8000, Math.max(800, Math.round(parsed / 100) * 100));
+}
+
+function linesToText(value?: string[]) {
+  return (value || []).filter(Boolean).join("\n");
+}
+
+function textToLines(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function generationFormForProject(project: Project | null): GenerationFormState {
+  const target = project?.target_word_count ?? project?.word_target;
+  return {
+    mode: "next_chapter",
+    chapter_count: 1,
+    word_target: clampGenerationWordTarget(target),
+    must: linesToText(project?.must_happen),
+    must_not: linesToText(project?.must_not_happen),
+    revision_rounds: 2,
+  };
+}
+
+function projectPatchFromGenerationForm(
+  form: GenerationFormState,
+): Partial<Project> {
+  return {
+    target_word_count: form.word_target,
+    must_happen: textToLines(form.must),
+    must_not_happen: textToLines(form.must_not),
+  };
+}
 
 const statusLabels: Record<string, string> = {
   planned: "规划中",
@@ -289,17 +342,30 @@ function Workspace({
     genre: "悬疑 / 奇幻",
     tone: "克制、具体、留白",
   });
-  const [generationForm, setGenerationForm] = useState({
-    mode: "next_chapter",
-    word_target: 3500,
-    must: "",
-    must_not: "",
-    revision_rounds: 2,
-  });
+  const [generationForm, setGenerationForm] = useState<GenerationFormState>(
+    generationFormForProject(null),
+  );
+  const generationFormRef = useRef(generationForm);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const generationSettingsTimer = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const pendingGenerationSettings = useRef<{
+    projectId: string;
+    payload: Partial<Project>;
+  } | null>(null);
+  const generationSettingsWriteChain = useRef<Promise<unknown>>(
+    Promise.resolve(),
+  );
+  const workspaceEpochRef = useRef(0);
+  const activeProjectIdRef = useRef(activeProjectId);
+  const activeJobIdRef = useRef(job?.id || "");
   const workspaceStageRef = useRef<HTMLDivElement>(null);
   const lastWorkspaceFocusRef = useRef<HTMLElement | null>(null);
+  generationFormRef.current = generationForm;
+  activeProjectIdRef.current = activeProjectId;
+  activeJobIdRef.current = job?.id || "";
 
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: "auto" });
@@ -311,6 +377,14 @@ function Workspace({
         clearTimeout(draftTimer.current);
         draftTimer.current = null;
       }
+      if (generationSettingsTimer.current) {
+        clearTimeout(generationSettingsTimer.current);
+        generationSettingsTimer.current = null;
+      }
+      pendingGenerationSettings.current = null;
+      workspaceEpochRef.current += 1;
+      activeProjectIdRef.current = "";
+      activeJobIdRef.current = "";
       setView("library");
       setActiveProjectId("");
       setActiveChapterId("");
@@ -332,6 +406,16 @@ function Workspace({
     return () =>
       window.removeEventListener("novel-auth-cleared", clearWorkspaceState);
   }, []);
+
+  useEffect(
+    () => () => {
+      if (generationSettingsTimer.current) {
+        clearTimeout(generationSettingsTimer.current);
+      }
+      pendingGenerationSettings.current = null;
+    },
+    [],
+  );
 
   const projectsQuery = useQuery({
     queryKey: ["projects"],
@@ -379,6 +463,124 @@ function Workspace({
     (review
       ? chapters.find((chapter) => chapter.id === review.chapter_id)
       : activeChapter) ?? null;
+
+  const saveGenerationSettings = useCallback(
+    (projectId: string, payload: Partial<Project>) => {
+      const workspaceEpoch = workspaceEpochRef.current;
+      const write = generationSettingsWriteChain.current
+        .catch(() => undefined)
+        .then(async () => {
+          if (workspaceEpoch !== workspaceEpochRef.current) return null;
+          const saved = await updateProject(projectId, payload);
+          if (workspaceEpoch !== workspaceEpochRef.current) return saved;
+          queryClient.setQueryData<Project[]>(["projects"], (current) =>
+            (current || []).map((item) =>
+              item.id === saved.id ? { ...item, ...saved } : item,
+            ),
+          );
+          return saved;
+        });
+      generationSettingsWriteChain.current = write;
+      return write;
+    },
+    [queryClient],
+  );
+
+  const queueGenerationSettingsSave = useCallback(
+    (form: GenerationFormState, projectId = activeProjectId) => {
+      if (!projectId) return;
+      if (generationSettingsTimer.current) {
+        clearTimeout(generationSettingsTimer.current);
+      }
+      pendingGenerationSettings.current = {
+        projectId,
+        payload: projectPatchFromGenerationForm(form),
+      };
+      generationSettingsTimer.current = setTimeout(() => {
+        const pending = pendingGenerationSettings.current;
+        pendingGenerationSettings.current = null;
+        generationSettingsTimer.current = null;
+        if (!pending) return;
+        void saveGenerationSettings(pending.projectId, pending.payload).catch(
+          (error) =>
+            setToast({
+              tone: "warning",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "生成偏好自动保存失败，开始生成时仍会携带本次填写内容。",
+            }),
+        );
+      }, 700);
+    },
+    [activeProjectId, saveGenerationSettings],
+  );
+
+  const flushGenerationSettings = useCallback(
+    async (projectId: string, form: GenerationFormState) => {
+      const pending = pendingGenerationSettings.current;
+      if (pending?.projectId === projectId) {
+        if (generationSettingsTimer.current) {
+          clearTimeout(generationSettingsTimer.current);
+          generationSettingsTimer.current = null;
+        }
+        pendingGenerationSettings.current = null;
+      }
+      return saveGenerationSettings(projectId, projectPatchFromGenerationForm(form));
+    },
+    [saveGenerationSettings],
+  );
+
+  const handleGenerationFormChange = useCallback(
+    (next: GenerationFormState) => {
+      setGenerationForm(next);
+      queueGenerationSettingsSave(next);
+    },
+    [queueGenerationSettingsSave],
+  );
+
+  useEffect(() => {
+    if (!activeProjectId) return undefined;
+    const projectId = activeProjectId;
+    const persistBeforeLeaving = () => {
+      if (activeProjectIdRef.current !== projectId) return;
+      if (generationSettingsTimer.current) {
+        clearTimeout(generationSettingsTimer.current);
+        generationSettingsTimer.current = null;
+      }
+      pendingGenerationSettings.current = null;
+      void updateProject(
+        projectId,
+        projectPatchFromGenerationForm(generationFormRef.current),
+        { keepalive: true },
+      ).catch(() => undefined);
+    };
+    window.addEventListener("pagehide", persistBeforeLeaving);
+    return () => window.removeEventListener("pagehide", persistBeforeLeaving);
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!activeProject) return;
+    const pending = pendingGenerationSettings.current;
+    if (pending && pending.projectId !== activeProject.id) {
+      if (generationSettingsTimer.current) {
+        clearTimeout(generationSettingsTimer.current);
+        generationSettingsTimer.current = null;
+      }
+      pendingGenerationSettings.current = null;
+      void saveGenerationSettings(pending.projectId, pending.payload).catch(
+        (error) =>
+          setToast({
+            tone: "warning",
+            message:
+              error instanceof Error
+                ? error.message
+                : "上一项目的生成偏好自动保存失败。",
+          }),
+      );
+    }
+    setGenerationForm(generationFormForProject(activeProject));
+  }, [activeProject?.id, saveGenerationSettings]);
 
   useEffect(() => {
     if (
@@ -446,14 +648,35 @@ function Workspace({
       ["completed", "failed", "cancelled", "needs_retry"].includes(job.status)
     )
       return undefined;
+    const subscribedProjectId = activeProjectId;
+    const subscribedJobId = job.id;
     return listenGenerationEvents(
       job.id,
       (nextJob) => {
-        setJob(nextJob);
+        if (
+          activeProjectIdRef.current !== subscribedProjectId ||
+          activeJobIdRef.current !== subscribedJobId
+        )
+          return;
+        setJob((current) => ({
+          ...(current || {}),
+          ...nextJob,
+          chapter_count: nextJob.chapter_count ?? current?.chapter_count,
+          batch_index:
+            nextJob.batch_index ?? nextJob.chapter_index ?? current?.batch_index,
+          batch_total: nextJob.batch_total ?? current?.batch_total,
+          batch_remaining:
+            nextJob.batch_remaining ?? current?.batch_remaining,
+        }));
         if (nextJob.status === "awaiting_review") {
           if (nextJob.review_bundle_id) {
             void getReview(nextJob.review_bundle_id)
               .then((bundle) => {
+                if (
+                  activeProjectIdRef.current !== subscribedProjectId ||
+                  activeJobIdRef.current !== subscribedJobId
+                )
+                  return;
                 setReview(bundle);
                 setActiveChapterId(bundle.chapter_id);
                 void queryClient.invalidateQueries({
@@ -480,11 +703,17 @@ function Workspace({
           }
         }
       },
-      () =>
+      () => {
+        if (
+          activeProjectIdRef.current !== subscribedProjectId ||
+          activeJobIdRef.current !== subscribedJobId
+        )
+          return;
         setToast({
           tone: "warning",
           message: "生成进度连接中断；请打开任务条重试，不会自动提交。",
-        }),
+        });
+      },
     );
   }, [activeChapterId, activeProjectId, job?.id]);
 
@@ -496,6 +725,7 @@ function Workspace({
         if (cancelled || !latest) return;
         const visibleStates: JobStatus[] = [
           "queued",
+          "running",
           "preparing_context",
           "planning",
           "drafting",
@@ -676,14 +906,34 @@ function Workspace({
       });
       return;
     }
+    const chapterCount =
+      generationForm.mode === "next_chapter"
+        ? Math.min(10, Math.max(1, Number(generationForm.chapter_count) || 1))
+        : 1;
+    const formForRun = { ...generationForm, chapter_count: chapterCount };
+    try {
+      await flushGenerationSettings(activeProject.id, formForRun);
+    } catch (error) {
+      setToast({
+        tone: "warning",
+        message:
+          error instanceof Error
+            ? `${error.message} 本次生成仍会携带当前填写的必须/禁止条件。`
+            : "生成偏好暂未保存，本次生成仍会携带当前填写的必须/禁止条件。",
+      });
+    }
     setShowGeneration(false);
     const useCurrentChapter =
-      generationForm.mode === "scene" || generationForm.mode === "rewrite";
+      formForRun.mode === "scene" || formForRun.mode === "rewrite";
     const targetChapterId = useCurrentChapter ? activeChapter?.id : undefined;
     const placeholder: GenerationJob = {
       id: uid("job"),
       project_id: activeProject.id,
       chapter_id: targetChapterId,
+      chapter_count: chapterCount,
+      batch_index: 1,
+      batch_total: chapterCount,
+      batch_remaining: Math.max(0, chapterCount - 1),
       status: "preparing_context",
       progress: 4,
       phase_label: "准备上下文",
@@ -692,12 +942,21 @@ function Workspace({
     setJob(placeholder);
     try {
       const remote = await createGeneration(activeProject.id, {
-        ...generationForm,
+        ...formForRun,
+        target_word_count: formForRun.word_target,
         chapter_id: targetChapterId,
         canon_version: activeProject.canon_version,
         provider_id: selectedProvider.id,
       });
-      setJob(normalizeJob(remote));
+      const normalized = normalizeJob(remote);
+      setJob({
+        ...normalized,
+        chapter_count: normalized.chapter_count ?? chapterCount,
+        batch_index: normalized.batch_index ?? normalized.chapter_index ?? 1,
+        batch_total: normalized.batch_total ?? chapterCount,
+        batch_remaining:
+          normalized.batch_remaining ?? Math.max(0, chapterCount - 1),
+      });
     } catch (error) {
       setJob(null);
       setToast({
@@ -754,6 +1013,8 @@ function Workspace({
       return;
     }
     if (action === "accept") {
+      const acceptedRunId = job?.id;
+      const acceptedProjectId = activeProjectId;
       queryClient.invalidateQueries({ queryKey: ["projects"] });
       queryClient.invalidateQueries({ queryKey: ["canon", activeProjectId] });
       queryClient.invalidateQueries({
@@ -767,7 +1028,49 @@ function Workspace({
       });
       setForceAcceptOpen(false);
       setShowReview(false);
+      activeJobIdRef.current = "";
       setJob(null);
+      void getLatestGeneration(acceptedProjectId)
+        .then(async (next) => {
+          if (
+            !next ||
+            next.id === acceptedRunId ||
+            activeProjectIdRef.current !== acceptedProjectId
+          ) {
+            return;
+          }
+          const activeStatuses: string[] = [
+            "queued",
+            "running",
+            "preparing_context",
+            "planning",
+            "drafting",
+            "extracting",
+            "auditing",
+            "revising",
+            "awaiting_review",
+            "needs_retry",
+            "failed",
+          ];
+          if (!activeStatuses.includes(next.status)) return;
+          setJob(next);
+          if (next.status === "awaiting_review" && next.review_bundle_id) {
+            const nextReview = await getReview(next.review_bundle_id);
+            if (activeProjectIdRef.current !== acceptedProjectId) return;
+            setReview(nextReview);
+            setActiveChapterId(nextReview.chapter_id);
+            setShowReview(true);
+          }
+        })
+        .catch((error) =>
+          setToast({
+            tone: "warning",
+            message:
+              error instanceof Error
+                ? error.message
+                : "下一章任务状态读取失败，请刷新任务条。",
+          }),
+        );
     } else if (action === "reject") {
       setToast({ tone: "info", message: "已拒绝审核包，正典版本保持不变。" });
       setShowReview(false);
@@ -1159,7 +1462,7 @@ function Workspace({
       {showGeneration && (
         <GenerationDrawer
           form={generationForm}
-          setForm={setGenerationForm}
+          setForm={handleGenerationFormChange}
           provider={provider}
           providers={providers}
           selectedProviderId={selectedProviderId || provider?.id || ""}
@@ -2545,12 +2848,13 @@ function SettingsView({
       setBusy(false);
     }
   };
-  const setDefault = async () => {
-    if (!draft?.id) return;
+  const setAccountDefault = async (providerId: string) => {
+    if (!providerId) return;
     setBusy(true);
     try {
-      await onSetDefault(draft.id);
-      setNotice("已设为账户默认 Provider；后续生成会使用它。" );
+      await onSetDefault(providerId);
+      setSelectedId(providerId);
+      setNotice("已设为账户默认 Provider；生成抽屉仍可临时切换。" );
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "默认 Provider 设置失败。" );
     } finally {
@@ -2585,12 +2889,12 @@ function SettingsView({
       <div className="settings-layout">
         <aside className="settings-nav"><p className="eyebrow">工作室设置</p><button className="settings-nav-item is-active"><ServerCog size={15} /> 模型与生成</button><button className="settings-nav-item"><Keyboard size={15} /> 快捷键</button><button className="settings-nav-item"><ShieldCheck size={15} /> 安全与备份</button><button className="settings-nav-item"><Gauge size={15} /> 质量闸门</button></aside>
         <section className="settings-content">
-          <div className="settings-heading"><div><p className="eyebrow">PRIVATE PROVIDERS / BYOK</p><h1>模型与生成</h1><p>Provider 只属于当前账号。密钥通过系统凭据库隔离保存，永远不会写入小说、任务快照或项目导出。</p></div><span className="settings-provider-status"><span className="status-dot green" /> {defaultProviderId ? "已设置默认" : "尚未设置默认"}</span></div>
+           <div className="settings-heading"><div><p className="eyebrow">PRIVATE PROVIDERS / BYOK</p><h1>模型与生成</h1><p>Provider 只属于当前账号。密钥通过系统凭据库隔离保存，永远不会写入小说、任务快照或项目导出。</p><p className="settings-default-guide"><strong>账户默认 Provider</strong> 决定未特别指定时使用哪套连接；每个 Provider 的“内置默认模型”和六角色映射属于它自己的配置，两者互不替代。</p></div><span className="settings-provider-status"><span className="status-dot green" /> {defaultProviderId ? "账户默认已设置" : "尚未设置账户默认"}</span></div>
           <div className="provider-settings-grid">
-            <div className="settings-card provider-list-card"><div className="settings-card-head"><div><h2>我的 Provider</h2><p>{providers.length ? `${providers.length} 个私有配置` : "尚未添加模型"}</p></div><button className="button button-secondary button-small" onClick={beginNew}><PlusCircle size={14} /> 新增</button></div>{providers.length ? <div className="provider-list">{providers.map((item) => <button key={item.id} className={`provider-list-item ${item.id === selectedId && !isNew ? "is-selected" : ""}`} onClick={() => { setIsNew(false); setSelectedId(item.id || ""); }}><span className="provider-list-icon"><ServerCog size={15} /></span><span><strong>{item.name}</strong><small>{item.protocol === "anthropic_messages" ? "Anthropic Messages" : item.protocol === "responses" ? "Responses API" : "Chat Completions"}</small></span>{item.id === defaultProviderId && <em>默认</em>}<ChevronRight size={14} /></button>)}</div> : <div className="provider-empty"><div className="provider-empty-seal"><ServerCog size={20} /></div><strong>尚未添加模型</strong><p>先添加一个你自己的 Provider，章回不会自动创建内置配置或共享密钥。</p><button className="button button-primary" onClick={beginNew}><Plus size={14} /> 添加第一个 Provider</button></div>}</div>
-            {draft ? <div className="settings-card provider-editor-card"><div className="settings-card-head"><div><p className="eyebrow">{isNew ? "NEW PROFILE" : "EDIT PROFILE"}</p><h2>{isNew ? "新增 Provider" : draft.name || "编辑 Provider"}</h2><p>保存配置后仍需主动设置默认项；生成抽屉可以临时切换。</p></div>{!isNew && draft.id === defaultProviderId && <span className="connection-state"><span className="status-dot green" /> 默认使用中</span>}</div><div className="form-grid"><label className="field"><span>显示名称</span><input value={draft.name} onChange={(event) => update("name", event.target.value)} placeholder="例如：我的 Claude" /></label><label className="field"><span>协议模式</span><select value={draft.protocol || "chat_completions"} onChange={(event) => switchProtocol(event.target.value as ProviderProfile["protocol"])}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></label><label className="field field-wide"><span>Base URL</span><input value={draft.base_url} onChange={(event) => update("base_url", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1"} /></label>{draft.protocol === "anthropic_messages" && <label className="field"><span>Anthropic API 版本</span><input value={draft.api_version || "2023-06-01"} onChange={(event) => update("api_version", event.target.value)} placeholder="2023-06-01" /></label>}<label className="field"><span>默认模型</span><input value={draft.default_model || ""} onChange={(event) => update("default_model", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "claude-sonnet-4-5" : "local-storyteller"} /></label><label className="field"><span>上下文长度</span><input type="number" min="1024" value={draft.context_length || 32768} onChange={(event) => update("context_length", Number(event.target.value))} /></label><label className="field"><span>最大输出 tokens</span><input type="number" min="256" value={draft.max_output_tokens || 4096} onChange={(event) => update("max_output_tokens", Number(event.target.value))} /></label><label className="field"><span>请求超时（毫秒）</span><input type="number" min="1000" value={draft.timeout_ms || 60000} onChange={(event) => update("timeout_ms", Number(event.target.value))} /></label><label className="field field-wide"><span>API Key <small>{draft.api_key_set ? "系统凭据库中已有密钥；留空即保留" : "只在需要时填写"}</small></span><input type="password" autoComplete="new-password" value={draft.api_key || ""} onChange={(event) => update("api_key", event.target.value)} placeholder={draft.api_key_set ? "••••••••（已安全保存）" : "粘贴你的 API Key"} /></label>{draft.protocol === "anthropic_messages" && <label className="field field-wide"><span>Anthropic Workspace ID <small>可选</small></span><input value={draft.anthropic_workspace_id || ""} onChange={(event) => update("anthropic_workspace_id", event.target.value)} placeholder="workspace_…" /></label>}</div><div className="form-actions"><button className="button button-secondary" onClick={test} disabled={busy || testState === "testing"}><RefreshCw size={14} className={testState === "testing" ? "spin" : ""} /> {testState === "testing" ? "测试中…" : "测试连接"}</button><button className="button button-primary" onClick={save} disabled={busy}><Save size={14} /> {busy ? "保存中…" : "保存配置"}</button>{!isNew && draft.id && <button className="button button-quiet-danger" onClick={remove} disabled={busy}><Trash2 size={14} /> 删除</button>}</div>{notice && <p className={`settings-notice ${testState === "error" ? "is-error" : ""}`} role="status">{notice}</p>}{!isNew && <div className="provider-editor-footer"><button className="text-button" onClick={setDefault} disabled={busy || draft.id === defaultProviderId}><CheckCircle2 size={14} /> {draft.id === defaultProviderId ? "当前默认 Provider" : "设为默认 Provider"}</button>{draft.api_key_set && <button className="text-button text-danger" onClick={clearKey} disabled={busy}><Trash2 size={14} /> 删除已保存密钥</button>}</div>}</div> : <div className="settings-card provider-editor-empty"><p className="eyebrow">SELECT A PROFILE</p><h2>选择一个 Provider 开始</h2><p>左侧列表会显示本账号的模型配置。没有默认 Provider 时，生成按钮会明确引导你完成设置。</p><button className="button button-secondary" onClick={beginNew}><Plus size={14} /> 新增 Provider</button></div>}
+             <div className="settings-card provider-list-card"><div className="settings-card-head"><div><h2>我的 Provider</h2><p>{providers.length ? `${providers.length} 个私有配置` : "尚未添加模型"}</p></div><button className="button button-secondary button-small" onClick={beginNew}><PlusCircle size={14} /> 新增</button></div>{providers.length ? <div className="provider-list">{providers.map((item) => { const isAccountDefault = defaultProviderId ? item.id === defaultProviderId : Boolean(item.is_default); return <div className="provider-list-row" key={item.id}><button className={`provider-list-item ${item.id === selectedId && !isNew ? "is-selected" : ""}`} onClick={() => { setIsNew(false); setSelectedId(item.id || ""); }}><span className="provider-list-icon"><ServerCog size={15} /></span><span><strong>{item.name}</strong><small>{item.protocol === "anthropic_messages" ? "Anthropic Messages" : item.protocol === "responses" ? "Responses API" : "Chat Completions"}</small></span>{isAccountDefault && <em>账户默认</em>}<ChevronRight size={14} /></button>{item.id && <button className={`provider-default-action ${isAccountDefault ? "is-default" : ""}`} onClick={() => void setAccountDefault(item.id || "")} disabled={busy || isAccountDefault}>{isAccountDefault ? <><CheckCircle2 size={13} /> 当前账户默认</> : <><CheckCircle2 size={13} /> 设为账户默认</>}</button>}</div>; })}</div> : <div className="provider-empty"><div className="provider-empty-seal"><ServerCog size={20} /></div><strong>尚未添加模型</strong><p>先添加一个你自己的 Provider，章回不会自动创建内置配置或共享密钥。</p><button className="button button-primary" onClick={beginNew}><Plus size={14} /> 添加第一个 Provider</button></div>}</div>
+            {draft ? <div className="settings-card provider-editor-card"><div className="settings-card-head"><div><p className="eyebrow">{isNew ? "NEW PROFILE" : "EDIT PROFILE"}</p><h2>{isNew ? "新增 Provider" : draft.name || "编辑 Provider"}</h2><p>Provider 内默认模型只属于这套连接；账户默认 Provider 需单独点击“设为账户默认”。生成抽屉可以临时切换。</p></div>{!isNew && draft.id === defaultProviderId && <span className="connection-state"><span className="status-dot green" /> 账户默认使用中</span>}</div><div className="form-grid"><label className="field"><span>显示名称</span><input value={draft.name} onChange={(event) => update("name", event.target.value)} placeholder="例如：我的 Claude" /></label><label className="field"><span>协议模式</span><select value={draft.protocol || "chat_completions"} onChange={(event) => switchProtocol(event.target.value as ProviderProfile["protocol"])}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></label><label className="field field-wide"><span>Base URL</span><input value={draft.base_url} onChange={(event) => update("base_url", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1"} /></label>{draft.protocol === "anthropic_messages" && <label className="field"><span>Anthropic API 版本</span><input value={draft.api_version || "2023-06-01"} onChange={(event) => update("api_version", event.target.value)} placeholder="2023-06-01" /></label>}<label className="field"><span>Provider 默认模型 <small>此连接的内部回退</small></span><input value={draft.default_model || ""} onChange={(event) => update("default_model", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "claude-sonnet-4-5" : "local-storyteller"} /></label><label className="field"><span>上下文长度</span><input type="number" min="1024" value={draft.context_length || 32768} onChange={(event) => update("context_length", Number(event.target.value))} /></label><label className="field"><span>最大输出 tokens</span><input type="number" min="256" value={draft.max_output_tokens || 4096} onChange={(event) => update("max_output_tokens", Number(event.target.value))} /></label><label className="field"><span>请求超时（毫秒）</span><input type="number" min="1000" value={draft.timeout_ms || 60000} onChange={(event) => update("timeout_ms", Number(event.target.value))} /></label><label className="field field-wide"><span>API Key <small>{draft.api_key_set ? "系统凭据库中已有密钥；留空即保留" : "只在需要时填写"}</small></span><input type="password" autoComplete="new-password" value={draft.api_key || ""} onChange={(event) => update("api_key", event.target.value)} placeholder={draft.api_key_set ? "••••••••（已安全保存）" : "粘贴你的 API Key"} /></label>{draft.protocol === "anthropic_messages" && <label className="field field-wide"><span>Anthropic Workspace ID <small>可选</small></span><input value={draft.anthropic_workspace_id || ""} onChange={(event) => update("anthropic_workspace_id", event.target.value)} placeholder="workspace_…" /></label>}</div><div className="form-actions"><button className="button button-secondary" onClick={test} disabled={busy || testState === "testing"}><RefreshCw size={14} className={testState === "testing" ? "spin" : ""} /> {testState === "testing" ? "测试中…" : "测试连接"}</button><button className="button button-primary" onClick={save} disabled={busy}><Save size={14} /> {busy ? "保存中…" : "保存配置"}</button>{!isNew && draft.id && <button className="button button-quiet-danger" onClick={remove} disabled={busy}><Trash2 size={14} /> 删除</button>}</div>{notice && <p className={`settings-notice ${testState === "error" ? "is-error" : ""}`} role="status">{notice}</p>}{!isNew && <div className="provider-editor-footer"><button className="text-button" onClick={() => void setAccountDefault(draft.id || "")} disabled={busy || draft.id === defaultProviderId}><CheckCircle2 size={14} /> {draft.id === defaultProviderId ? "当前账户默认 Provider" : "设为账户默认"}</button>{draft.api_key_set && <button className="text-button text-danger" onClick={clearKey} disabled={busy}><Trash2 size={14} /> 删除已保存密钥</button>}</div>}</div> : <div className="settings-card provider-editor-empty"><p className="eyebrow">SELECT A PROFILE</p><h2>选择一个 Provider 开始</h2><p>左侧列表会显示本账号的模型配置。没有默认 Provider 时，生成按钮会明确引导你完成设置。</p><button className="button button-secondary" onClick={beginNew}><Plus size={14} /> 新增 Provider</button></div>}
           </div>
-          {draft && <div className="settings-card"><div className="settings-card-head"><div><h2>质量优先角色映射</h2><p>六个角色可以共用模型，也可以分别指定。留空时沿用默认模型。</p></div><span className="role-count">6 个角色</span></div><div className="role-grid">{roles.map(([key, label]) => <label className="role-field" key={key}><span>{label}</span><input value={draft.model_roles?.[key] || ""} placeholder={draft.default_model || "沿用默认模型"} onChange={(event) => setDraft({ ...draft, model_roles: { ...(draft.model_roles || {}), [key]: event.target.value } })} /><small>{key}</small></label>)}</div></div>}
+          {draft && <div className="settings-card"><div className="settings-card-head"><div><h2>Provider 内角色模型映射</h2><p>六个角色可以共用本 Provider 的默认模型，也可以分别指定；它们不改变账户默认 Provider。</p></div><span className="role-count">6 个角色</span></div><div className="role-grid">{roles.map(([key, label]) => <label className="role-field" key={key}><span>{label}</span><input value={draft.model_roles?.[key] || ""} placeholder={draft.default_model || "沿用 Provider 内默认模型"} onChange={(event) => setDraft({ ...draft, model_roles: { ...(draft.model_roles || {}), [key]: event.target.value } })} /><small>{key}</small></label>)}</div></div>}
           <div className="settings-card backup-card"><div className="backup-icon"><FileArchive size={18} /></div><div><h2>完整备份</h2><p>导出正文、正典、修订、原始导入文件和 schema 版本。密钥永远不会包含在内。</p></div><button className="button button-secondary" onClick={onExport}><Download size={14} /> 导出项目 ZIP</button></div>
         </section>
       </div>
@@ -2924,20 +3228,8 @@ function GenerationDrawer({
   onClose,
   onStart,
 }: {
-  form: {
-    mode: string;
-    word_target: number;
-    must: string;
-    must_not: string;
-    revision_rounds: number;
-  };
-  setForm: (form: {
-    mode: string;
-    word_target: number;
-    must: string;
-    must_not: string;
-    revision_rounds: number;
-  }) => void;
+  form: GenerationFormState;
+  setForm: (form: GenerationFormState) => void;
   provider: ProviderProfile | null;
   providers: ProviderProfile[];
   selectedProviderId: string;
@@ -2983,11 +3275,13 @@ function GenerationDrawer({
             </div>
           </div>
           <label className="field">
-            <span>本次使用的 Provider</span>
+            <span>
+              本次使用的 Provider <small>账户默认只是起点，可临时切换</small>
+            </span>
             {providers.length ? (
               <select value={selectedProviderId} onChange={(event) => onProviderChange(event.target.value)} required>
                 <option value="">选择一个 Provider</option>
-                {providers.map((item) => <option key={item.id} value={item.id}>{item.name}{item.id === selectedProviderId ? " · 本次选择" : ""}</option>)}
+                {providers.map((item) => <option key={item.id} value={item.id}>{item.name}{item.is_default ? " · 账户默认" : ""}{item.id === selectedProviderId ? " · 本次选择" : ""}</option>)}
               </select>
             ) : (
               <div className="drawer-provider-empty"><ServerCog size={14} /><span>尚未添加模型。请先到“模型与生成”添加 Provider。</span></div>
@@ -2997,9 +3291,14 @@ function GenerationDrawer({
             <span>生成目标</span>
             <select
               value={form.mode}
-              onChange={(event) =>
-                setForm({ ...form, mode: event.target.value })
-              }
+              onChange={(event) => {
+                const mode = event.target.value;
+                setForm({
+                  ...form,
+                  mode,
+                  chapter_count: mode === "next_chapter" ? form.chapter_count : 1,
+                });
+              }}
             >
               <option value="next_chapter">下一章正文</option>
               <option value="outline">先生成章节规划</option>
@@ -3007,6 +3306,53 @@ function GenerationDrawer({
               <option value="rewrite">按审核意见定向修订</option>
             </select>
           </label>
+          <label className="field">
+            <span>
+              连续生成章数 <output>{form.chapter_count} 章</output>
+            </span>
+            <select
+              value={form.mode === "next_chapter" ? form.chapter_count : 1}
+              onChange={(event) =>
+                setForm({
+                  ...form,
+                  chapter_count: Number(event.target.value),
+                })
+              }
+              disabled={form.mode !== "next_chapter"}
+              aria-describedby="generation-batch-note"
+            >
+              {Array.from({ length: 10 }, (_, index) => index + 1).map((count) => (
+                <option key={count} value={count}>
+                  {count} 章
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="generation-batch-panel" id="generation-batch-note">
+            <div className="generation-batch-copy">
+              <span className="generation-batch-icon"><Layers3 size={14} /></span>
+              <div>
+                <strong>
+                  {form.mode === "next_chapter"
+                    ? `本批次将逐章生成 ${form.chapter_count} 章`
+                    : "当前模式按单章执行"}
+                </strong>
+                <p>
+                  每章都要先通过审核并入典，系统才会继续排队下一章；任一章拒绝或需重试，后续会暂停。
+                </p>
+              </div>
+            </div>
+            <div className="generation-batch-tickets" role="list" aria-label="本批次章节序列">
+              {Array.from(
+                { length: form.mode === "next_chapter" ? form.chapter_count : 1 },
+                (_, index) => (
+                  <span className={`generation-batch-ticket ${index === 0 ? "is-current" : ""}`} key={index} role="listitem">
+                    <small>章</small>{String(index + 1).padStart(2, "0")}
+                  </span>
+                ),
+              )}
+            </div>
+          </div>
           <label className="field">
             <span>
               目标字数 <output>{formatWords(form.word_target)} 字</output>
@@ -3029,7 +3375,7 @@ function GenerationDrawer({
           </div>
           <label className="field">
             <span>
-              必须发生 <small>可选</small>
+              必须发生 <small>可选 · 自动保存到当前小说，刷新后仍保留；手动清空才移除</small>
             </span>
             <textarea
               rows={3}
@@ -3042,7 +3388,7 @@ function GenerationDrawer({
           </label>
           <label className="field">
             <span>
-              禁止发生 <small>可选</small>
+              禁止发生 <small>可选 · 自动保存到当前小说，刷新后仍保留；手动清空才移除</small>
             </span>
             <textarea
               rows={3}
@@ -3104,6 +3450,16 @@ function JobStrip({
   const complete =
     job.status === "awaiting_review" || job.status === "completed";
   const stalled = job.status === "needs_retry" || job.status === "failed";
+  const batchTotal = Math.max(1, job.batch_total ?? job.chapter_count ?? 1);
+  const batchIndex = Math.min(
+    batchTotal,
+    Math.max(1, job.batch_index ?? job.chapter_index ?? 1),
+  );
+  const batchRemaining = Math.max(
+    0,
+    job.batch_remaining ?? Math.max(0, batchTotal - batchIndex),
+  );
+  const hasBatch = batchTotal > 1;
   return (
     <div
       className={`job-strip ${complete ? "job-ready" : stalled ? "job-stalled" : "job-running"}`}
@@ -3133,6 +3489,12 @@ function JobStrip({
                 ? job.error || "远程结果不确定，系统没有自动提交"
                 : `${job.provider_name || "Provider"} · 可安全关闭窗口，进度会持久化`}
           </span>
+          {hasBatch && (
+            <small className="job-batch-progress">
+              第 {batchIndex}/{batchTotal} 章 · 审核通过后继续
+              {batchRemaining ? ` · 余 ${batchRemaining} 章` : ""}
+            </small>
+          )}
         </div>
       </div>
       <div className="job-strip-progress">

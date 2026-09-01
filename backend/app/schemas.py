@@ -349,6 +349,9 @@ class GenerationRequest(BaseModel):
     # user's explicit default_provider_id is resolved before any chapter/job
     # row is created.
     provider_id: str | None = None
+    # A batch is still executed one chapter at a time.  The next chapter is
+    # queued only after the preceding review is accepted.
+    chapter_count: int = Field(default=1, ge=1, le=10)
     target_word_count: int | None = Field(default=None, ge=1)
     instructions: str | None = None
     mode: str = "quality"

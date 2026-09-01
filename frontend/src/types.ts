@@ -23,7 +23,10 @@ export interface Project {
   viewpoint?: string;
   tone?: string;
   word_target?: number;
+  target_word_count?: number;
   chapter_target?: number;
+  must_happen?: string[];
+  must_not_happen?: string[];
   current_chapter_id?: string | null;
   canon_version?: number;
   memory_epoch?: number;
@@ -153,6 +156,7 @@ export interface ReviewBundle {
 
 export type JobStatus =
   | "queued"
+  | "running"
   | "preparing_context"
   | "planning"
   | "drafting"
@@ -173,6 +177,11 @@ export interface GenerationJob {
   status: JobStatus;
   progress?: number;
   phase_label?: string;
+  chapter_count?: number;
+  chapter_index?: number;
+  batch_index?: number;
+  batch_total?: number;
+  batch_remaining?: number;
   created_at?: string;
   error?: string;
   provider_name?: string;
@@ -194,6 +203,7 @@ export interface ProviderProfile {
   timeout_ms?: number;
   capabilities?: Record<string, boolean>;
   enabled?: boolean;
+  is_default?: boolean;
   deleted_at?: string | null;
   api_key_set?: boolean;
   api_key?: string;

@@ -22,6 +22,7 @@ from ..services.generation import (
     RunNotFound,
     create_generation_run,
     execute_generation,
+    reconcile_batch_next_run,
     recover_incomplete_runs,
     run_snapshot,
     sse_events,
@@ -92,6 +93,7 @@ def get_generation(
 @router.get("/projects/{project_id}/generations/latest")
 def latest_generation(
     project_id: str,
+    background: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -103,6 +105,14 @@ def latest_generation(
     )
     if run is None:
         raise HTTPException(status_code=404, detail="项目还没有生成任务")
+    # Acceptance normally creates the next child in the same transaction.  A
+    # latest-read also repairs batches created by an older worker that died
+    # after committing acceptance but before enqueueing the child.
+    repaired = reconcile_batch_next_run(db, run)
+    if repaired is not None:
+        run = repaired
+        if str(repaired.status) == "queued":
+            background.add_task(_run_background, str(repaired.id))
     return run_snapshot(run)
 
 

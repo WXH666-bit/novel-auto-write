@@ -9,6 +9,7 @@ from synchronous tests.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -56,6 +57,8 @@ WORKFLOW_STAGES = (
     "completed",
 )
 MAX_REVISION_ROUNDS = 2
+MAX_BATCH_CHAPTERS = 10
+BATCH_METADATA_KEY = "batch"
 
 
 class GenerationBusy(RuntimeError):
@@ -74,6 +77,82 @@ class RunNotFound(LookupError):
 class RunCreation:
     run: Any
     created: bool
+
+
+def _chapter_count(value: Any) -> int:
+    """Normalize the public batch size for callers that bypass Pydantic."""
+
+    if value is None or value == "":
+        return 1
+    if isinstance(value, bool):
+        raise ValueError("chapter_count 必须是 1 到 10 之间的整数")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("chapter_count 必须是 1 到 10 之间的整数") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError("chapter_count 必须是 1 到 10 之间的整数")
+    if parsed < 1 or parsed > MAX_BATCH_CHAPTERS:
+        raise ValueError("chapter_count 必须是 1 到 10 之间的整数")
+    return parsed
+
+
+def _clone_json(value: Any, default: Any = None) -> Any:
+    """Copy JSON-compatible state without introducing secret-bearing objects."""
+
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return default
+
+
+def _batch_from_snapshot(snapshot: Any) -> dict[str, Any] | None:
+    payload = read_json(snapshot, {}) or {}
+    if not isinstance(payload, Mapping):
+        return None
+    raw = payload.get(BATCH_METADATA_KEY)
+    if not isinstance(raw, Mapping):
+        return None
+    batch_id = str(raw.get("batch_id") or "").strip()
+    root_key = str(raw.get("root_idempotency_key") or "").strip()
+    try:
+        chapter_index = int(raw.get("chapter_index") or 0)
+        chapter_total = _chapter_count(raw.get("chapter_total"))
+    except (TypeError, ValueError):
+        return None
+    if not batch_id or not root_key or chapter_index < 1 or chapter_index > chapter_total:
+        return None
+    parent_run_id = raw.get("parent_run_id")
+    return {
+        "batch_id": batch_id,
+        "chapter_index": chapter_index,
+        "chapter_total": chapter_total,
+        "root_idempotency_key": root_key,
+        "parent_run_id": str(parent_run_id) if parent_run_id else None,
+    }
+
+
+def _next_batch_metadata(batch: Mapping[str, Any], parent_run_id: str) -> dict[str, Any]:
+    return {
+        "batch_id": str(batch["batch_id"]),
+        "chapter_index": int(batch["chapter_index"]) + 1,
+        "chapter_total": int(batch["chapter_total"]),
+        "root_idempotency_key": str(batch["root_idempotency_key"]),
+        "parent_run_id": str(parent_run_id),
+    }
+
+
+def _batch_idempotency_key(batch: Mapping[str, Any], chapter_index: int) -> str:
+    """Build a deterministic child key within the Job/Run 255-char limit."""
+
+    raw = (
+        f"{batch['root_idempotency_key']}::batch:{batch['batch_id']}"
+        f"::chapter:{int(chapter_index)}"
+    )
+    if len(raw) <= 255:
+        return raw
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"batch:{batch['batch_id']}:chapter:{int(chapter_index)}:{digest}"
 
 
 def _get_request(request: Any) -> dict[str, Any]:
@@ -232,6 +311,290 @@ def _chapter_for_run(
     return chapter
 
 
+def batch_metadata(run: Any) -> dict[str, Any] | None:
+    """Return normalized batch metadata stored in a run's input snapshot."""
+
+    return _batch_from_snapshot(getattr(run, "input_snapshot", None))
+
+
+def _batch_provider_values(run: Any) -> tuple[str, str, dict[str, Any]]:
+    provider_snapshot = read_json(getattr(run, "provider_snapshot", None), {}) or {}
+    if not isinstance(provider_snapshot, Mapping):
+        provider_snapshot = {}
+    provider_id = str(
+        getattr(run, "provider_profile_id", None)
+        or provider_snapshot.get("provider_id")
+        or ""
+    ).strip()
+    protocol = str(
+        getattr(run, "provider_protocol", None) or provider_snapshot.get("protocol") or ""
+    ).strip()
+    if not provider_id or not protocol or not provider_snapshot:
+        raise ProviderRequired("批次任务缺少冻结 Provider 配置")
+    # provider_config_snapshot() is secret-free by contract.  Strip the only
+    # credential-shaped field accepted by older/custom snapshots defensively
+    # before copying it to a child run.
+    cloned = _clone_json(provider_snapshot, {})
+    if not isinstance(cloned, dict):
+        raise ProviderRequired("批次任务的 Provider 快照无效")
+    cloned.pop("api_key", None)
+    cloned.pop("apiKey", None)
+    cloned.pop("api_key_override", None)
+    return provider_id, protocol, cloned
+
+
+def get_next_batch_run(session: Session, run_or_id: Any) -> Any | None:
+    """Find an already-created child run without mutating the database."""
+
+    from ..models import GenerationRun
+
+    run = (
+        session.get(GenerationRun, str(run_or_id))
+        if isinstance(run_or_id, str)
+        else run_or_id
+    )
+    if run is None:
+        return None
+    batch = batch_metadata(run)
+    if batch is None or batch["chapter_index"] >= batch["chapter_total"]:
+        return None
+    child_key = _batch_idempotency_key(batch, batch["chapter_index"] + 1)
+    return session.scalar(
+        select(GenerationRun).where(
+            GenerationRun.project_id == run.project_id,
+            GenerationRun.idempotency_key == child_key,
+        )
+    )
+
+
+def _create_next_batch_rows(
+    session: Session,
+    project: Any,
+    run: Any,
+    batch: Mapping[str, Any],
+    expected_batch: Mapping[str, Any],
+    child_key: str,
+) -> Any:
+    """Insert a child chapter/run/job inside a savepoint.
+
+    A savepoint matters for two review/latest requests racing to repair the
+    same missing child: a unique-key loser can roll back only its attempted
+    child rows while preserving the caller's surrounding acceptance work.
+    """
+
+    from ..models import GenerationRun, Job
+
+    provider_id, protocol, provider_snapshot = _batch_provider_values(run)
+    previous_input = read_json(getattr(run, "input_snapshot", None), {}) or {}
+    if not isinstance(previous_input, Mapping):
+        previous_input = {}
+    child_input = {
+        key: _clone_json(value, value)
+        for key, value in previous_input.items()
+        if key
+        not in {
+            "batch",
+            "chapter_id",
+            "project_id",
+            "provider_id",
+            "provider_protocol",
+            "provider_config_hash",
+            "context_snapshot",
+            "created_at",
+            "idempotency_key",
+            "title",
+        }
+    }
+    child_input.update(
+        {
+            "idempotency_key": child_key,
+            "chapter_count": batch["chapter_total"],
+            "batch": dict(expected_batch),
+        }
+    )
+    previous_params = read_json(getattr(run, "model_params", None), {}) or {}
+    if not isinstance(previous_params, Mapping):
+        previous_params = {}
+    child_params = {
+        key: _clone_json(value, value) for key, value in previous_params.items()
+    }
+    child_params.update(
+        {
+            "provider_id": provider_id,
+            "provider_protocol": protocol,
+            "provider_config_hash": provider_snapshot.get("config_hash"),
+            "batch": dict(expected_batch),
+        }
+    )
+
+    with session.begin_nested():
+        # No chapter is allocated until this function is called from the
+        # accepted review transaction.  The first run may have been attached
+        # to an existing chapter; every child is a newly allocated next one.
+        chapter = _chapter_for_run(session, project, None, child_input)
+        child_input.update(
+            {
+                "chapter_id": chapter.id,
+                "project_id": project.id,
+                "provider_id": provider_id,
+                "provider_protocol": protocol,
+                "provider_config_hash": provider_snapshot.get("config_hash"),
+                "created_at": utcnow().isoformat(),
+            }
+        )
+        child_run = GenerationRun(
+            **mapped_kwargs(
+                GenerationRun,
+                {
+                    "project_id": project.id,
+                    "chapter_id": chapter.id,
+                    "stage": "queued",
+                    "status": "queued",
+                    "idempotency_key": child_key,
+                    "input_snapshot": child_input,
+                    "model_params": child_params,
+                    "provider_profile_id": provider_id,
+                    "provider_protocol": protocol,
+                    "provider_config_version": getattr(
+                        run, "provider_config_version", provider_snapshot.get("config_version")
+                    ),
+                    "provider_snapshot": provider_snapshot,
+                    "prompt_version": getattr(run, "prompt_version", None) or PROMPT_VERSION,
+                },
+            )
+        )
+        session.add(child_run)
+        session.flush()
+        child_job = Job(
+            **mapped_kwargs(
+                Job,
+                {
+                    "project_id": project.id,
+                    "chapter_id": chapter.id,
+                    "idempotency_key": child_key,
+                    "state": "queued",
+                    "current_stage": "queued",
+                    "payload": child_input,
+                    "lease_owner": None,
+                    "lease_expires_at": utcnow() + timedelta(minutes=10),
+                },
+            )
+        )
+        session.add(child_job)
+        session.flush()
+        assign(child_run, "job_id", child_job.id)
+    return child_run
+
+
+def queue_next_batch_run(session: Session, project: Any, run: Any) -> Any | None:
+    """Create exactly one queued child run after a chapter is accepted.
+
+    The caller owns the project's acceptance transaction.  This function only
+    flushes rows; the child chapter, job, and run become durable atomically with
+    the accepted chapter/canon commit.  A deterministic child idempotency key
+    makes retries and crash reconciliation safe.
+    """
+
+    from ..models import GenerationRun, Project
+
+    locked_project = session.scalar(
+        select(Project).where(Project.id == project.id).with_for_update()
+    )
+    if locked_project is None:
+        raise RunNotFound("项目不存在")
+    project = locked_project
+    batch = batch_metadata(run)
+    if batch is None or batch["chapter_index"] >= batch["chapter_total"]:
+        return None
+    child_index = batch["chapter_index"] + 1
+    child_key = _batch_idempotency_key(batch, child_index)
+    expected_batch = _next_batch_metadata(batch, str(run.id))
+    existing = session.scalar(
+        select(GenerationRun)
+        .where(
+            GenerationRun.project_id == project.id,
+            GenerationRun.idempotency_key == child_key,
+        )
+        .with_for_update()
+    )
+    if existing is not None:
+        existing_batch = batch_metadata(existing)
+        if existing_batch != expected_batch:
+            raise IdempotencyConflict("批次子任务幂等键已用于另一项生成任务")
+        return existing
+    try:
+        return _create_next_batch_rows(
+            session,
+            project,
+            run,
+            batch,
+            expected_batch,
+            child_key,
+        )
+    except IntegrityError as exc:
+        # Another worker may have won the deterministic child key race.  The
+        # savepoint above has removed this worker's chapter/run/job attempt;
+        # return the winner instead of surfacing a duplicate-run failure.
+        existing = session.scalar(
+            select(GenerationRun).where(
+                GenerationRun.project_id == project.id,
+                GenerationRun.idempotency_key == child_key,
+            ).with_for_update()
+        )
+        if existing is None:
+            raise
+        existing_batch = batch_metadata(existing)
+        if existing_batch != expected_batch:
+            raise IdempotencyConflict("批次子任务幂等键已用于另一项生成任务") from exc
+        return existing
+
+
+def reconcile_batch_next_run(session: Session, run_or_id: Any) -> Any | None:
+    """Idempotently repair a missing child after an accepted batch run.
+
+    Normally the child is created in the same transaction as acceptance.  This
+    helper covers legacy/partially-upgraded rows and a process dying between an
+    older acceptance commit and its enqueue step.  It commits only when it had
+    to create the child.
+    """
+
+    from ..models import GenerationRun, Project, ReviewBundle
+
+    run = (
+        session.get(GenerationRun, str(run_or_id))
+        if isinstance(run_or_id, str)
+        else run_or_id
+    )
+    if run is None or getattr(run, "status", None) != "completed":
+        return None
+    batch = batch_metadata(run)
+    if batch is None:
+        return None
+    bundle = session.scalar(
+        select(ReviewBundle).where(ReviewBundle.generation_run_id == run.id)
+    )
+    if bundle is None or bundle.status not in {"accepted", "force_accepted"}:
+        return None
+    # Serialize repair attempts on the same project before checking and
+    # creating the deterministic child key.  The normal acceptance path
+    # already holds this row lock; latest/recovery callers acquire it here.
+    project = session.scalar(
+        select(Project)
+        .where(Project.id == run.project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if project is None:
+        return None
+    child = get_next_batch_run(session, run)
+    if child is not None:
+        return child
+    child = queue_next_batch_run(session, project, run)
+    if child is not None:
+        session.commit()
+    return child
+
+
 def _active_run(session: Session, project_id: str) -> Any | None:
     from ..models import GenerationRun
 
@@ -251,6 +614,12 @@ def create_generation_run(session: Session, project: Any, request: Any) -> RunCr
     from ..models import GenerationRun, Job, Project
 
     values = _get_request(request)
+    requested_chapters = _chapter_count(values.get("chapter_count", 1))
+    values["chapter_count"] = requested_chapters
+    mode = str(values.get("mode") or "quality").strip().lower()
+    if requested_chapters > 1 and mode not in {"quality", "next_chapter"}:
+        raise ValueError("chapter_count 大于 1 时只支持连续下一章生成模式")
+    values["mode"] = mode
     if bool(getattr(project, "needs_rebuild", False)):
         raise ValueError("旧章修改后的连续性记忆尚未重建，当前暂停继续生成")
     key = str(values.get("idempotency_key") or "").strip()
@@ -284,6 +653,12 @@ def create_generation_run(session: Session, project: Any, request: Any) -> RunCr
         # The durable snapshot also contains derived fields (chapter id and
         # context metadata).  Compare only keys supplied by this retry request.
         old_comparable = {k: old_request.get(k) for k in comparable}
+        # Runs created before chapter_count existed are equivalent to the
+        # single-chapter default when replayed through the new schema.
+        if "chapter_count" in comparable and "chapter_count" not in old_request:
+            old_comparable["chapter_count"] = 1
+        if "mode" in comparable and "mode" not in old_request:
+            old_comparable["mode"] = "quality"
         if comparable and old_comparable != comparable:
             raise IdempotencyConflict("幂等键已用于另一份生成请求")
         return RunCreation(existing, False)
@@ -297,7 +672,15 @@ def create_generation_run(session: Session, project: Any, request: Any) -> RunCr
     profile = _provider_profile(session, project, values.get("provider_id"))
     provider_snapshot = provider_config_snapshot(profile)
     chapter = _chapter_for_run(session, project, values.get("chapter_id"), values)
+    batch = {
+        "batch_id": str(uuid.uuid4()),
+        "chapter_index": 1,
+        "chapter_total": requested_chapters,
+        "root_idempotency_key": key,
+        "parent_run_id": None,
+    }
     snapshot = dict(values)
+    snapshot["batch"] = batch
     snapshot["chapter_id"] = chapter.id
     snapshot["project_id"] = project.id
     snapshot["provider_id"] = profile.id
@@ -720,6 +1103,18 @@ def execute_generation(session: Session, run_id: str) -> Any:
         return run
     if str(run.status) == "awaiting_review":
         return run
+    if bool(getattr(project, "needs_rebuild", False)):
+        message = "旧章修改后的连续性记忆尚未重建，任务已暂停"
+        assign(run, "status", "needs_retry")
+        assign(run, "error", message)
+        job = _job_for_run(session, run)
+        if job is not None:
+            assign(job, "state", "needs_retry")
+            assign(job, "last_error", message)
+            assign(job, "lease_owner", None)
+            assign(job, "lease_expires_at", None)
+        session.commit()
+        return run
     lease_owner = _claim_run(session, run)
     if lease_owner is None:
         # A second background callback for the same idempotent request must not
@@ -789,6 +1184,14 @@ def execute_generation(session: Session, run_id: str) -> Any:
                 request.get("instructions")
                 or "规划本章目标、场景顺序、必须推进的剧情线，并严格遵守已确认正典。"
             )
+            batch = batch_metadata(run)
+            if batch and batch["chapter_total"] > 1:
+                instruction = (
+                    f"这是连续创作批次的第 {batch['chapter_index']}/{batch['chapter_total']} 章。"
+                    "批次要求应在整批章节中合理推进或完成；若某项已经出现在已确认正文或正典中，"
+                    "保持其结果，不要机械重复。\n"
+                    f"{instruction}"
+                )
             planning_messages = _messages(
                 "你是剧情规划角色。只规划，不把草稿写入正典。", context, instruction
             )
@@ -1109,6 +1512,7 @@ def recover_incomplete_runs(session: Session, *, owner_id: str | None = None) ->
 
 
 def run_snapshot(run: Any) -> dict[str, Any]:
+    batch = batch_metadata(run)
     return {
         "id": str(run.id),
         "project_id": str(run.project_id),
@@ -1121,6 +1525,12 @@ def run_snapshot(run: Any) -> dict[str, Any]:
         "error": getattr(run, "error", None),
         "review_bundle_id": getattr(run, "review_bundle_id", None),
         "output_hash": getattr(run, "output_hash", None),
+        "batch_id": batch["batch_id"] if batch else None,
+        "batch_index": batch["chapter_index"] if batch else None,
+        "batch_total": batch["chapter_total"] if batch else None,
+        "batch_remaining": (
+            max(0, batch["chapter_total"] - batch["chapter_index"]) if batch else 0
+        ),
     }
 
 

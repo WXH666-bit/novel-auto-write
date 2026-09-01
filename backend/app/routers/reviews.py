@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..models import ReviewBundle, User
 from ..security import get_current_user
+from ..services.generation import reconcile_batch_next_run
 from ..services.providers import ProviderError
 from ..services.reviews import (
     BlockerError,
@@ -161,20 +162,28 @@ def reject(
 def accept(
     bundle_id: str,
     payload: AcceptPayload,
+    background: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_review(db, bundle_id, current_user)
     try:
-        return bundle_payload(
-            accept_review(
-                db,
-                bundle_id,
-                force_reason=payload.force_reason,
-                actor=_actor(current_user),
-                actor_user_id=current_user.id,
-            )
+        result = accept_review(
+            db,
+            bundle_id,
+            force_reason=payload.force_reason,
+            actor=_actor(current_user),
+            actor_user_id=current_user.id,
         )
+        next_run = reconcile_batch_next_run(db, result.generation_run_id)
+        response = bundle_payload(result)
+        if next_run is not None:
+            response["next_generation_run_id"] = str(next_run.id)
+            if next_run.status == "queued":
+                from .generations import _run_background
+
+                background.add_task(_run_background, str(next_run.id))
+        return response
     except ReviewNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except BlockerError as exc:
@@ -190,6 +199,7 @@ def accept(
 def decision(
     bundle_id: str,
     payload: dict[str, Any],
+    background: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -202,6 +212,7 @@ def decision(
                 force_reason=payload.get("force_reason"),
                 actor=current_user.id,
             ),
+            background,
             current_user,
             db,
         )

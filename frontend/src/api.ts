@@ -335,7 +335,12 @@ export async function createProject(input: Partial<Project>): Promise<Project> {
       ...input,
       name: input.title,
       description: input.logline,
-      target_word_count: input.word_target,
+      ...(input.word_target !== undefined || input.target_word_count !== undefined
+        ? {
+            target_word_count:
+              input.target_word_count ?? input.word_target,
+          }
+        : {}),
     }),
   });
   return normalizeProject(payload);
@@ -344,15 +349,20 @@ export async function createProject(input: Partial<Project>): Promise<Project> {
 export async function updateProject(
   projectId: string,
   input: Partial<Project>,
+  options: { keepalive?: boolean } = {},
 ): Promise<Project> {
   const payload = await apiRequest<unknown>(`/projects/${projectId}`, {
     method: "PATCH",
+    keepalive: options.keepalive,
     body: JSON.stringify({
       ...input,
       ...(input.title !== undefined ? { name: input.title } : {}),
       ...(input.logline !== undefined ? { description: input.logline } : {}),
-      ...(input.word_target !== undefined
-        ? { target_word_count: input.word_target }
+      ...(input.word_target !== undefined || input.target_word_count !== undefined
+        ? {
+            target_word_count:
+              input.target_word_count ?? input.word_target,
+          }
         : {}),
     }),
   });
@@ -417,6 +427,10 @@ export async function createGeneration(
   projectId: string,
   input: Record<string, unknown>,
 ): Promise<GenerationJob> {
+  const chapterCount =
+    input.mode === "next_chapter"
+      ? Math.min(10, Math.max(1, Number(input.chapter_count ?? 1) || 1))
+      : 1;
   const instructions = [
     input.instructions,
     input.must ? `必须发生：${String(input.must)}` : "",
@@ -428,6 +442,7 @@ export async function createGeneration(
     chapter_id: input.chapter_id || null,
     provider_id: input.provider_id ? String(input.provider_id) : null,
     idempotency_key: input.idempotency_key || crypto.randomUUID(),
+    chapter_count: chapterCount,
     target_word_count: Number(
       input.target_word_count ?? input.word_target ?? 3500,
     ),
@@ -714,6 +729,12 @@ export async function downloadExport(projectId: string): Promise<Blob> {
 
 export function normalizeProject(value: unknown): Project {
   const source = (value || {}) as Record<string, unknown>;
+  const targetWordCount = numberOrUndefined(
+    source.word_target ??
+      source.wordTarget ??
+      source.target_word_count ??
+      source.targetWordCount,
+  );
   return {
     id: String(source.id ?? source.project_id ?? crypto.randomUUID()),
     title: String(source.title ?? source.name ?? "未命名项目"),
@@ -723,14 +744,16 @@ export function normalizeProject(value: unknown): Project {
     genre: String(source.genre ?? source.category ?? ""),
     viewpoint: String(source.viewpoint ?? source.pov ?? ""),
     tone: String(source.tone ?? source.style ?? ""),
-    word_target: numberOrUndefined(
-      source.word_target ??
-        source.wordTarget ??
-        source.target_word_count ??
-        source.targetWordCount,
-    ),
+    word_target: targetWordCount,
+    target_word_count: targetWordCount,
     chapter_target: numberOrUndefined(
       source.chapter_target ?? source.chapterTarget,
+    ),
+    must_happen: textList(
+      source.must_happen ?? source.mustHappen ?? source.must,
+    ),
+    must_not_happen: textList(
+      source.must_not_happen ?? source.mustNotHappen ?? source.must_not,
     ),
     current_chapter_id: (source.current_chapter_id ??
       source.currentChapterId ??
@@ -837,6 +860,7 @@ export function normalizeJob(value: unknown): GenerationJob {
   ) as GenerationJob["status"];
   const stages: GenerationJob["status"][] = [
     "queued",
+    "running",
     "preparing_context",
     "planning",
     "drafting",
@@ -849,6 +873,7 @@ export function normalizeJob(value: unknown): GenerationJob {
   ];
   const labels: Record<string, string> = {
     queued: "排队中",
+    running: "运行中",
     preparing_context: "准备上下文",
     planning: "规划场景",
     drafting: "生成正文",
@@ -875,6 +900,33 @@ export function normalizeJob(value: unknown): GenerationJob {
         source.message ??
         labels[status] ??
         "",
+    ),
+    chapter_count: numberOrUndefined(
+      source.chapter_count ??
+        source.chapterCount ??
+        source.batch_total ??
+        source.batchTotal,
+    ),
+    chapter_index: numberOrUndefined(
+      source.chapter_index ??
+        source.chapterIndex ??
+        source.batch_index ??
+        source.batchIndex,
+    ),
+    batch_index: numberOrUndefined(
+      source.batch_index ??
+        source.batchIndex ??
+        source.chapter_index ??
+        source.chapterIndex,
+    ),
+    batch_total: numberOrUndefined(
+      source.batch_total ??
+        source.batchTotal ??
+        source.chapter_count ??
+        source.chapterCount,
+    ),
+    batch_remaining: numberOrUndefined(
+      source.batch_remaining ?? source.batchRemaining,
     ),
     created_at: String(source.created_at ?? source.createdAt ?? ""),
     error: source.error as string | undefined,
@@ -1083,6 +1135,7 @@ export function normalizeProvider(value: unknown): ProviderProfile {
     capabilities: (source.capabilities ?? {}) as Record<string, boolean>,
     enabled:
       source.enabled === undefined ? true : Boolean(source.enabled),
+    is_default: Boolean(source.is_default ?? source.isDefault ?? false),
     deleted_at:
       source.deleted_at === null || source.deleted_at === undefined
         ? null
@@ -1101,4 +1154,27 @@ function numberOrUndefined(value: unknown): number | undefined {
     value !== ""
     ? parsed
     : undefined;
+}
+
+function textList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === "string") return item.trim();
+        if (item === undefined || item === null) return "";
+        try {
+          return (JSON.stringify(item) ?? "").trim();
+        } catch {
+          return String(item).trim();
+        }
+      })
+      .filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
 }
