@@ -18,6 +18,7 @@ from . import db as db_module
 from .config import (
     APP_HOST,
     APP_PORT,
+    AUTH_MODE,
     CORS_ORIGINS,
     CSRF_COOKIE_NAME,
     DATABASE_URL,
@@ -25,6 +26,7 @@ from .config import (
     MAIL_MODE,
     PUBLIC_BASE_URL,
     SESSION_COOKIE_SECURE,
+    SMTP_EXPLICITLY_CONFIGURED,
     SMTP_HOST,
     TRUSTED_HOSTS,
 )
@@ -60,10 +62,11 @@ def _validate_production_config() -> None:
         problems.append("生产 CORS Origin 必须使用 HTTPS")
     if not DATABASE_URL.startswith("mysql+pymysql://"):
         problems.append("生产数据库必须使用 mysql+pymysql:// 的 MySQL 8.4")
-    if not SMTP_HOST:
-        problems.append("生产环境必须配置 SMTP")
-    if MAIL_MODE != "smtp":
-        problems.append("生产环境 NOVEL_MAIL_MODE 必须为 smtp")
+    if AUTH_MODE == "email":
+        if not SMTP_EXPLICITLY_CONFIGURED or not SMTP_HOST:
+            problems.append("邮箱认证模式必须显式配置 NOVEL_SMTP_HOST")
+        if MAIL_MODE != "smtp":
+            problems.append("生产环境 NOVEL_MAIL_MODE 必须为 smtp")
     if problems:
         raise RuntimeError("生产安全配置无效：" + "；".join(problems))
 

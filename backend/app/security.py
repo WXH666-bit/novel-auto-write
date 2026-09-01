@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import re
 import secrets
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -23,6 +24,7 @@ from sqlalchemy.orm import Session
 from .config import (
     AUTH_LOCKOUT_MINUTES,
     AUTH_MAX_LOGIN_ATTEMPTS,
+    AUTH_MODE,
     AUTH_RATE_LIMIT_WINDOW_SECONDS,
     CORS_ORIGINS,
     CSRF_COOKIE_NAME,
@@ -51,6 +53,7 @@ except ImportError:  # pragma: no cover - exercised only before dependency insta
 
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_USERNAME_PUNCTUATION = frozenset("._-")
 
 
 def utc_now() -> datetime:
@@ -71,6 +74,24 @@ def normalize_email(email: str) -> str:
     value = email.strip().casefold()
     if len(value) > 320 or not _EMAIL_RE.fullmatch(value):
         raise ValueError("请输入有效邮箱地址")
+    return value
+
+
+def normalize_username(username: str) -> str:
+    """Normalize the deployment-local username used for identity lookups."""
+
+    value = unicodedata.normalize("NFKC", username).strip().casefold()
+    if (
+        len(value) < 3
+        or len(value) > 64
+        or not value[0].isalnum()
+        or not value[-1].isalnum()
+        or any(
+            not character.isalnum() and character not in _USERNAME_PUNCTUATION
+            for character in value
+        )
+    ):
+        raise ValueError("用户名需为 3 至 64 个字符，只能使用文字、数字及中间的 . _ -")
     return value
 
 
@@ -189,8 +210,15 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     user = db.get(User, session.user_id)
     if user is None or not user.is_active or user.id == LEGACY_OWNER_ID:
         raise auth_error("not_authenticated", "请先登录")
-    if not user.is_email_verified:
-        raise auth_error("email_not_verified", "请先验证邮箱", status.HTTP_403_FORBIDDEN)
+    if AUTH_MODE == "email":
+        if not user.email_normalized:
+            raise auth_error("not_authenticated", "请先登录")
+        if not user.is_email_verified:
+            raise auth_error("email_not_verified", "请先验证邮箱", status.HTTP_403_FORBIDDEN)
+    elif not user.username_normalized:
+        # A session created under another deployment mode must not become a
+        # login bypass after the operator switches identity modes.
+        raise auth_error("not_authenticated", "请先登录")
     session.last_seen_at = utc_now()
     validate_csrf(request, db, session)
     return user
@@ -201,7 +229,12 @@ def get_optional_user(request: Request, db: Session = Depends(get_db)) -> User |
     if session is None:
         return None
     user = db.get(User, session.user_id)
-    if user is None or not user.is_active or not user.is_email_verified:
+    if user is None or not user.is_active:
+        return None
+    if AUTH_MODE == "email":
+        if not user.email_normalized or not user.is_email_verified:
+            return None
+    elif not user.username_normalized:
         return None
     return user
 
@@ -417,6 +450,7 @@ __all__ = [
     "new_secret",
     "new_session",
     "normalize_email",
+    "normalize_username",
     "register_login_failure",
     "require_owned_project",
     "require_owned_provider",

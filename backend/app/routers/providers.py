@@ -170,7 +170,7 @@ def _audit(
             entity_type="provider_profile",
             entity_id=profile.id,
             actor_user_id=_owner(user),
-            actor=str(getattr(user, "email", "user")),
+            actor=user.username or user.email or user.id,
             after_json=after,
         )
     )

@@ -153,7 +153,7 @@ def test_mysql_empty_database_migrates_to_head(mysql_engine: Engine) -> None:
     assert {"alembic_version", "users", "projects", "search_documents"} <= tables
     with mysql_engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260901_0002"
+            "20260901_0003"
         )
     for table in ("projects", "provider_profiles"):
         owner = next(
@@ -165,8 +165,79 @@ def test_mysql_empty_database_migrates_to_head(mysql_engine: Engine) -> None:
             and foreign_key["referred_table"] == "users"
             for foreign_key in inspector.get_foreign_keys(table)
         )
+    user_columns = {column["name"]: column for column in inspector.get_columns("users")}
+    assert user_columns["email"]["nullable"] is True
+    assert user_columns["email_normalized"]["nullable"] is True
+    assert {"username", "username_normalized"} <= set(user_columns)
+    username_indexes = {
+        index["name"]: index for index in inspector.get_indexes("users")
+    }
+    assert username_indexes["ix_users_username_normalized"]["unique"] is True
+    assert "ck_users_identity_present" in {
+        constraint["name"] for constraint in inspector.get_check_constraints("users")
+    }
     indexes = {index["name"] for index in inspector.get_indexes("search_documents")}
     assert "ft_search_documents_ngram" in indexes
+
+
+def test_mysql_existing_0002_users_upgrade_to_username_identity(mysql_engine: Engine) -> None:
+    """The real 0002 shape is altered in place without losing email accounts."""
+
+    _reset_schema(mysql_engine)
+    with mysql_engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE users (
+                id VARCHAR(36) PRIMARY KEY,
+                email VARCHAR(320) NOT NULL,
+                email_normalized VARCHAR(320) NOT NULL,
+                display_name VARCHAR(120),
+                password_hash VARCHAR(512),
+                is_email_verified BOOLEAN NOT NULL,
+                is_active BOOLEAN NOT NULL,
+                default_provider_id VARCHAR(36),
+                failed_login_attempts INTEGER NOT NULL,
+                locked_until DATETIME,
+                last_login_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                UNIQUE KEY ix_users_email_normalized (email_normalized)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+            """
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE alembic_version "
+            "(version_num VARCHAR(32) NOT NULL PRIMARY KEY) ENGINE=InnoDB"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO alembic_version (version_num) VALUES ('20260901_0002')"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO users "
+            "(id,email,email_normalized,password_hash,is_email_verified,is_active,"
+            "failed_login_attempts,created_at,updated_at) VALUES "
+            "('old-email','Old@Example.test','old@example.test','hash',1,1,0,NOW(),NOW())"
+        )
+
+    run_migrations(mysql_engine)
+    inspector = inspect(mysql_engine)
+    columns = {column["name"]: column for column in inspector.get_columns("users")}
+    assert columns["email"]["nullable"] is True
+    assert columns["email_normalized"]["nullable"] is True
+    assert {"username", "username_normalized"} <= set(columns)
+    assert "ix_users_username_normalized" in {
+        index["name"] for index in inspector.get_indexes("users")
+    }
+    assert "ck_users_identity_present" in {
+        constraint["name"] for constraint in inspector.get_check_constraints("users")
+    }
+    with mysql_engine.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "20260901_0003"
+        )
+        assert connection.execute(
+            text("SELECT email_normalized FROM users WHERE id='old-email'")
+        ).scalar_one() == "old@example.test"
 
 
 def test_mysql_chinese_ngram_search_uses_only_accepted_content(

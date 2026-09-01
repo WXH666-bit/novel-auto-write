@@ -10,6 +10,7 @@ import type {
   SourceRef,
   StoryMap,
   TimelineEvent,
+  AuthConfig,
   AuthSession,
   User,
 } from "./types";
@@ -149,7 +150,8 @@ export function normalizeUser(value: unknown): User {
   const source = (value || {}) as Record<string, unknown>;
   return {
     id: String(source.id ?? source.user_id ?? ""),
-    email: String(source.email ?? source.email_address ?? ""),
+    email: String(source.email ?? source.email_address ?? "") || undefined,
+    username: String(source.username ?? source.user_name ?? "") || undefined,
     display_name: String(source.display_name ?? source.name ?? "") || undefined,
     is_email_verified: Boolean(
       source.is_email_verified ?? source.email_verified ?? source.verified,
@@ -183,15 +185,54 @@ export async function getCurrentUser(): Promise<AuthSession> {
   return normalizeAuthSession(await apiRequest<unknown>("/auth/me"));
 }
 
+export function normalizeAuthConfig(value: unknown): AuthConfig {
+  const source = (value || {}) as Record<string, unknown>;
+  const configSource =
+    source.config && typeof source.config === "object"
+      ? (source.config as Record<string, unknown>)
+      : source.data && typeof source.data === "object"
+        ? (source.data as Record<string, unknown>)
+        : source;
+  const mode = configSource.mode;
+  if (mode !== "email" && mode !== "username") {
+    throw new Error("服务器登录配置无效");
+  }
+  if (
+    typeof configSource.verification_required !== "boolean" ||
+    typeof configSource.password_reset_available !== "boolean"
+  ) {
+    throw new Error("服务器登录配置不完整");
+  }
+  return {
+    mode,
+    verification_required: configSource.verification_required,
+    password_reset_available: configSource.password_reset_available,
+  };
+}
+
+export async function getAuthConfig(): Promise<AuthConfig> {
+  return normalizeAuthConfig(await apiRequest<unknown>("/auth/config"));
+}
+
 export async function registerAccount(input: {
-  email: string;
+  email?: string;
+  username?: string;
   password: string;
   display_name?: string;
 }) {
+  const payload: Record<string, unknown> = {
+    password: input.password,
+    display_name: input.display_name,
+  };
+  if (input.username?.trim()) payload.username = input.username.trim();
+  if (input.email?.trim()) payload.email = input.email.trim();
+  if (!payload.username && !payload.email) {
+    throw new Error("请输入用户名或邮箱");
+  }
   return normalizeAuthSession(
     await apiRequest<unknown>("/auth/register", {
       method: "POST",
-      body: JSON.stringify(input),
+      body: JSON.stringify(payload),
     }),
   );
 }
@@ -214,11 +255,19 @@ export async function resendVerification(email?: string) {
   });
 }
 
-export async function loginAccount(input: { email: string; password: string }) {
+export async function loginAccount(input: {
+  identifier?: string;
+  email?: string;
+  username?: string;
+  password: string;
+}) {
+  const identifier =
+    input.identifier?.trim() || input.username?.trim() || input.email?.trim();
+  if (!identifier) throw new Error("请输入用户名或邮箱");
   return normalizeAuthSession(
     await apiRequest<unknown>("/auth/login", {
       method: "POST",
-      body: JSON.stringify(input),
+      body: JSON.stringify({ identifier, password: input.password }),
     }),
   );
 }

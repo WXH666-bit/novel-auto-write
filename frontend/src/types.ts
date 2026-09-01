@@ -7,6 +7,7 @@ export type AuthView =
   | "forgot-password"
   | "reset-password"
   | "account";
+export type AuthMode = "email" | "username";
 export type CanonStatus =
   | "pending"
   | "confirmed"
@@ -200,7 +201,8 @@ export interface ProviderProfile {
 
 export interface User {
   id: string;
-  email: string;
+  email?: string;
+  username?: string;
   display_name?: string;
   is_email_verified: boolean;
   is_active?: boolean;
@@ -211,6 +213,12 @@ export interface User {
 export interface AuthSession {
   user: User;
   csrf_token?: string;
+}
+
+export interface AuthConfig {
+  mode: AuthMode;
+  verification_required: boolean;
+  password_reset_available: boolean;
 }
 
 export interface ImportChapterPreview {

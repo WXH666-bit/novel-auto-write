@@ -11,10 +11,11 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..config import AUTH_RATE_LIMIT_WINDOW_SECONDS, CSRF_COOKIE_NAME
+from ..config import AUTH_MODE, AUTH_RATE_LIMIT_WINDOW_SECONDS, CSRF_COOKIE_NAME
 from ..db import get_db
 from ..models import AuditLog, EmailToken, Project, ProviderProfile, User
 from ..schemas import (
+    AuthConfigRead,
     ChangePasswordRequest,
     DeleteAccountRequest,
     ForgotPasswordRequest,
@@ -38,6 +39,7 @@ from ..security import (
     new_secret,
     new_session,
     normalize_email,
+    normalize_username,
     register_login_failure,
     revoke_all_sessions,
     revoke_session,
@@ -59,6 +61,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 VERIFY_TOKEN_TTL = timedelta(hours=24)
 RESET_TOKEN_TTL = timedelta(minutes=30)
 GENERIC_RECOVERY_MESSAGE = "如果该邮箱已注册，我们会发送一封邮件；请检查收件箱。"
+AUTH_MODE_UNAVAILABLE_MESSAGE = "当前部署未启用邮箱认证功能"
 
 
 class _AuthResponse(dict[str, Any]):
@@ -90,6 +93,31 @@ def _find_user(db: Session, email: str) -> User | None:
     except ValueError:
         return None
     return db.scalar(select(User).where(User.email_normalized == normalized))
+
+
+def _payload_identifier(payload: Any) -> str | None:
+    """Return the mode-independent identifier accepted by auth schemas."""
+
+    for value in (
+        getattr(payload, "identifier", None),
+        getattr(payload, "username", None),
+        getattr(payload, "email", None),
+    ):
+        if value is not None and value.strip():
+            return value
+    return None
+
+
+def _auth_mode_unavailable() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={"code": "auth_mode_unavailable", "message": AUTH_MODE_UNAVAILABLE_MESSAGE},
+    )
+
+
+def _require_email_auth_mode() -> None:
+    if AUTH_MODE != "email":
+        _auth_mode_unavailable()
 
 
 def _public_user(user: User) -> UserRead:
@@ -178,6 +206,17 @@ def csrf_token(request: Request, response: Response) -> dict[str, str]:
     return {"csrf_token": raw}
 
 
+@router.get("/config", response_model=AuthConfigRead)
+def auth_config() -> AuthConfigRead:
+    """Expose the deployment-selected authentication capabilities publicly."""
+
+    return AuthConfigRead(
+        mode=AUTH_MODE,
+        verification_required=AUTH_MODE == "email",
+        password_reset_available=AUTH_MODE == "email",
+    )
+
+
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 def register(
     payload: RegisterRequest, request: Request, db: Session = Depends(get_db)
@@ -193,22 +232,43 @@ def register(
     ):
         db.commit()
         raise HTTPException(status_code=429, detail="注册请求过于频繁，请稍后再试")
+    raw_identifier = _payload_identifier(payload)
     try:
-        email = normalize_email(payload.email)
+        if raw_identifier is None:  # Pydantic normally catches this first.
+            raise ValueError("必须提供登录标识")
         validate_password(payload.password)
+        if AUTH_MODE == "username":
+            username = normalize_username(raw_identifier)
+            if db.scalar(select(User).where(User.username_normalized == username)) is not None:
+                # Keep the rate-limit increment even when the account already exists.
+                db.commit()
+                raise HTTPException(status_code=409, detail="该用户名已注册")
+            email = None
+            email_normalized = None
+        else:
+            email = normalize_email(raw_identifier)
+            username = None
+            email_normalized = email
+            if db.scalar(select(User).where(User.email_normalized == email)) is not None:
+                # Keep the rate-limit increment even when the account already exists.
+                db.commit()
+                raise HTTPException(status_code=409, detail="该邮箱已注册")
+    except HTTPException:
+        raise
     except ValueError as exc:
         db.commit()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if db.scalar(select(User).where(User.email_normalized == email)) is not None:
-        # Keep the rate-limit increment even when the account already exists.
-        db.commit()
-        raise HTTPException(status_code=409, detail="该邮箱已注册")
     user = User(
-        email=payload.email.strip(),
-        email_normalized=email,
+        email=raw_identifier.strip() if AUTH_MODE == "email" else None,
+        email_normalized=email_normalized,
+        username=raw_identifier.strip() if AUTH_MODE == "username" else None,
+        username_normalized=username,
         display_name=payload.display_name.strip() if payload.display_name else None,
         password_hash=hash_password(payload.password),
-        is_email_verified=False,
+        # Username accounts have no email verification step and are usable
+        # immediately; this flag remains true for compatibility with clients
+        # that display the existing UserRead field.
+        is_email_verified=AUTH_MODE == "username",
         is_active=True,
     )
     try:
@@ -219,19 +279,29 @@ def register(
             db.flush()
     except IntegrityError as exc:
         db.commit()  # preserve the database-backed rate-limit increment
-        raise HTTPException(status_code=409, detail="该邮箱已注册") from exc
-    _, raw_token = _token(db, user, "verify_email", VERIFY_TOKEN_TTL)
-    _audit(db, action="auth.registered", user=user, after={"email": user.email})
+        detail = "该用户名已注册" if AUTH_MODE == "username" else "该邮箱已注册"
+        raise HTTPException(status_code=409, detail=detail) from exc
+    if AUTH_MODE == "email":
+        _, raw_token = _token(db, user, "verify_email", VERIFY_TOKEN_TTL)
+    else:
+        raw_token = None
+    _audit(
+        db,
+        action="auth.registered",
+        user=user,
+        after={"email": user.email, "username": user.username},
+    )
     db.commit()
-    try:
-        mailer.send_verification_email(user, raw_token)
-    except mailer.MailDeliveryError:
-        # Registration is still valid; the user can use resend-verification.
-        logger.exception("verification email delivery failed")
+    if raw_token is not None:
+        try:
+            mailer.send_verification_email(user, raw_token)
+        except mailer.MailDeliveryError:
+            # Registration is still valid; the user can use resend-verification.
+            logger.exception("verification email delivery failed")
     return {
         "user": _public_user(user).model_dump(mode="json"),
-        "verification_required": True,
-        "message": "注册成功，请验证邮箱后登录。",
+        "verification_required": AUTH_MODE == "email",
+        "message": "注册成功，请验证邮箱后登录。" if AUTH_MODE == "email" else "注册成功，请直接登录。",
     }
 
 
@@ -266,6 +336,7 @@ def verify_email(
     response: Response,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    _require_email_auth_mode()
     _verify_origin_for_auth_write(request)
     item = _verify_token(db, payload.token, "verify_email")
     user = db.get(User, item.user_id)
@@ -287,9 +358,13 @@ def verify_email(
 def resend_verification(
     payload: ResendVerificationRequest, request: Request, db: Session = Depends(get_db)
 ) -> dict[str, Any]:
+    _require_email_auth_mode()
     _verify_origin_for_auth_write(request)
     try:
-        email = normalize_email(payload.email)
+        raw_identifier = _payload_identifier(payload)
+        if raw_identifier is None:
+            raise ValueError
+        email = normalize_email(raw_identifier)
     except ValueError:
         # Keep the same response for malformed/unknown identifiers.
         return {"ok": True, "message": GENERIC_RECOVERY_MESSAGE}
@@ -328,25 +403,36 @@ def login(
     payload: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)
 ) -> dict[str, Any]:
     _verify_origin_for_auth_write(request)
+    raw_identifier = _payload_identifier(payload)
     try:
-        email = normalize_email(payload.email)
+        if raw_identifier is None:
+            raise ValueError
+        identifier = (
+            normalize_username(raw_identifier)
+            if AUTH_MODE == "username"
+            else normalize_email(raw_identifier)
+        )
     except ValueError:
         raise HTTPException(
             status_code=401,
-            detail={"code": "invalid_credentials", "message": "邮箱或密码错误"},
+            detail={
+                "code": "invalid_credentials",
+                "message": "用户名或密码错误" if AUTH_MODE == "username" else "邮箱或密码错误",
+            },
         ) from None
     if not consume_rate_limit(
         db,
         "login",
-        f"{_client_ip(request)}:{email}",
+        f"{_client_ip(request)}:{identifier}",
         limit=12,
         window_seconds=AUTH_RATE_LIMIT_WINDOW_SECONDS,
     ):
         db.commit()
         raise HTTPException(status_code=429, detail="登录尝试过于频繁，请稍后再试")
-    user = db.scalar(
-        select(User).where(User.email_normalized == email).with_for_update()
+    identity_column = (
+        User.username_normalized if AUTH_MODE == "username" else User.email_normalized
     )
+    user = db.scalar(select(User).where(identity_column == identifier).with_for_update())
     locked_until = as_utc(user.locked_until) if user else None
     if locked_until and locked_until > utc_now():
         db.commit()
@@ -354,11 +440,23 @@ def login(
     if user is None or not verify_password(user.password_hash, payload.password):
         register_login_failure(db, user)
         db.commit()
-        raise HTTPException(status_code=401, detail={"code": "invalid_credentials", "message": "邮箱或密码错误"})
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "invalid_credentials",
+                "message": "用户名或密码错误" if AUTH_MODE == "username" else "邮箱或密码错误",
+            },
+        )
     if not user.is_active:
         db.commit()
-        raise HTTPException(status_code=401, detail={"code": "invalid_credentials", "message": "邮箱或密码错误"})
-    if not user.is_email_verified:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "invalid_credentials",
+                "message": "用户名或密码错误" if AUTH_MODE == "username" else "邮箱或密码错误",
+            },
+        )
+    if AUTH_MODE == "email" and not user.is_email_verified:
         db.commit()
         raise HTTPException(status_code=403, detail={"code": "email_not_verified", "message": "请先验证邮箱"})
     clear_login_failures(user)
@@ -416,9 +514,13 @@ def me(user: User = Depends(get_current_user)) -> UserRead:
 def forgot_password(
     payload: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)
 ) -> dict[str, Any]:
+    _require_email_auth_mode()
     _verify_origin_for_auth_write(request)
     try:
-        email = normalize_email(payload.email)
+        raw_identifier = _payload_identifier(payload)
+        if raw_identifier is None:
+            raise ValueError
+        email = normalize_email(raw_identifier)
     except ValueError:
         return {"ok": True, "message": GENERIC_RECOVERY_MESSAGE}
     if not consume_rate_limit(
@@ -456,6 +558,7 @@ def reset_password(
     response: Response,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    _require_email_auth_mode()
     _verify_origin_for_auth_write(request)
     try:
         validate_password(payload.new_password)

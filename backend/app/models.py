@@ -14,6 +14,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -117,11 +118,22 @@ class User(Base):
     """
 
     __tablename__ = "users"
-    __table_args__ = (Index("ix_users_email_normalized", "email_normalized", unique=True),)
+    __table_args__ = (
+        Index("ix_users_email_normalized", "email_normalized", unique=True),
+        Index("ix_users_username_normalized", "username_normalized", unique=True),
+        CheckConstraint(
+            "email_normalized IS NOT NULL OR username_normalized IS NOT NULL",
+            name="ck_users_identity_present",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    email: Mapped[str] = mapped_column(String(320), nullable=False)
-    email_normalized: Mapped[str] = mapped_column(String(320), nullable=False)
+    # Email remains the identity in the default deployment mode, but is
+    # nullable so username-only deployments do not collect an email address.
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    email_normalized: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    username: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    username_normalized: Mapped[str | None] = mapped_column(String(120), nullable=True)
     display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String(512), nullable=True)
     is_email_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

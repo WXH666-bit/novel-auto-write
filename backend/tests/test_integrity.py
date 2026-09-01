@@ -8,13 +8,15 @@ from typing import Any
 
 import pytest
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from backend.app import cli as cli_module
 from backend.app import db as db_module
 from backend.app import models
 from backend.app.cli import claim_legacy
 from backend.app.config import LEGACY_OWNER_ID
-from backend.app.db import create_engine_for_url, init_db, rebuild_search_index
+from backend.app.db import create_engine_for_url, init_db, rebuild_search_index, run_migrations
 from backend.app.routers.canon import confirm_canon, mark_canon_needs_review
 from backend.app.routers.chapters import confirm_chapter
 from backend.app.services import providers as provider_service
@@ -400,9 +402,20 @@ def test_genuine_legacy_sqlite_migrates_owner_constraints_and_flat_uploads(
             and foreign_key["referred_table"] == "users"
             for foreign_key in inspector.get_foreign_keys(table)
         )
+    user_columns = {column["name"]: column for column in inspector.get_columns("users")}
+    assert user_columns["email"]["nullable"] is True
+    assert user_columns["email_normalized"]["nullable"] is True
+    assert user_columns["username"]["nullable"] is True
+    assert user_columns["username_normalized"]["nullable"] is True
+    assert "ix_users_username_normalized" in {
+        index["name"] for index in inspector.get_indexes("users")
+    }
+    assert "ck_users_identity_present" in {
+        constraint["name"] for constraint in inspector.get_check_constraints("users")
+    }
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260901_0002"
+            "20260901_0003"
         )
         migrated = connection.execute(
             text("SELECT owner_id,name,story_bible,canon_version,memory_epoch FROM projects")
@@ -430,7 +443,102 @@ def test_genuine_legacy_sqlite_migrates_owner_constraints_and_flat_uploads(
     engine.dispose()
 
 
+def test_existing_0002_sqlite_adds_nullable_username_identity(tmp_path) -> None:
+    database = tmp_path / "existing-0002.sqlite3"
+    engine = create_engine_for_url(f"sqlite:///{database.as_posix()}")
+    timestamp = "2026-08-31 12:00:00"
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE users (
+                id VARCHAR(36) PRIMARY KEY,
+                email VARCHAR(320) NOT NULL,
+                email_normalized VARCHAR(320) NOT NULL,
+                display_name VARCHAR(120),
+                password_hash VARCHAR(512),
+                is_email_verified BOOLEAN NOT NULL,
+                is_active BOOLEAN NOT NULL,
+                default_provider_id VARCHAR(36),
+                failed_login_attempts INTEGER NOT NULL,
+                locked_until DATETIME,
+                last_login_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX ix_users_email_normalized "
+            "ON users (email_normalized)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+        )
+        connection.execute(
+            text("INSERT INTO alembic_version VALUES ('20260901_0002')")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users "
+                "(id,email,email_normalized,password_hash,is_email_verified,is_active,"
+                "failed_login_attempts,created_at,updated_at) VALUES "
+                "('old-email','Old@Example.test','old@example.test','hash',1,1,0,"
+                ":created,:updated)"
+            ),
+            {"created": timestamp, "updated": timestamp},
+        )
+
+    run_migrations(engine)
+    inspector = inspect(engine)
+    columns = {column["name"]: column for column in inspector.get_columns("users")}
+    assert columns["email"]["nullable"] is True
+    assert columns["email_normalized"]["nullable"] is True
+    assert columns["username"]["nullable"] is True
+    assert columns["username_normalized"]["nullable"] is True
+    assert "ix_users_username_normalized" in {
+        index["name"] for index in inspector.get_indexes("users")
+    }
+    assert "ck_users_identity_present" in {
+        constraint["name"] for constraint in inspector.get_check_constraints("users")
+    }
+    with engine.begin() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "20260901_0003"
+        )
+        assert connection.execute(
+            text("SELECT email_normalized FROM users WHERE id='old-email'")
+        ).scalar_one() == "old@example.test"
+        for account_id, username in (("username-1", "writer"), ("username-2", "作者01")):
+            connection.execute(
+                text(
+                    "INSERT INTO users "
+                    "(id,email,email_normalized,username,username_normalized,password_hash,"
+                    "is_email_verified,is_active,failed_login_attempts,created_at,updated_at) "
+                    "VALUES (:id,NULL,NULL,:username,:username,'hash',1,1,0,:created,:updated)"
+                ),
+                {
+                    "id": account_id,
+                    "username": username,
+                    "created": timestamp,
+                    "updated": timestamp,
+                },
+            )
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO users "
+                    "(id,email,email_normalized,username,username_normalized,password_hash,"
+                    "is_email_verified,is_active,failed_login_attempts,created_at,updated_at) "
+                    "VALUES ('duplicate',NULL,NULL,'Writer','writer','hash',1,1,0,"
+                    ":created,:updated)"
+                ),
+                {"created": timestamp, "updated": timestamp},
+            )
+    engine.dispose()
+
+
 def test_claim_legacy_preserves_story_hash_and_rehomes_sources(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli_module, "AUTH_MODE", "email")
     engine = create_engine_for_url(f"sqlite:///{(tmp_path / 'legacy.sqlite3').as_posix()}")
     init_db(engine)
     factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -576,6 +684,38 @@ def test_claim_legacy_preserves_story_hash_and_rehomes_sources(tmp_path, monkeyp
         assert provider.api_key_ref == f"{user_id}:{provider_id}"
         assert provider_service.get_api_key(provider) == "legacy-private-key"
         assert fake_keyring.get_password(provider_service.KEYRING_SERVICE, provider_id) is None
+    engine.dispose()
+
+
+def test_claim_legacy_uses_the_deployment_identity_mode(tmp_path, monkeypatch) -> None:
+    engine = create_engine_for_url(f"sqlite:///{(tmp_path / 'username-claim.sqlite3').as_posix()}")
+    init_db(engine)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    with factory() as db:
+        user = models.User(
+            username="Owner_01",
+            username_normalized="owner_01",
+            password_hash="test-only",
+            is_email_verified=True,
+            is_active=True,
+        )
+        project = models.Project(owner_id=LEGACY_OWNER_ID, name="待认领旧项目")
+        db.add_all([user, project])
+        db.commit()
+        user_id = user.id
+        project_id = project.id
+
+    monkeypatch.setattr(db_module, "engine", engine)
+    monkeypatch.setattr(db_module, "SessionLocal", factory)
+    monkeypatch.setattr(db_module, "init_db", lambda *_args, **_kwargs: engine)
+    monkeypatch.setattr(cli_module, "AUTH_MODE", "username")
+    with pytest.raises(RuntimeError, match="--username"):
+        claim_legacy("owner@example.test")
+
+    result = claim_legacy(username=" OWNER_01 ")
+    assert result == {"username": "owner_01", "projects": 1, "providers": 0}
+    with factory() as db:
+        assert db.get(models.Project, project_id).owner_id == user_id
     engine.dispose()
 
 

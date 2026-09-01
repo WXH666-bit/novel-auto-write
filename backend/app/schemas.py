@@ -14,7 +14,8 @@ class ORMModel(BaseModel):
 
 class UserRead(ORMModel):
     id: str
-    email: str
+    email: str | None = None
+    username: str | None = None
     display_name: str | None = None
     is_email_verified: bool
     default_provider_id: str | None = None
@@ -23,9 +24,22 @@ class UserRead(ORMModel):
 
 
 class RegisterRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=320)
+    # ``identifier`` is the mode-independent field.  ``email`` and
+    # ``username`` remain accepted so older clients and newer username-aware
+    # clients can use the same endpoint during a deployment transition.
+    identifier: str | None = Field(default=None, min_length=1, max_length=320)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
+    username: str | None = Field(default=None, min_length=1, max_length=120)
     password: str = Field(min_length=12, max_length=128)
     display_name: str | None = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def require_identifier(self) -> RegisterRequest:
+        if not self.identifier:
+            self.identifier = self.username or self.email
+        if not self.identifier:
+            raise ValueError("必须提供 identifier、email 或 username")
+        return self
 
 
 class VerifyEmailRequest(BaseModel):
@@ -33,16 +47,36 @@ class VerifyEmailRequest(BaseModel):
 
 
 class ResendVerificationRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=320)
+    identifier: str | None = Field(default=None, min_length=1, max_length=320)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
+    username: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class LoginRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=320)
+    identifier: str | None = Field(default=None, min_length=1, max_length=320)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
+    username: str | None = Field(default=None, min_length=1, max_length=120)
     password: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def require_identifier(self) -> LoginRequest:
+        if not self.identifier:
+            self.identifier = self.username or self.email
+        if not self.identifier:
+            raise ValueError("必须提供 identifier、email 或 username")
+        return self
 
 
 class ForgotPasswordRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=320)
+    identifier: str | None = Field(default=None, min_length=1, max_length=320)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
+    username: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class AuthConfigRead(BaseModel):
+    mode: Literal["email", "username"]
+    verification_required: bool
+    password_reset_available: bool
 
 
 class ResetPasswordRequest(BaseModel):

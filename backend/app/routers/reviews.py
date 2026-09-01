@@ -29,6 +29,12 @@ from . import require_project, require_review
 router = APIRouter(prefix="/api", tags=["reviews"])
 
 
+def _actor(user: User) -> str:
+    """Stable human-readable audit identity for either deployment mode."""
+
+    return user.username or user.email or user.id
+
+
 class DraftEditPayload(BaseModel):
     content: str = Field(min_length=1)
     actor: str = "editor"
@@ -92,7 +98,7 @@ def edit_draft(
                 db,
                 bundle_id,
                 payload.content,
-                actor=current_user.email,
+                actor=_actor(current_user),
                 actor_user_id=current_user.id,
             )
         )
@@ -115,7 +121,7 @@ def reaudit(
             reaudit_review_bundle(
                 db,
                 bundle_id,
-                actor=current_user.email,
+                actor=_actor(current_user),
                 actor_user_id=current_user.id,
             )
         )
@@ -141,7 +147,7 @@ def reject(
                 db,
                 bundle_id,
                 payload.reason,
-                actor=current_user.email,
+                actor=_actor(current_user),
                 actor_user_id=current_user.id,
             )
         )
@@ -165,7 +171,7 @@ def accept(
                 db,
                 bundle_id,
                 force_reason=payload.force_reason,
-                actor=current_user.email,
+                actor=_actor(current_user),
                 actor_user_id=current_user.id,
             )
         )

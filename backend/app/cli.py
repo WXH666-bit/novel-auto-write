@@ -14,27 +14,49 @@ import sys
 from sqlalchemy import select
 
 from . import db as db_module
-from .config import LEGACY_OWNER_ID
+from .config import AUTH_MODE, LEGACY_OWNER_ID
 from .models import AuditLog, Project, ProviderProfile, User
-from .security import normalize_email
+from .security import normalize_email, normalize_username
 from .services.providers import migrate_legacy_credentials
 from .services.storage import migrate_import_storage
 
 
-def claim_legacy(email: str) -> dict[str, int | str]:
+def claim_legacy(
+    email: str | None = None, *, username: str | None = None
+) -> dict[str, int | str]:
     """Transfer quarantined old rows to an existing verified account."""
 
-    normalized = normalize_email(email)
+    if bool(email) == bool(username):
+        raise RuntimeError("必须指定 --email 或 --username，且只能指定一个")
+    if AUTH_MODE == "email" and username is not None:
+        raise RuntimeError("当前部署使用邮箱认证，请使用 --email")
+    if AUTH_MODE == "username" and email is not None:
+        raise RuntimeError("当前部署使用用户名认证，请使用 --username")
+    normalized_email: str | None = None
+    normalized_username: str | None = None
+    if username:
+        normalized_username = normalize_username(username)
+    else:
+        normalized_email = normalize_email(email or "")
     db_module.init_db()
     db = db_module.SessionLocal()
     storage_migration = None
     credential_migration = None
     try:
-        user = db.scalar(select(User).where(User.email_normalized == normalized))
+        if normalized_username is not None:
+            user = db.scalar(select(User).where(User.username_normalized == normalized_username))
+        else:
+            user = db.scalar(select(User).where(User.email_normalized == normalized_email))
         if user is None:
-            raise RuntimeError("指定邮箱尚未注册")
-        if not user.is_active or not user.is_email_verified:
-            raise RuntimeError("指定账号必须已激活并完成邮箱验证")
+            raise RuntimeError(
+                "指定用户名尚未注册" if normalized_username is not None else "指定邮箱尚未注册"
+            )
+        if not user.is_active or (AUTH_MODE == "email" and not user.is_email_verified):
+            raise RuntimeError(
+                "指定账号必须已激活并完成邮箱验证"
+                if AUTH_MODE == "email"
+                else "指定账号必须已激活"
+            )
         if user.id == LEGACY_OWNER_ID:
             raise RuntimeError("legacy_owner 不可登录或领取自身数据")
         projects = db.scalars(
@@ -80,7 +102,11 @@ def claim_legacy(email: str) -> dict[str, int | str]:
                 # search is derived and startup will rebuild it again.
                 pass
         return {
-            "email": normalized,
+            **(
+                {"username": normalized_username}
+                if normalized_username is not None
+                else {"email": normalized_email}
+            ),
             "projects": len(projects),
             "providers": len(providers),
         }
@@ -104,8 +130,10 @@ def migrate() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     commands = parser.add_subparsers(dest="command", required=True)
-    claim = commands.add_parser("claim-legacy", help="把旧单用户数据交给已验证账号")
-    claim.add_argument("--email", required=True, help="已注册且已验证的账号邮箱")
+    claim = commands.add_parser("claim-legacy", help="把旧单用户数据交给当前模式的可登录账号")
+    identity = claim.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--email", help="已注册且已验证的账号邮箱")
+    identity.add_argument("--username", help="已注册的用户名账号")
     commands.add_parser("migrate", help="执行数据库迁移/兼容初始化")
     return parser
 
@@ -114,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "claim-legacy":
-            result = claim_legacy(args.email)
+            result = claim_legacy(email=args.email, username=args.username)
         else:
             migrate()
             result = {"ok": True}

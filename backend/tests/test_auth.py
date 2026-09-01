@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,11 +17,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app import db as db_module
+from backend.app import main as main_module
 from backend.app import models
 from backend.app import security as security_module
 from backend.app.db import create_engine_for_url, get_db, init_db
 from backend.app.main import app
 from backend.app.routers import auth as auth_router
+from backend.app.routers import reviews as reviews_router
 from backend.app.schemas import DeleteAccountRequest
 from backend.app.security import hash_password, hash_secret, utc_now
 from backend.app.services import mailer
@@ -27,6 +33,10 @@ from backend.app.services.generation import create_generation_run
 
 @pytest.fixture
 def auth_client(tmp_path, monkeypatch) -> Iterator[tuple[TestClient, dict[str, str], Any]]:
+    # Most lifecycle regressions exercise the backwards-compatible default;
+    # individual username tests override both import-time bindings explicitly.
+    monkeypatch.setattr(auth_router, "AUTH_MODE", "email")
+    monkeypatch.setattr(security_module, "AUTH_MODE", "email")
     engine = create_engine_for_url(f"sqlite:///{(tmp_path / 'auth.sqlite3').as_posix()}")
     init_db(engine)
     testing_session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -99,6 +109,198 @@ def test_register_verify_login_and_csrf(auth_client) -> None:
     assert forbidden_origin.status_code == 403
     assert client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf}).status_code == 200
     assert client.get("/api/auth/me").status_code == 401
+
+
+def test_email_auth_config_is_the_backwards_compatible_default(auth_client) -> None:
+    client, _tokens, _factory = auth_client
+    response = client.get("/api/auth/config")
+    assert response.status_code == 200
+    assert response.json() == {
+        "mode": "email",
+        "verification_required": True,
+        "password_reset_available": True,
+    }
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_username_mode_registers_without_email_or_mail_and_logs_in(
+    auth_client, monkeypatch
+) -> None:
+    client, tokens, factory = auth_client
+    monkeypatch.setattr(auth_router, "AUTH_MODE", "username")
+    monkeypatch.setattr(security_module, "AUTH_MODE", "username")
+
+    config = client.get("/api/auth/config")
+    assert config.json() == {
+        "mode": "username",
+        "verification_required": False,
+        "password_reset_available": False,
+    }
+    registered = client.post(
+        "/api/auth/register",
+        json={
+            "username": "  Ｗriter_01  ",
+            "password": "a sufficiently long password",
+            "display_name": "无邮箱作者",
+        },
+    )
+    assert registered.status_code == 201, registered.text
+    assert registered.json()["verification_required"] is False
+    assert registered.json()["user"]["email"] is None
+    assert registered.json()["user"]["username"] == "Ｗriter_01"
+    assert tokens == {}
+    assert client.get("/api/auth/me").status_code == 401
+
+    with factory() as db:
+        user = db.scalar(
+            select(models.User).where(models.User.username_normalized == "writer_01")
+        )
+        assert user is not None
+        assert user.email is None
+        assert user.email_normalized is None
+        assert user.is_email_verified is True
+        assert reviews_router._actor(user) == "Ｗriter_01"
+        assert db.query(models.EmailToken).count() == 0
+
+    wrong = client.post(
+        "/api/auth/login",
+        json={"identifier": "WRITER_01", "password": "wrong password"},
+    )
+    unknown = client.post(
+        "/api/auth/login",
+        json={"identifier": "unknown_01", "password": "wrong password"},
+    )
+    assert wrong.status_code == unknown.status_code == 401
+    assert wrong.json()["detail"] == unknown.json()["detail"]
+
+    login = client.post(
+        "/api/auth/login",
+        json={
+            "identifier": " WRITER_01 ",
+            "password": "a sufficiently long password",
+        },
+    )
+    assert login.status_code == 200, login.text
+    assert login.json()["user"]["username"] == "Ｗriter_01"
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["email"] is None
+
+    csrf = client.cookies["novel_csrf"]
+    changed = client.post(
+        "/api/auth/change-password",
+        json={
+            "current_password": "a sufficiently long password",
+            "new_password": "a different sufficiently long password",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert changed.status_code == 200
+
+    provider = client.post(
+        "/api/providers",
+        json={
+            "name": "用户名账号模型",
+            "protocol": "chat_completions",
+            "base_url": "http://127.0.0.1:9999/v1",
+            "default_model": "local-model",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert provider.status_code == 201, provider.text
+    with factory() as db:
+        audit = db.scalar(
+            select(models.AuditLog).where(
+                models.AuditLog.action == "provider.created"
+            )
+        )
+        assert audit is not None
+        assert audit.actor == "Ｗriter_01"
+        assert audit.actor_user_id == login.json()["user"]["id"]
+
+    # Switching a running deployment does not turn an existing session into
+    # a valid account of the other identity mode.
+    monkeypatch.setattr(security_module, "AUTH_MODE", "email")
+    assert client.get("/api/auth/me").status_code == 401
+
+
+def test_username_mode_rejects_duplicates_invalid_names_and_email_flows(
+    auth_client, monkeypatch
+) -> None:
+    client, tokens, factory = auth_client
+    monkeypatch.setattr(auth_router, "AUTH_MODE", "username")
+    monkeypatch.setattr(security_module, "AUTH_MODE", "username")
+    password = "a sufficiently long password"
+    assert client.post(
+        "/api/auth/register", json={"username": "作者_01", "password": password}
+    ).status_code == 201
+    duplicate = client.post(
+        "/api/auth/register", json={"username": " 作者_01 ", "password": password}
+    )
+    assert duplicate.status_code == 409
+
+    for invalid in ("ab", "...", "-writer", "writer-", "writer/name"):
+        response = client.post(
+            "/api/auth/register", json={"username": invalid, "password": password}
+        )
+        assert response.status_code == 422, (invalid, response.text)
+
+    disabled_requests = (
+        ("/api/auth/verify-email", {"token": "x" * 32}),
+        ("/api/auth/resend-verification", {"email": "writer@example.test"}),
+        ("/api/auth/forgot-password", {"email": "writer@example.test"}),
+        (
+            "/api/auth/reset-password",
+            {"token": "x" * 32, "new_password": "another long enough password"},
+        ),
+    )
+    for path, payload in disabled_requests:
+        response = client.post(path, json=payload)
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "auth_mode_unavailable"
+    assert tokens == {}
+    with factory() as db:
+        assert db.query(models.EmailToken).count() == 0
+
+
+def test_invalid_auth_mode_fails_during_process_import() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["NOVEL_AUTH_MODE"] = "hybrid"
+    env["PYTHONPATH"] = str(repository_root)
+    completed = subprocess.run(
+        [sys.executable, "-c", "from backend.app import config"],
+        cwd=repository_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "NOVEL_AUTH_MODE" in completed.stderr
+
+
+def test_production_smtp_is_required_only_for_email_mode(monkeypatch) -> None:
+    monkeypatch.setattr(main_module, "IS_PRODUCTION", True)
+    monkeypatch.setattr(main_module, "PUBLIC_BASE_URL", "https://novel.example")
+    monkeypatch.setattr(main_module, "SESSION_COOKIE_SECURE", True)
+    monkeypatch.setattr(main_module, "TRUSTED_HOSTS", ["novel.example"])
+    monkeypatch.setattr(main_module, "CORS_ORIGINS", ["https://novel.example"])
+    monkeypatch.setattr(
+        main_module,
+        "DATABASE_URL",
+        "mysql+pymysql://novel:test@127.0.0.1/novel",
+    )
+    monkeypatch.setattr(main_module, "SMTP_EXPLICITLY_CONFIGURED", False)
+    monkeypatch.setattr(main_module, "SMTP_HOST", "127.0.0.1")
+    monkeypatch.setattr(main_module, "MAIL_MODE", "disabled")
+
+    monkeypatch.setattr(main_module, "AUTH_MODE", "username")
+    main_module._validate_production_config()
+
+    monkeypatch.setattr(main_module, "AUTH_MODE", "email")
+    with pytest.raises(RuntimeError, match="NOVEL_SMTP_HOST"):
+        main_module._validate_production_config()
 
 
 def test_email_action_tokens_use_url_fragments_not_query_strings(monkeypatch) -> None:

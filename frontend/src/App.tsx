@@ -98,7 +98,10 @@ import {
   testProvider,
   updateChapter,
 } from "./api";
-import AuthScreen, { AccountSecurityView } from "./AuthScreen";
+import AuthScreen, {
+  AccountSecurityView,
+  getAuthViewFromPath,
+} from "./AuthScreen";
 import type {
   AuditIssue,
   CanonChange,
@@ -877,13 +880,14 @@ function Workspace({
             className="avatar"
             onClick={() => setAccountMenuOpen((open) => !open)}
             aria-label="打开账号菜单"
+            aria-haspopup="menu"
             aria-expanded={accountMenuOpen}
           >
-            {(session.user.display_name || session.user.email || "章").slice(0, 1).toUpperCase()}
+            {(session.user.display_name || session.user.username || session.user.email || "章").slice(0, 1).toUpperCase()}
           </button>
           {accountMenuOpen && (
             <div className="account-menu" role="menu">
-              <div className="account-menu-head"><span className="account-menu-avatar">{(session.user.display_name || session.user.email || "章").slice(0, 1).toUpperCase()}</span><div><strong>{session.user.display_name || "未设置称呼"}</strong><small>{session.user.email}</small></div></div>
+              <div className="account-menu-head"><span className="account-menu-avatar">{(session.user.display_name || session.user.username || session.user.email || "章").slice(0, 1).toUpperCase()}</span><div><strong>{session.user.display_name || "未设置称呼"}</strong><small>{session.user.username ? `用户名：${session.user.username}` : session.user.email || "账号身份不可用"}</small></div></div>
               <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onAccount(); }}><UserRound size={14} /> 账号与安全</button>
               <button role="menuitem" onClick={() => { setAccountMenuOpen(false); setView("settings"); }}><Settings size={14} /> 模型与生成</button>
               <div className="account-menu-rule" />
@@ -1125,6 +1129,7 @@ export default function App() {
     staleTime: 5 * 60_000,
   });
   const session = authCleared ? undefined : authQuery.data;
+  const deepLinkView = getAuthViewFromPath();
 
   const clearClientState = useCallback(() => {
     void queryClient.cancelQueries();
@@ -1149,11 +1154,29 @@ export default function App() {
     }
   };
 
+  const renderAuthScreen = (initialView: AuthView) => (
+    <AuthScreen
+      initialView={initialView}
+      onNavigate={setAuthView}
+      onSessionCleared={clearClientState}
+      onAuthenticated={(next) => {
+        setAuthCleared(false);
+        queryClient.setQueryData(["auth", "me"], next);
+        setAccountView(false);
+      }}
+    />
+  );
+
+  // Verification/reset links must take precedence even when another account
+  // already has a cached session in this browser.
+  if (deepLinkView) {
+    return renderAuthScreen(deepLinkView);
+  }
   if (authQuery.isLoading && !authCleared) {
     return <div className="auth-loading"><div className="auth-loading-mark"><BookOpen size={19} /></div><span>正在打开你的故事正典…</span></div>;
   }
   if (!session?.user?.id) {
-    return <AuthScreen initialView={authView} onNavigate={setAuthView} onAuthenticated={(next) => { setAuthCleared(false); queryClient.setQueryData(["auth", "me"], next); setAccountView(false); }} />;
+    return renderAuthScreen(authView);
   }
   if (accountView) {
     return <AccountSecurityView session={session} onBack={() => setAccountView(false)} onLogout={() => void doLogout(false)} onLogoutAll={() => void doLogout(true)} onSession={(next) => queryClient.setQueryData(["auth", "me"], next)} />;

@@ -30,6 +30,13 @@ DEBUG = os.getenv("NOVEL_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
 ENVIRONMENT = os.getenv("NOVEL_ENV", "local").strip().lower()
 IS_PRODUCTION = ENVIRONMENT in {"production", "prod"}
 
+# Authentication is selected once by the deployment operator.  ``email`` is
+# the backwards-compatible default; ``username`` deliberately has no email
+# dependency, so it can run without an SMTP service.
+AUTH_MODE = os.getenv("NOVEL_AUTH_MODE", "email").strip().lower()
+if AUTH_MODE not in {"email", "username"}:
+    raise ValueError("NOVEL_AUTH_MODE 必须为 email 或 username")
+
 
 def _csv_env(name: str, default: str = "") -> list[str]:
     return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
@@ -78,6 +85,7 @@ AUTH_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("NOVEL_AUTH_RATE_LIMIT_WINDOW_SEC
 # Email delivery.  Local development can point these values at Mailpit, while
 # production uses a conventional authenticated SMTP relay.
 SMTP_HOST = os.getenv("NOVEL_SMTP_HOST", "127.0.0.1")
+SMTP_EXPLICITLY_CONFIGURED = bool(os.getenv("NOVEL_SMTP_HOST", "").strip())
 SMTP_PORT = int(os.getenv("NOVEL_SMTP_PORT", "1025"))
 SMTP_USERNAME = os.getenv("NOVEL_SMTP_USERNAME", "")
 SMTP_PASSWORD = os.getenv("NOVEL_SMTP_PASSWORD", "")

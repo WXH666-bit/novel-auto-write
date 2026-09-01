@@ -2,7 +2,7 @@
 
 “章回”把长篇小说的正文、人物状态、世界规则、时间线、关系、物品、剧情线、伏笔与审核记录保存成可追溯的故事正典。草稿只有在用户审核接受后，才会与正典在同一事务中生效；拒绝草稿不会污染后续记忆。
 
-当前版本支持账号与完全私有的数据空间。每位用户只能看到自己的项目、章节、正典、任务、审核包、导入文件和模型配置。系统不内置 Demo 模型，新账号必须自行添加 Provider 并明确设为默认，才能开始生成。
+当前版本支持账号与完全私有的数据空间。每位用户只能看到自己的项目、章节、正典、任务、审核包、导入文件和模型配置。部署者可以选择“邮箱 + 密码并验证邮箱”或“用户名 + 密码、无需邮箱”两种登录模式。系统不内置 Demo 模型，新账号必须自行添加 Provider 并明确设为默认，才能开始生成。
 
 ## 连续性与隔离保证
 
@@ -15,12 +15,25 @@
 
 ## Windows 本地运行
 
-前置条件：Python 3.11、Node.js（含 npm）、PowerShell。邮件验证推荐使用 Docker 启动 Mailpit；也可以改用自己的 SMTP。
+前置条件：Python 3.11、Node.js（含 npm）、PowerShell。首次安装先执行：
 
 ```powershell
 Set-Location C:\Users\<你的用户名>\Desktop\novel_auto_write
 ./setup.ps1
+```
+
+部署者必须为整套服务选择一种登录模式。默认的邮箱验证模式可使用 Mailpit 接收本地测试邮件：
+
+```powershell
+$env:NOVEL_AUTH_MODE = "email"
 docker compose -f deploy/compose.local.yml up -d
+./start.ps1
+```
+
+如果希望直接使用用户名和密码、不收集邮箱也不验证邮箱，则不需要 Docker 或 SMTP：
+
+```powershell
+$env:NOVEL_AUTH_MODE = "username"
 ./start.ps1
 ```
 
@@ -30,7 +43,13 @@ docker compose -f deploy/compose.local.yml up -d
 - Mailpit 收件箱：<http://127.0.0.1:8025>
 - API 文档：<http://127.0.0.1:8000/docs>
 
-注册后，到 Mailpit 打开验证邮件，再登录并在“模型设置”中添加 Provider。`setup.ps1` 会在项目根目录创建 `.venv`、安装后端依赖、安装 npm 依赖并构建前端；`start.ps1` 默认只监听 `127.0.0.1:8000`。
+邮箱模式注册后，到 Mailpit 打开验证邮件；用户名模式注册后可直接登录。登录后在“模型设置”中添加 Provider。`setup.ps1` 会在项目根目录创建 `.venv`、安装后端依赖、安装 npm 依赖并构建前端；`start.ps1` 默认只监听 `127.0.0.1:8000`。
+
+`NOVEL_AUTH_MODE` 只允许 `email` 或 `username`，默认是 `email`。它是服务器级配置，不是用户级选项；同一实例不会在登录页同时开放两种注册方式。应在首次上线前确定并保持稳定：改变该值只会改变登录入口，不会自动把已有邮箱账号转换为用户名账号，反之亦然。
+
+用户名会做 NFKC、去除首尾空格和大小写归一化；长度为 3–64 个字符，可使用中文等文字、数字，以及位于中间的 `.`、`_`、`-`。例如 `Writer_01` 与 `writer_01` 视为同一账号。
+
+用户名模式不收集邮箱，因此也没有“忘记密码”邮件找回入口；用户应自行妥善保管密码。已登录用户仍可在“账号与安全”中修改密码并撤销其他设备会话。
 
 如果 PowerShell 禁止脚本执行：
 
@@ -39,7 +58,7 @@ powershell -ExecutionPolicy Bypass -File ./setup.ps1
 powershell -ExecutionPolicy Bypass -File ./start.ps1
 ```
 
-不使用 Docker 时，可以在启动前设置标准 SMTP：
+邮箱模式不使用 Docker 时，可以在启动前设置标准 SMTP：
 
 ```powershell
 $env:NOVEL_SMTP_HOST = "smtp.example.com"
@@ -53,11 +72,15 @@ $env:NOVEL_SMTP_FROM = "novel@example.com"
 
 ## 认领升级前的旧项目
 
-原单用户数据库升级时，旧项目会先归属一个不可登录的 `legacy_owner`，不会自动交给公网第一个注册者。目标账号注册并完成邮箱验证后，由本机运维执行：
+原单用户数据库升级时，旧项目会先归属一个不可登录的 `legacy_owner`，不会自动交给公网第一个注册者。由本机运维根据当前登录模式交给目标账号：
 
 ```powershell
+# 邮箱模式：目标账号必须已完成邮箱验证
 $env:PYTHONPATH = "backend"
 ./.venv/Scripts/python.exe -m app.cli claim-legacy --email "owner@example.com"
+
+# 用户名模式：目标账号注册后即可认领
+./.venv/Scripts/python.exe -m app.cli claim-legacy --username "owner_name"
 ```
 
 命令不重写项目、章节、修订或正典内容，内容哈希保持不变；若旧项目含原始导入文件，会同时将它们安全迁入 `uploads/<user_id>/<project_id>/` 的新租户目录。旧版以裸 `provider_id` 保存的系统凭据也会原子地改名为 `user_id:provider_id`；请务必使用原服务系统账号执行命令，以便访问同一凭据库。迁移前会自动创建 SQLite 一致性快照。
@@ -88,14 +111,14 @@ data/
 
 ## Linux 生产部署
 
-生产目标为单台应用主机、MySQL 8.4 LTS、固定 HTTPS 域名、标准 SMTP 和固定 Linux 服务账号。示例位于：
+生产目标为单台应用主机、MySQL 8.4 LTS、固定 HTTPS 域名和固定 Linux 服务账号；只有邮箱模式需要标准 SMTP。示例位于：
 
 - `deploy/compose.mysql.yml`：MySQL 8.4、`utf8mb4_0900_ai_ci`、`ngram_token_size=2`；
 - `deploy/novel-auto-write.service`：systemd 服务；
 - `deploy/Caddyfile`：HTTPS 反向代理；
 - `.env.example`：应用环境变量参考。
 
-生产必须设置 `NOVEL_ENV=production`、HTTPS 的公开地址、可信 Host、精确 CORS 来源和安全 Cookie。Linux 凭据库使用 Secret Service，服务必须以固定账号运行并拥有可用的 DBus/Secret Service 会话。多应用节点不在首版范围内；扩容前需把凭据迁移到外部 Secrets Manager。
+生产必须设置 `NOVEL_ENV=production`、`NOVEL_AUTH_MODE=email` 或 `NOVEL_AUTH_MODE=username`、HTTPS 的公开地址、可信 Host、精确 CORS 来源和安全 Cookie。邮箱模式还必须配置 SMTP；用户名模式不会调用邮件服务。Linux 凭据库使用 Secret Service，服务必须以固定账号运行并拥有可用的 DBus/Secret Service 会话。多应用节点不在首版范围内；扩容前需把凭据迁移到外部 Secrets Manager。
 
 执行数据库迁移：
 
