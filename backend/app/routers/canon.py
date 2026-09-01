@@ -7,9 +7,19 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db, rebuild_search_index
-from ..models import AuditLog, CanonItem, Chapter, ChapterRevision, json_text, utcnow
+from ..models import (
+    AuditLog,
+    CanonItem,
+    Chapter,
+    ChapterRevision,
+    Project,
+    User,
+    json_text,
+    utcnow,
+)
 from ..schemas import CanonConfirmRequest, CanonItemCreate, CanonItemRead, CanonItemUpdate
-from . import require_project
+from ..security import get_current_user
+from . import require_canon_item, require_project
 
 router = APIRouter(prefix="/api", tags=["canon"])
 _STATUS_ALIASES = {
@@ -18,13 +28,6 @@ _STATUS_ALIASES = {
     "已取代": "superseded",
     "待复核": "needs_review",
 }
-
-
-def require_canon(db: Session, item_id: str) -> CanonItem:
-    item = db.get(CanonItem, item_id)
-    if item is None:
-        raise HTTPException(status_code=404, detail="正典条目不存在")
-    return item
 
 
 def _validate_sources(
@@ -59,9 +62,10 @@ def list_canon(
     project_id: str,
     status_filter: str | None = Query(default=None, alias="status"),
     category: str | None = None,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[CanonItemRead]:
-    require_project(db, project_id)
+    require_project(db, project_id, current_user)
     statement = (
         select(CanonItem).where(CanonItem.project_id == project_id).order_by(CanonItem.created_at)
     )
@@ -84,9 +88,12 @@ def list_canon(
     include_in_schema=False,
 )
 def create_canon(
-    project_id: str, payload: CanonItemCreate, db: Session = Depends(get_db)
+    project_id: str,
+    payload: CanonItemCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> CanonItemRead:
-    project = require_project(db, project_id)
+    project = require_project(db, project_id, current_user)
     _validate_sources(db, project_id, payload.source_chapter_id, payload.source_revision_id)
     normalized_status = _STATUS_ALIASES.get(payload.status, payload.status)
     if normalized_status not in {"pending", "needs_review", "superseded"}:
@@ -120,11 +127,16 @@ def create_canon(
             entity_type="canon_item",
             entity_id=item.id,
             after_json={"key": item.key, "status": item.status},
+            actor_user_id=current_user.id,
         )
     )
     db.commit()
     try:
-        rebuild_search_index(db_engine=db.get_bind())
+        rebuild_search_index(
+            db_engine=db.get_bind(),
+            owner_id=current_user.id,
+            project_id=project.id,
+        )
     except Exception:
         pass
     db.refresh(item)
@@ -133,16 +145,23 @@ def create_canon(
 
 @router.get("/canon/{item_id}", response_model=CanonItemRead)
 @router.get("/canon-items/{item_id}", response_model=CanonItemRead, include_in_schema=False)
-def get_canon(item_id: str, db: Session = Depends(get_db)) -> CanonItemRead:
-    return CanonItemRead.model_validate(require_canon(db, item_id))
+def get_canon(
+    item_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CanonItemRead:
+    return CanonItemRead.model_validate(require_canon_item(db, item_id, current_user))
 
 
 @router.patch("/canon/{item_id}", response_model=CanonItemRead)
 @router.patch("/canon-items/{item_id}", response_model=CanonItemRead, include_in_schema=False)
 def update_canon(
-    item_id: str, payload: CanonItemUpdate, db: Session = Depends(get_db)
+    item_id: str,
+    payload: CanonItemUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> CanonItemRead:
-    item = require_canon(db, item_id)
+    item = require_canon_item(db, item_id, current_user)
     values = payload.model_dump(exclude_unset=True)
     requested_status = values.get("status")
     if requested_status in _STATUS_ALIASES:
@@ -164,7 +183,7 @@ def update_canon(
     for key, value in values.items():
         setattr(item, key, value)
     if requested_status == "confirmed":
-        _confirm_item(db, item, CanonConfirmRequest())
+        _confirm_item(db, item, CanonConfirmRequest(), current_user)
     item.updated_at = utcnow()
     db.add(
         AuditLog(
@@ -174,19 +193,47 @@ def update_canon(
             entity_id=item.id,
             before_json=before,
             after_json={key: getattr(item, key) for key in values},
+            actor_user_id=current_user.id,
         )
     )
     db.commit()
     try:
-        rebuild_search_index(db_engine=db.get_bind())
+        rebuild_search_index(
+            db_engine=db.get_bind(),
+            owner_id=current_user.id,
+            project_id=item.project_id,
+        )
     except Exception:
         pass
     db.refresh(item)
     return CanonItemRead.model_validate(item)
 
 
-def _confirm_item(db: Session, item: CanonItem, payload: CanonConfirmRequest) -> CanonItem:
-    project = require_project(db, item.project_id)
+def _confirm_item(
+    db: Session, item: CanonItem, payload: CanonConfirmRequest, current_user: User
+) -> CanonItem:
+    project = require_project(db, item.project_id, current_user)
+    # Serialize every canon pointer advance at the project row.  Refresh the
+    # item after acquiring the lock so simultaneous confirmations of the same
+    # fact remain idempotent rather than consuming two canon versions.
+    db.flush()
+    project_id = project.id
+    project = db.scalar(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if project is None:  # pragma: no cover - guarded tenant lookup
+        raise HTTPException(status_code=404, detail="项目不存在")
+    item = db.scalar(
+        select(CanonItem)
+        .where(CanonItem.id == item.id, CanonItem.project_id == project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if item is None:  # pragma: no cover - guarded tenant lookup
+        raise HTTPException(status_code=404, detail="正典条目不存在")
     if item.status == "confirmed":
         return item
     if payload.force and not payload.reason:
@@ -205,6 +252,7 @@ def _confirm_item(db: Session, item: CanonItem, payload: CanonConfirmRequest) ->
             entity_id=item.id,
             reason=payload.reason,
             after_json={"canon_version": project.canon_version, "is_hard": item.is_hard},
+            actor_user_id=current_user.id,
         )
     )
     return item
@@ -215,13 +263,20 @@ def _confirm_item(db: Session, item: CanonItem, payload: CanonConfirmRequest) ->
     "/canon-items/{item_id}/confirm", response_model=CanonItemRead, include_in_schema=False
 )
 def confirm_canon(
-    item_id: str, payload: CanonConfirmRequest | None = None, db: Session = Depends(get_db)
+    item_id: str,
+    payload: CanonConfirmRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> CanonItemRead:
-    item = require_canon(db, item_id)
-    _confirm_item(db, item, payload or CanonConfirmRequest())
+    item = require_canon_item(db, item_id, current_user)
+    _confirm_item(db, item, payload or CanonConfirmRequest(), current_user)
     db.commit()
     try:
-        rebuild_search_index(db_engine=db.get_bind())
+        rebuild_search_index(
+            db_engine=db.get_bind(),
+            owner_id=current_user.id,
+            project_id=item.project_id,
+        )
     except Exception:
         pass
     db.refresh(item)
@@ -237,13 +292,23 @@ def confirm_project_canon(
     project_id: str,
     item_id: str,
     payload: CanonConfirmRequest | None = None,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> CanonItemRead:
-    item = require_canon(db, item_id)
+    require_project(db, project_id, current_user)
+    item = require_canon_item(db, item_id, current_user)
     if item.project_id != project_id:
         raise HTTPException(status_code=404, detail="正典条目不存在")
-    _confirm_item(db, item, payload or CanonConfirmRequest())
+    _confirm_item(db, item, payload or CanonConfirmRequest(), current_user)
     db.commit()
+    try:
+        rebuild_search_index(
+            db_engine=db.get_bind(),
+            owner_id=current_user.id,
+            project_id=project_id,
+        )
+    except Exception:
+        pass
     db.refresh(item)
     return CanonItemRead.model_validate(item)
 
@@ -253,9 +318,12 @@ def confirm_project_canon(
     "/canon-items/{item_id}/needs-review", response_model=CanonItemRead, include_in_schema=False
 )
 def mark_canon_needs_review(
-    item_id: str, reason: str | None = None, db: Session = Depends(get_db)
+    item_id: str,
+    reason: str | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> CanonItemRead:
-    item = require_canon(db, item_id)
+    item = require_canon_item(db, item_id, current_user)
     item.status = "needs_review"
     item.updated_at = utcnow()
     db.add(
@@ -265,9 +333,18 @@ def mark_canon_needs_review(
             entity_type="canon_item",
             entity_id=item.id,
             reason=reason,
+            actor_user_id=current_user.id,
         )
     )
     db.commit()
+    try:
+        rebuild_search_index(
+            db_engine=db.get_bind(),
+            owner_id=current_user.id,
+            project_id=item.project_id,
+        )
+    except Exception:
+        pass
     db.refresh(item)
     return CanonItemRead.model_validate(item)
 

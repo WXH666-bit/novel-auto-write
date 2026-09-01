@@ -2,6 +2,9 @@
 pythonpath = ["backend"]
 testpaths = ["backend/tests"]
 addopts = "-q"
+markers = [
+    "mysql: integration tests requiring a MySQL 8.4 database from NOVEL_TEST_MYSQL_URL",
+]
 
 [tool.ruff]
 target-version = "py311"

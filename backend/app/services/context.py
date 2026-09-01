@@ -6,8 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import select
 
 from .common import safe_text, token_estimate
 
@@ -75,34 +74,27 @@ def _current_revision(session: Any, chapter: Any, *, accepted_only: bool = False
 
 def _fts_search(
     session: Any,
-    project_id: Any,
+    project: Any,
     query: str,
     limit: int = 8,
 ) -> list[tuple[Any, Any, str]]:
-    """Search the optional FTS5 table and gracefully fall back to revisions.
-
-    Migrations may name the virtual table ``chapter_fts`` or ``chapter_search``;
-    both forms are attempted with bound parameters.  A missing table is normal
-    in a fresh lightweight installation, so the Python fallback is deterministic.
-    """
+    """Search accepted text with explicit tenant/project predicates."""
 
     from ..models import Chapter, ChapterRevision
+    from .search import search_accepted_chapters
 
     query = " ".join(query.split())[:256]
+    project_id = str(project.id)
     if query:
-        for table_name in ("chapter_fts", "chapter_search"):
-            try:
-                rows = session.execute(
-                    text(
-                        f"SELECT chapter_id, revision_id, content FROM {table_name} "
-                        f"WHERE {table_name} MATCH :query AND project_id = :project_id LIMIT :limit"
-                    ),
-                    {"query": query, "project_id": str(project_id), "limit": limit},
-                ).all()
-                if rows:
-                    return [(row[0], row[1], safe_text(row[2])) for row in rows]
-            except SQLAlchemyError:
-                continue
+        rows = search_accepted_chapters(
+            session,
+            owner_id=str(project.owner_id),
+            project_id=project_id,
+            query=query,
+            limit=limit,
+        )
+        if rows:
+            return [(row[0], row[1], safe_text(row[2])) for row in rows]
 
     revisions = (
         session.execute(
@@ -313,7 +305,7 @@ def build_context(
     search_query = query or safe_text(_value(project, "description", ""))[:120]
     for chapter_id, revision_id, excerpt in _fts_search(
         session,
-        project.id,
+        project,
         search_query,
     ):
         if not excerpt:

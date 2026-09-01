@@ -1,5 +1,12 @@
 export type View = "library" | "desk" | "settings";
 export type LedgerTab = "canon" | "timeline" | "threads" | "foreshadowing";
+export type AuthView =
+  | "login"
+  | "register"
+  | "verify-email"
+  | "forgot-password"
+  | "reset-password"
+  | "account";
 export type CanonStatus =
   | "pending"
   | "confirmed"
@@ -168,7 +175,7 @@ export interface GenerationJob {
   created_at?: string;
   error?: string;
   provider_name?: string;
-  is_demo?: boolean;
+  provider_id?: string;
   review_bundle_id?: string;
 }
 
@@ -176,15 +183,34 @@ export interface ProviderProfile {
   id?: string;
   name: string;
   base_url: string;
-  protocol?: "chat_completions" | "responses" | "demo";
+  protocol?: "chat_completions" | "responses" | "anthropic_messages";
+  api_version?: string;
+  max_output_tokens?: number;
+  anthropic_workspace_id?: string;
   default_model?: string;
   model_roles?: Record<string, string>;
   context_length?: number;
   timeout_ms?: number;
   capabilities?: Record<string, boolean>;
-  is_demo?: boolean;
+  enabled?: boolean;
+  deleted_at?: string | null;
   api_key_set?: boolean;
   api_key?: string;
+}
+
+export interface User {
+  id: string;
+  email: string;
+  display_name?: string;
+  is_email_verified: boolean;
+  is_active?: boolean;
+  default_provider_id?: string | null;
+  created_at?: string;
+}
+
+export interface AuthSession {
+  user: User;
+  csrf_token?: string;
 }
 
 export interface ImportChapterPreview {

@@ -12,20 +12,14 @@ from sqlalchemy.orm import Session
 
 from ..config import DATA_DIR
 from ..db import get_db, rebuild_search_index
-from ..models import AuditLog, ImportSource, Project
+from ..models import AuditLog, ImportSource, User
+from ..security import get_current_user
 from ..services.importer import ImportPreview, apply_preview_edits, persist_import, preview_import
-from . import chapter_payload
+from . import chapter_payload, require_project
 
 router = APIRouter(prefix="/api/projects", tags=["imports"])
 MAX_IMPORT_BYTES = 50 * 1024 * 1024
 UPLOAD_DIR = DATA_DIR / "uploads"
-
-
-def _project(db: Session, project_id: str) -> Project:
-    project = db.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="项目不存在")
-    return project
 
 
 class ImportChapterPayload(BaseModel):
@@ -50,17 +44,20 @@ def _preview_response(preview: ImportPreview) -> dict[str, Any]:
     return preview.as_dict()
 
 
-def _cache_source(raw: bytes, source_hash: str) -> str:
+def _cache_source(raw: bytes, source_hash: str, *, user_id: str, project_id: str) -> str:
     if len(raw) > MAX_IMPORT_BYTES:
         raise HTTPException(status_code=413, detail="首版单个导入文件不能超过 50 MB")
     if len(source_hash) != 64 or any(
         char not in "0123456789abcdef" for char in source_hash.lower()
     ):
         raise HTTPException(status_code=422, detail="导入文件哈希无效")
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    stored_name = f"{source_hash.lower()}.source"
+    tenant_dir = (UPLOAD_DIR / user_id / project_id).resolve()
+    if UPLOAD_DIR.resolve() not in tenant_dir.parents:
+        raise HTTPException(status_code=422, detail="导入缓存路径无效")
+    tenant_dir.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{user_id}/{project_id}/{source_hash.lower()}.source"
     destination = (UPLOAD_DIR / stored_name).resolve()
-    if destination.parent != UPLOAD_DIR.resolve():
+    if destination.parent != tenant_dir:
         raise HTTPException(status_code=422, detail="导入缓存路径无效")
     if not destination.exists():
         destination.write_bytes(raw)
@@ -70,34 +67,45 @@ def _cache_source(raw: bytes, source_hash: str) -> str:
 @router.post("/{project_id}/import/preview")
 @router.post("/{project_id}/imports/preview")
 def import_preview(
-    project_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)
+    project_id: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    _project(db, project_id)
-    raw = file.file.read()
+    require_project(db, project_id, current_user)
+    raw = file.file.read(MAX_IMPORT_BYTES + 1)
+    if len(raw) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="首版单个导入文件不能超过 50 MB")
     preview = preview_import(raw, file.filename or "未命名稿件")
-    _cache_source(raw, preview.source_hash)
+    _cache_source(raw, preview.source_hash, user_id=current_user.id, project_id=project_id)
     return _preview_response(preview)
 
 
 @router.post("/{project_id}/imports/preview-text")
 def import_preview_text(
-    project_id: str, payload: ImportCommitPayload, db: Session = Depends(get_db)
+    project_id: str,
+    payload: ImportCommitPayload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    _project(db, project_id)
+    require_project(db, project_id, current_user)
     if payload.content is None:
         raise HTTPException(status_code=422, detail="content 不能为空")
     raw = payload.content.encode("utf-8")
     preview = preview_import(raw, payload.filename)
-    _cache_source(raw, preview.source_hash)
+    _cache_source(raw, preview.source_hash, user_id=current_user.id, project_id=project_id)
     return _preview_response(preview)
 
 
 @router.post("/{project_id}/import/commit")
 @router.post("/{project_id}/imports/commit")
 def import_commit(
-    project_id: str, payload: ImportCommitPayload, db: Session = Depends(get_db)
+    project_id: str,
+    payload: ImportCommitPayload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    project = _project(db, project_id)
+    project = require_project(db, project_id, current_user)
     chapters = payload.chapters
     source_hash = payload.source_hash
     if chapters is None:
@@ -125,9 +133,10 @@ def import_commit(
     if not created:
         return {"created": [], "count": 0, "idempotent": True, "source_hash": source_hash}
     if source_hash:
-        stored_name = f"{source_hash.lower()}.source"
+        stored_name = f"{current_user.id}/{project.id}/{source_hash.lower()}.source"
+        tenant_dir = (UPLOAD_DIR / current_user.id / project.id).resolve()
         stored_path = (UPLOAD_DIR / stored_name).resolve()
-        if stored_path.parent == UPLOAD_DIR.resolve() and stored_path.is_file():
+        if stored_path.parent == tenant_dir and stored_path.is_file():
             existing_source = db.scalar(
                 select(ImportSource).where(
                     ImportSource.project_id == project.id,
@@ -154,11 +163,16 @@ def import_commit(
             entity_type="project",
             entity_id=project.id,
             after_json={"source_hash": source_hash, "chapter_count": len(created)},
+            actor_user_id=current_user.id,
         )
     )
     db.commit()
     try:
-        rebuild_search_index(db_engine=db.get_bind())
+        rebuild_search_index(
+            db_engine=db.get_bind(),
+            owner_id=current_user.id,
+            project_id=project.id,
+        )
     except Exception:
         pass
     chapter_payloads = [chapter_payload(chapter).model_dump(mode="json") for chapter in created]
@@ -174,6 +188,9 @@ def import_commit(
 # their navigation.
 @router.post("/{project_id}/import")
 def import_commit_alias(
-    project_id: str, payload: ImportCommitPayload, db: Session = Depends(get_db)
+    project_id: str,
+    payload: ImportCommitPayload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    return import_commit(project_id, payload, db)
+    return import_commit(project_id, payload, current_user, db)

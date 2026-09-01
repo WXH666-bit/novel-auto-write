@@ -10,7 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import ReviewBundle
+from ..models import ReviewBundle, User
+from ..security import get_current_user
 from ..services.providers import ProviderError
 from ..services.reviews import (
     BlockerError,
@@ -23,6 +24,7 @@ from ..services.reviews import (
     reaudit_review_bundle,
     reject_review,
 )
+from . import require_project, require_review
 
 router = APIRouter(prefix="/api", tags=["reviews"])
 
@@ -47,7 +49,12 @@ class ReauditPayload(BaseModel):
 
 
 @router.get("/projects/{project_id}/reviews")
-def list_reviews(project_id: str, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_reviews(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    require_project(db, project_id, current_user)
     bundles = db.scalars(
         select(ReviewBundle)
         .where(ReviewBundle.project_id == project_id)
@@ -57,7 +64,12 @@ def list_reviews(project_id: str, db: Session = Depends(get_db)) -> list[dict[st
 
 
 @router.get("/reviews/{bundle_id}")
-def get_review(bundle_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+def get_review(
+    bundle_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_review(db, bundle_id, current_user)
     try:
         from ..services.reviews import _bundle
 
@@ -68,11 +80,21 @@ def get_review(bundle_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
 
 @router.post("/reviews/{bundle_id}/draft")
 def edit_draft(
-    bundle_id: str, payload: DraftEditPayload, db: Session = Depends(get_db)
+    bundle_id: str,
+    payload: DraftEditPayload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    require_review(db, bundle_id, current_user)
     try:
         return bundle_payload(
-            edit_review_draft(db, bundle_id, payload.content, actor=payload.actor)
+            edit_review_draft(
+                db,
+                bundle_id,
+                payload.content,
+                actor=current_user.email,
+                actor_user_id=current_user.id,
+            )
         )
     except ReviewNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -82,10 +104,21 @@ def edit_draft(
 
 @router.post("/reviews/{bundle_id}/reaudit")
 def reaudit(
-    bundle_id: str, payload: ReauditPayload, db: Session = Depends(get_db)
+    bundle_id: str,
+    payload: ReauditPayload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    require_review(db, bundle_id, current_user)
     try:
-        return bundle_payload(reaudit_review_bundle(db, bundle_id, actor=payload.actor))
+        return bundle_payload(
+            reaudit_review_bundle(
+                db,
+                bundle_id,
+                actor=current_user.email,
+                actor_user_id=current_user.id,
+            )
+        )
     except ReviewNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ReviewValidationError as exc:
@@ -95,9 +128,23 @@ def reaudit(
 
 
 @router.post("/reviews/{bundle_id}/reject")
-def reject(bundle_id: str, payload: RejectPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+def reject(
+    bundle_id: str,
+    payload: RejectPayload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_review(db, bundle_id, current_user)
     try:
-        return bundle_payload(reject_review(db, bundle_id, payload.reason, actor=payload.actor))
+        return bundle_payload(
+            reject_review(
+                db,
+                bundle_id,
+                payload.reason,
+                actor=current_user.email,
+                actor_user_id=current_user.id,
+            )
+        )
     except ReviewNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ReviewValidationError as exc:
@@ -105,10 +152,22 @@ def reject(bundle_id: str, payload: RejectPayload, db: Session = Depends(get_db)
 
 
 @router.post("/reviews/{bundle_id}/accept")
-def accept(bundle_id: str, payload: AcceptPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+def accept(
+    bundle_id: str,
+    payload: AcceptPayload,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_review(db, bundle_id, current_user)
     try:
         return bundle_payload(
-            accept_review(db, bundle_id, force_reason=payload.force_reason, actor=payload.actor)
+            accept_review(
+                db,
+                bundle_id,
+                force_reason=payload.force_reason,
+                actor=current_user.email,
+                actor_user_id=current_user.id,
+            )
         )
     except ReviewNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -123,24 +182,30 @@ def accept(bundle_id: str, payload: AcceptPayload, db: Session = Depends(get_db)
 # Compact aliases for clients that post the decision directly to the bundle.
 @router.post("/reviews/{bundle_id}/decision")
 def decision(
-    bundle_id: str, payload: dict[str, Any], db: Session = Depends(get_db)
+    bundle_id: str,
+    payload: dict[str, Any],
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    require_review(db, bundle_id, current_user)
     action = str(payload.get("action") or "").lower()
     if action == "accept":
         return accept(
             bundle_id,
             AcceptPayload(
                 force_reason=payload.get("force_reason"),
-                actor=str(payload.get("actor") or "editor"),
+                actor=current_user.id,
             ),
+            current_user,
             db,
         )
     if action == "reject":
         return reject(
             bundle_id,
             RejectPayload(
-                reason=str(payload.get("reason") or ""), actor=str(payload.get("actor") or "editor")
+                reason=str(payload.get("reason") or ""), actor=current_user.id
             ),
+            current_user,
             db,
         )
     raise HTTPException(status_code=422, detail="action 必须为 accept 或 reject")

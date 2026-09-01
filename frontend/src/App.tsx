@@ -61,6 +61,11 @@ import {
   Upload,
   WandSparkles,
   X,
+  UserRound,
+  LogOut,
+  ServerCog,
+  PlusCircle,
+  Trash,
 } from "lucide-react";
 import {
   commitImport,
@@ -70,7 +75,8 @@ import {
   editReviewDraft,
   getCanon,
   getChapters,
-  getDefaultProvider,
+  getProviders,
+  getCurrentUser,
   getLatestGeneration,
   getReview,
   listenGenerationEvents,
@@ -78,14 +84,21 @@ import {
   getStoryMap,
   normalizeJob,
   previewImport,
-  putDefaultProvider,
+  createProvider,
+  updateProvider,
+  deleteProvider,
+  setDefaultProvider,
+  deleteProviderKey,
+  logoutAccount,
+  logoutAllSessions,
+  onAuthEvent,
   rebuildProjectMemory,
   reviewAction,
   retryGeneration,
   testProvider,
   updateChapter,
 } from "./api";
-import { demoProvider, demoReview } from "./demoData";
+import AuthScreen, { AccountSecurityView } from "./AuthScreen";
 import type {
   AuditIssue,
   CanonChange,
@@ -103,6 +116,8 @@ import type {
   SourceRef,
   TimelineEvent,
   View,
+  AuthSession,
+  AuthView,
 } from "./types";
 
 const jobPhases: Array<{ key: JobStatus; label: string }> = [
@@ -161,7 +176,17 @@ function shortTime(value?: string) {
   return value.replace("T", " ").slice(0, 16);
 }
 
-export default function App() {
+function Workspace({
+  session,
+  onLogout,
+  onLogoutAll,
+  onAccount,
+}: {
+  session: AuthSession;
+  onLogout: () => void;
+  onLogoutAll: () => void;
+  onAccount: () => void;
+}) {
   const queryClient = useQueryClient();
   const [view, setView] = useState<View>("library");
   const [activeProjectId, setActiveProjectId] = useState("");
@@ -186,7 +211,12 @@ export default function App() {
   const [review, setReview] = useState<ReviewBundle | null>(null);
   const [importPreviewData, setImportPreviewData] =
     useState<ImportPreview | null>(null);
-  const [provider, setProvider] = useState<ProviderProfile>(demoProvider);
+  const [provider, setProvider] = useState<ProviderProfile | null>(null);
+  const [selectedProviderId, setSelectedProviderId] = useState("");
+  const [defaultProviderId, setDefaultProviderId] = useState(
+    session.user.default_provider_id || "",
+  );
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [forceAcceptOpen, setForceAcceptOpen] = useState(false);
   const [forceReason, setForceReason] = useState("");
   const [focusedReviewSection, setFocusedReviewSection] = useState<
@@ -208,6 +238,34 @@ export default function App() {
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const clearWorkspaceState = () => {
+      if (draftTimer.current) {
+        clearTimeout(draftTimer.current);
+        draftTimer.current = null;
+      }
+      setView("library");
+      setActiveProjectId("");
+      setActiveChapterId("");
+      setJob(null);
+      setDraftById({});
+      setReview(null);
+      setImportPreviewData(null);
+      setProvider(null);
+      setSelectedProviderId("");
+      setDefaultProviderId("");
+      setShowNewProject(false);
+      setShowImport(false);
+      setShowGeneration(false);
+      setShowReview(false);
+      setShowCommand(false);
+      setAccountMenuOpen(false);
+    };
+    window.addEventListener("novel-auth-cleared", clearWorkspaceState);
+    return () =>
+      window.removeEventListener("novel-auth-cleared", clearWorkspaceState);
+  }, []);
 
   const projectsQuery = useQuery({
     queryKey: ["projects"],
@@ -240,9 +298,10 @@ export default function App() {
     foreshadowing: [],
   };
   const providerQuery = useQuery({
-    queryKey: ["provider"],
-    queryFn: getDefaultProvider,
+    queryKey: ["providers"],
+    queryFn: getProviders,
   });
+  const providers = providerQuery.data ?? [];
   const activeChapter =
     chapters.find((chapter) => chapter.id === activeChapterId) ??
     chapters[0] ??
@@ -272,8 +331,16 @@ export default function App() {
   }, [activeChapterId, chapters]);
 
   useEffect(() => {
-    if (providerQuery.data) setProvider(providerQuery.data);
-  }, [providerQuery.data]);
+    const defaultId = defaultProviderId;
+    const preferred =
+      providers.find((item) => item.id === defaultId) || providers[0] || null;
+    setProvider(preferred);
+    setSelectedProviderId(preferred?.id || "");
+  }, [defaultProviderId, providers]);
+
+  useEffect(() => {
+    setDefaultProviderId(session.user.default_provider_id || "");
+  }, [session.user.default_provider_id]);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -307,62 +374,6 @@ export default function App() {
   useEffect(() => {
     if (
       !job ||
-      ![
-        "queued",
-        "preparing_context",
-        "planning",
-        "drafting",
-        "extracting",
-        "auditing",
-        "revising",
-      ].includes(job.status) ||
-      !job.is_demo
-    )
-      return undefined;
-    const timer = setInterval(() => {
-      setJob((previous) => {
-        if (!previous) return previous;
-        const progress = Math.min(100, (previous.progress || 0) + 8);
-        const phaseIndex = Math.min(
-          jobPhases.length - 1,
-          Math.floor(progress / 14),
-        );
-        const phase = jobPhases[phaseIndex];
-        if (progress >= 100) {
-          const nextReview = {
-            ...demoReview,
-            id: uid("review"),
-            project_id: previous.project_id,
-            chapter_id: previous.chapter_id || activeChapterId,
-          };
-          setReview(nextReview);
-          setShowReview(true);
-          setToast({
-            tone: "success",
-            message: "审查完成，已生成审核包。正典尚未改变。",
-          });
-          return {
-            ...previous,
-            progress: 100,
-            status: "awaiting_review",
-            phase_label: "等待审核",
-          };
-        }
-        return {
-          ...previous,
-          progress,
-          status: phase.key,
-          phase_label: phase.label,
-        };
-      });
-    }, 850);
-    return () => clearInterval(timer);
-  }, [activeChapterId, job]);
-
-  useEffect(() => {
-    if (
-      !job ||
-      job.is_demo ||
       ["completed", "failed", "cancelled", "needs_retry"].includes(job.status)
     )
       return undefined;
@@ -406,7 +417,7 @@ export default function App() {
           message: "生成进度连接中断；请打开任务条重试，不会自动提交。",
         }),
     );
-  }, [activeChapterId, activeProjectId, job?.id, job?.is_demo]);
+  }, [activeChapterId, activeProjectId, job?.id]);
 
   useEffect(() => {
     if (!activeProjectId) return undefined;
@@ -585,6 +596,17 @@ export default function App() {
 
   const startGeneration = async () => {
     if (!activeProject) return;
+    const selectedProvider =
+      providers.find((item) => item.id === selectedProviderId) || provider;
+    if (!selectedProvider?.id) {
+      setShowGeneration(false);
+      setView("settings");
+      setToast({
+        tone: "warning",
+        message: "尚未添加模型。请先添加 Provider 并设置默认项。",
+      });
+      return;
+    }
     setShowGeneration(false);
     const useCurrentChapter =
       generationForm.mode === "scene" || generationForm.mode === "rewrite";
@@ -596,8 +618,7 @@ export default function App() {
       status: "preparing_context",
       progress: 4,
       phase_label: "准备上下文",
-      provider_name: provider.name,
-      is_demo: false,
+      provider_name: selectedProvider.name,
     };
     setJob(placeholder);
     try {
@@ -605,6 +626,7 @@ export default function App() {
         ...generationForm,
         chapter_id: targetChapterId,
         canon_version: activeProject.canon_version,
+        provider_id: selectedProvider.id,
       });
       setJob(normalizeJob(remote));
     } catch (error) {
@@ -683,39 +705,6 @@ export default function App() {
       setJob(null);
     } else
       setToast({ tone: "info", message: "已重新审查，旧结果标记为失效。" });
-  };
-
-  const runProviderTest = async () => {
-    try {
-      const result = await testProvider(provider);
-      setToast({
-        tone: result.ok ? "success" : "warning",
-        message: result.ok
-          ? `连接成功 · ${result.model || provider.default_model || provider.name}`
-          : result.message || "连接未通过",
-      });
-    } catch (error) {
-      setToast({
-        tone: "error",
-        message:
-          error instanceof Error
-            ? error.message
-            : "连接失败，请检查 Base URL。",
-      });
-    }
-  };
-
-  const saveProvider = async () => {
-    try {
-      const saved = await putDefaultProvider(provider);
-      setProvider({ ...saved, api_key: "" });
-      setToast({
-        tone: "success",
-        message: "Provider 配置已保存。API Key 仅保存在系统凭据库。",
-      });
-    } catch (error) {
-      setToast({ tone: "error", message: error instanceof Error ? error.message : "Provider 配置保存失败。" });
-    }
   };
 
   const handleFile = async (file: File) => {
@@ -858,9 +847,13 @@ export default function App() {
           <strong>{headerTitle}</strong>
         </div>
         <div className="top-actions">
-          {provider.is_demo && (
-            <span className="demo-badge">
-              <span className="status-dot" /> Demo Provider
+          {provider ? (
+            <span className="provider-badge">
+              <span className="status-dot green" /> {provider.name}
+            </span>
+          ) : (
+            <span className="provider-badge provider-badge-empty">
+              <span className="status-dot" /> 尚未添加模型
             </span>
           )}
           <button
@@ -882,11 +875,22 @@ export default function App() {
           </button>
           <button
             className="avatar"
-            onClick={() => setView("settings")}
-            aria-label="打开设置"
+            onClick={() => setAccountMenuOpen((open) => !open)}
+            aria-label="打开账号菜单"
+            aria-expanded={accountMenuOpen}
           >
-            岚
+            {(session.user.display_name || session.user.email || "章").slice(0, 1).toUpperCase()}
           </button>
+          {accountMenuOpen && (
+            <div className="account-menu" role="menu">
+              <div className="account-menu-head"><span className="account-menu-avatar">{(session.user.display_name || session.user.email || "章").slice(0, 1).toUpperCase()}</span><div><strong>{session.user.display_name || "未设置称呼"}</strong><small>{session.user.email}</small></div></div>
+              <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onAccount(); }}><UserRound size={14} /> 账号与安全</button>
+              <button role="menuitem" onClick={() => { setAccountMenuOpen(false); setView("settings"); }}><Settings size={14} /> 模型与生成</button>
+              <div className="account-menu-rule" />
+              <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onLogout(); }}><LogOut size={14} /> 退出当前设备</button>
+              <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onLogoutAll(); }}><ShieldCheck size={14} /> 退出全部会话</button>
+            </div>
+          )}
         </div>
       </header>
 
@@ -913,12 +917,67 @@ export default function App() {
             onSettings={() => setView("settings")}
           />
         )}
-        {view === "settings" && (
+        {view === "settings" && providerQuery.isLoading && (
+          <div className="auth-loading">
+            <div className="auth-loading-mark"><ServerCog size={19} /></div>
+            <span>正在读取你的私有 Provider…</span>
+          </div>
+        )}
+        {view === "settings" && providerQuery.isError && (
+          <div className="auth-loading" role="alert">
+            <div className="auth-loading-mark"><CircleAlert size={19} /></div>
+            <span>读取 Provider 失败，请检查网络后重试。</span>
+            <button
+              className="button button-secondary button-small"
+              onClick={() => void providerQuery.refetch()}
+            >
+              <RefreshCw size={14} /> 重新读取
+            </button>
+          </div>
+        )}
+        {view === "settings" && !providerQuery.isLoading && !providerQuery.isError && (
           <SettingsView
-            provider={provider}
-            onChange={setProvider}
-            onTest={runProviderTest}
-            onSave={saveProvider}
+            providers={providers}
+            defaultProviderId={defaultProviderId}
+            onRefresh={() => providerQuery.refetch()}
+            onChangeDefault={(next) => {
+              setProvider(next);
+              setSelectedProviderId(next?.id || "");
+              setDefaultProviderId(next?.id || "");
+            }}
+            onCreate={async (input) => {
+              const created = await createProvider(input);
+              await providerQuery.refetch();
+              return created;
+            }}
+            onUpdate={async (id, input) => {
+              const updated = await updateProvider(id, input);
+              await providerQuery.refetch();
+              if (updated.id === provider?.id) setProvider(updated);
+              return updated;
+            }}
+            onDelete={async (id) => {
+              await deleteProvider(id);
+              await providerQuery.refetch();
+              if (id === provider?.id) setProvider(null);
+            }}
+            onSetDefault={async (id) => {
+              const saved = await setDefaultProvider(id);
+              setProvider(saved);
+              setSelectedProviderId(id);
+              setDefaultProviderId(id);
+              await providerQuery.refetch();
+            }}
+            onDeleteKey={async (id) => {
+              const result = await deleteProviderKey(id);
+              await providerQuery.refetch();
+              if (id === provider?.id) {
+                setProvider((current) =>
+                  current ? { ...current, api_key_set: false } : current,
+                );
+              }
+              return result;
+            }}
             onExport={exportProject}
             onBack={() => setView(activeProject ? "desk" : "library")}
           />
@@ -939,7 +998,24 @@ export default function App() {
             }}
             onContentChange={handleContentChange}
             onTab={setLedgerTab}
-            onGenerate={() => setShowGeneration(true)}
+            onGenerate={() => {
+              if (!providers.length) {
+                setView("settings");
+                setToast({
+                  tone: "warning",
+                  message: "尚未添加模型。请先配置你自己的 Provider。",
+                });
+                return;
+              }
+              setShowGeneration(true);
+            }}
+            providerGuide={
+              !providers.length
+                ? "configure"
+                : !defaultProviderId
+                  ? "choose"
+                  : undefined
+            }
             onReview={openReview}
             onImport={() => setShowImport(true)}
             onLibrary={() => setView("library")}
@@ -987,6 +1063,12 @@ export default function App() {
           form={generationForm}
           setForm={setGenerationForm}
           provider={provider}
+          providers={providers}
+          selectedProviderId={selectedProviderId || provider?.id || ""}
+          onProviderChange={(id) => {
+            setSelectedProviderId(id);
+            setProvider(providers.find((item) => item.id === id) || null);
+          }}
           chapter={activeChapter}
           canonVersion={activeProject?.canon_version || 0}
           onClose={() => setShowGeneration(false)}
@@ -1028,6 +1110,55 @@ export default function App() {
       )}
     </div>
   );
+}
+
+export default function App() {
+  const queryClient = useQueryClient();
+  const [authView, setAuthView] = useState<AuthView>("login");
+  const [accountView, setAccountView] = useState(false);
+  const [authCleared, setAuthCleared] = useState(false);
+  const authQuery = useQuery({
+    queryKey: ["auth", "me"],
+    queryFn: getCurrentUser,
+    enabled: !authCleared,
+    retry: false,
+    staleTime: 5 * 60_000,
+  });
+  const session = authCleared ? undefined : authQuery.data;
+
+  const clearClientState = useCallback(() => {
+    void queryClient.cancelQueries();
+    queryClient.clear();
+    setAuthCleared(true);
+    setAccountView(false);
+    setAuthView("login");
+    window.dispatchEvent(new Event("novel-auth-cleared"));
+  }, [queryClient]);
+
+  useEffect(
+    () => onAuthEvent(() => clearClientState()),
+    [clearClientState],
+  );
+
+  const doLogout = async (all = false) => {
+    try {
+      if (all) await logoutAllSessions();
+      else await logoutAccount();
+    } finally {
+      clearClientState();
+    }
+  };
+
+  if (authQuery.isLoading && !authCleared) {
+    return <div className="auth-loading"><div className="auth-loading-mark"><BookOpen size={19} /></div><span>正在打开你的故事正典…</span></div>;
+  }
+  if (!session?.user?.id) {
+    return <AuthScreen initialView={authView} onNavigate={setAuthView} onAuthenticated={(next) => { setAuthCleared(false); queryClient.setQueryData(["auth", "me"], next); setAccountView(false); }} />;
+  }
+  if (accountView) {
+    return <AccountSecurityView session={session} onBack={() => setAccountView(false)} onLogout={() => void doLogout(false)} onLogoutAll={() => void doLogout(true)} onSession={(next) => queryClient.setQueryData(["auth", "me"], next)} />;
+  }
+  return <Workspace session={session} onLogout={() => void doLogout(false)} onLogoutAll={() => void doLogout(true)} onAccount={() => setAccountView(true)} />;
 }
 
 function LibraryView({
@@ -1250,6 +1381,7 @@ interface WritingDeskProps {
   mobileLedger: boolean;
   onCloseMobileSidebar: () => void;
   onCloseMobileLedger: () => void;
+  providerGuide?: "configure" | "choose";
 }
 
 function WritingDesk({
@@ -1275,6 +1407,7 @@ function WritingDesk({
   mobileLedger,
   onCloseMobileSidebar,
   onCloseMobileLedger,
+  providerGuide,
 }: WritingDeskProps) {
   return (
     <div className="desk-shell">
@@ -1384,6 +1517,7 @@ function WritingDesk({
           onReview={onReview}
           onMobileLedger={onMobileLedger}
           generateDisabled={project.needs_rebuild}
+          providerGuide={providerGuide}
         />
         {activeChapter ? (
           <EditorPaper
@@ -1510,6 +1644,7 @@ function EditorHeader({
   onReview,
   onMobileLedger,
   generateDisabled,
+  providerGuide,
 }: {
   project: Project;
   chapter: Chapter | null;
@@ -1518,6 +1653,7 @@ function EditorHeader({
   onReview: () => void;
   onMobileLedger: () => void;
   generateDisabled?: boolean;
+  providerGuide?: "configure" | "choose";
 }) {
   return (
     <div className="editor-header">
@@ -1567,9 +1703,22 @@ function EditorHeader({
           className="button button-primary button-compact"
           onClick={onGenerate}
           disabled={generateDisabled}
-          title={generateDisabled ? "请先完成旧章重建" : "开始可恢复生成任务"}
+          title={
+            generateDisabled
+              ? "请先完成旧章重建"
+              : providerGuide === "configure"
+                ? "先添加你的私有 Provider"
+                : providerGuide === "choose"
+                  ? "尚未设置默认项，请为本次生成选择 Provider"
+                  : "开始可恢复生成任务"
+          }
         >
-          <WandSparkles size={14} /> 生成下一章
+          {providerGuide === "configure" ? <ServerCog size={14} /> : <WandSparkles size={14} />}
+          {providerGuide === "configure"
+            ? "配置模型"
+            : providerGuide === "choose"
+              ? "选择本次模型"
+              : "生成下一章"}
         </button>
         <button
           className="icon-button only-mobile"
@@ -2139,209 +2288,192 @@ function SourceChip({
 }
 
 function SettingsView({
-  provider,
-  onChange,
-  onTest,
-  onSave,
+  providers,
+  defaultProviderId,
+  onRefresh,
+  onChangeDefault,
+  onCreate,
+  onUpdate,
+  onDelete,
+  onSetDefault,
+  onDeleteKey,
   onExport,
   onBack,
 }: {
-  provider: ProviderProfile;
-  onChange: (provider: ProviderProfile) => void;
-  onTest: () => void;
-  onSave: () => void;
+  providers: ProviderProfile[];
+  defaultProviderId: string;
+  onRefresh: () => void;
+  onChangeDefault: (provider: ProviderProfile | null) => void;
+  onCreate: (provider: Partial<ProviderProfile>) => Promise<ProviderProfile>;
+  onUpdate: (id: string, provider: Partial<ProviderProfile>) => Promise<ProviderProfile>;
+  onDelete: (id: string) => Promise<void>;
+  onSetDefault: (id: string) => Promise<void>;
+  onDeleteKey: (id: string) => Promise<unknown>;
   onExport: () => void;
   onBack: () => void;
 }) {
-  const update = (key: keyof ProviderProfile, value: unknown) =>
-    onChange({ ...provider, [key]: value });
+  const [selectedId, setSelectedId] = useState(defaultProviderId || providers[0]?.id || "");
+  const [draft, setDraft] = useState<ProviderProfile | null>(null);
+  const [isNew, setIsNew] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [testState, setTestState] = useState<"idle" | "testing" | "ok" | "error">("idle");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    if (!isNew && selectedId && !providers.some((item) => item.id === selectedId)) {
+      setSelectedId(defaultProviderId || providers[0]?.id || "");
+    }
+  }, [defaultProviderId, isNew, providers, selectedId]);
+
+  useEffect(() => {
+    if (isNew) return;
+    const selected = providers.find((item) => item.id === selectedId) || null;
+    setDraft(selected ? { ...selected, api_key: "" } : null);
+  }, [isNew, providers, selectedId]);
+
+  const update = (key: keyof ProviderProfile, value: unknown) => {
+    setDraft((current) => (current ? { ...current, [key]: value } : current));
+  };
+  const switchProtocol = (protocol: ProviderProfile["protocol"]) => {
+    setDraft((current) => {
+      if (!current) return current;
+      const currentBase = current.base_url?.trim().replace(/\/$/, "") || "";
+      const officialOpenAI = "https://api.openai.com/v1";
+      const officialAnthropic = "https://api.anthropic.com/v1";
+      return {
+        ...current,
+        protocol,
+        ...(protocol === "anthropic_messages" &&
+        (!currentBase || currentBase === officialOpenAI)
+          ? { base_url: officialAnthropic, api_version: "2023-06-01" }
+          : protocol !== "anthropic_messages" &&
+              (!currentBase || currentBase === officialAnthropic)
+            ? { base_url: officialOpenAI, api_version: undefined }
+            : {}),
+      };
+    });
+  };
+  const beginNew = () => {
+    setIsNew(true);
+    setSelectedId("");
+    setTestState("idle");
+    setNotice("");
+    setDraft({
+      name: "",
+      base_url: "https://api.openai.com/v1",
+      protocol: "chat_completions",
+      default_model: "",
+      model_roles: {},
+      context_length: 32768,
+      timeout_ms: 60000,
+      max_output_tokens: 4096,
+      api_key: "",
+    });
+  };
+  const save = async () => {
+    if (!draft) return;
+    if (!draft.name?.trim() || !draft.base_url?.trim() || !draft.default_model?.trim()) {
+      setNotice("请填写名称、Base URL 和默认模型。" );
+      return;
+    }
+    setBusy(true);
+    setNotice("");
+    try {
+      const saved = isNew ? await onCreate(draft) : await onUpdate(draft.id || "", draft);
+      setIsNew(false);
+      setSelectedId(saved.id || "");
+      setDraft({ ...saved, api_key: "" });
+      onChangeDefault(saved.id === defaultProviderId ? saved : providers.find((item) => item.id === defaultProviderId) || null);
+      setNotice("Provider 已保存。是否设为默认项由你决定。" );
+      onRefresh();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Provider 保存失败。" );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const test = async () => {
+    if (!draft) return;
+    setTestState("testing");
+    setNotice("");
+    try {
+      const result = await testProvider(draft);
+      setTestState(result.ok ? "ok" : "error");
+      setNotice(result.ok ? `连接成功 · ${result.model || draft.default_model}` : result.message || "连接未通过" );
+    } catch (error) {
+      setTestState("error");
+      setNotice(error instanceof Error ? error.message : "连接失败，请检查 Base URL。" );
+    }
+  };
+  const remove = async () => {
+    if (!draft?.id || !window.confirm(`确定删除「${draft.name}」吗？`)) return;
+    const removingDefault = draft.id === defaultProviderId;
+    setBusy(true);
+    try {
+      await onDelete(draft.id);
+      const remaining = providers.filter((item) => item.id !== draft.id);
+      const next = remaining[0];
+      setSelectedId(next?.id || "");
+      setDraft(next ? { ...next, api_key: "" } : null);
+      setNotice("Provider 已删除。" );
+      onChangeDefault(
+        removingDefault
+          ? null
+          : providers.find((item) => item.id === defaultProviderId) || null,
+      );
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Provider 删除失败。" );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const setDefault = async () => {
+    if (!draft?.id) return;
+    setBusy(true);
+    try {
+      await onSetDefault(draft.id);
+      setNotice("已设为账户默认 Provider；后续生成会使用它。" );
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "默认 Provider 设置失败。" );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const clearKey = async () => {
+    if (!draft?.id || !window.confirm("删除后，调用此 Provider 需要重新输入密钥。继续吗？")) return;
+    setBusy(true);
+    try {
+      await onDeleteKey(draft.id);
+      setDraft({ ...draft, api_key_set: false, api_key: "" });
+      setNotice("API Key 已从系统凭据库删除。" );
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "API Key 删除失败。" );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const roles = [
+    ["planner", "剧情规划"],
+    ["drafter", "正文写作"],
+    ["extractor", "事实提取"],
+    ["auditor", "连续性审查"],
+    ["style_auditor", "风格审查"],
+    ["reviser", "定向修订"],
+  ] as const;
   return (
     <div className="settings-page">
-      <div className="settings-top">
-        <button className="back-to-library" onClick={onBack}>
-          <ChevronLeft size={15} /> 返回工作台
-        </button>
-        <span className="settings-version">章回 0.1 · 本地单机</span>
-      </div>
+      <div className="settings-top"><button className="back-to-library" onClick={onBack}><ChevronLeft size={15} /> 返回工作台</button><span className="settings-version">章回 0.2 · PRIVATE MODEL DESK</span></div>
       <div className="settings-layout">
-        <aside className="settings-nav">
-          <p className="eyebrow">工作室设置</p>
-          <button className="settings-nav-item is-active">
-            <Sparkles size={15} /> 模型与生成
-          </button>
-          <button className="settings-nav-item">
-            <Keyboard size={15} /> 快捷键
-          </button>
-          <button className="settings-nav-item">
-            <ShieldCheck size={15} /> 安全与备份
-          </button>
-          <button className="settings-nav-item">
-            <Gauge size={15} /> 质量闸门
-          </button>
-        </aside>
+        <aside className="settings-nav"><p className="eyebrow">工作室设置</p><button className="settings-nav-item is-active"><ServerCog size={15} /> 模型与生成</button><button className="settings-nav-item"><Keyboard size={15} /> 快捷键</button><button className="settings-nav-item"><ShieldCheck size={15} /> 安全与备份</button><button className="settings-nav-item"><Gauge size={15} /> 质量闸门</button></aside>
         <section className="settings-content">
-          <div className="settings-heading">
-            <div>
-              <p className="eyebrow">PROVIDER PROFILE</p>
-              <h1>模型与生成</h1>
-              <p>
-                为每个角色配置同一个或不同的 OpenAI 兼容模型。API Key
-                不会进入数据库、快照或导出文件。
-              </p>
-            </div>
-            <span className="settings-demo">
-              <span className={`status-dot ${provider.is_demo ? "" : "green"}`} />
-              {provider.is_demo ? "Demo Provider" : "真实 Provider"}
-            </span>
+          <div className="settings-heading"><div><p className="eyebrow">PRIVATE PROVIDERS / BYOK</p><h1>模型与生成</h1><p>Provider 只属于当前账号。密钥通过系统凭据库隔离保存，永远不会写入小说、任务快照或项目导出。</p></div><span className="settings-provider-status"><span className="status-dot green" /> {defaultProviderId ? "已设置默认" : "尚未设置默认"}</span></div>
+          <div className="provider-settings-grid">
+            <div className="settings-card provider-list-card"><div className="settings-card-head"><div><h2>我的 Provider</h2><p>{providers.length ? `${providers.length} 个私有配置` : "尚未添加模型"}</p></div><button className="button button-secondary button-small" onClick={beginNew}><PlusCircle size={14} /> 新增</button></div>{providers.length ? <div className="provider-list">{providers.map((item) => <button key={item.id} className={`provider-list-item ${item.id === selectedId && !isNew ? "is-selected" : ""}`} onClick={() => { setIsNew(false); setSelectedId(item.id || ""); }}><span className="provider-list-icon"><ServerCog size={15} /></span><span><strong>{item.name}</strong><small>{item.protocol === "anthropic_messages" ? "Anthropic Messages" : item.protocol === "responses" ? "Responses API" : "Chat Completions"}</small></span>{item.id === defaultProviderId && <em>默认</em>}<ChevronRight size={14} /></button>)}</div> : <div className="provider-empty"><div className="provider-empty-seal"><ServerCog size={20} /></div><strong>尚未添加模型</strong><p>先添加一个你自己的 Provider，章回不会自动创建内置配置或共享密钥。</p><button className="button button-primary" onClick={beginNew}><Plus size={14} /> 添加第一个 Provider</button></div>}</div>
+            {draft ? <div className="settings-card provider-editor-card"><div className="settings-card-head"><div><p className="eyebrow">{isNew ? "NEW PROFILE" : "EDIT PROFILE"}</p><h2>{isNew ? "新增 Provider" : draft.name || "编辑 Provider"}</h2><p>保存配置后仍需主动设置默认项；生成抽屉可以临时切换。</p></div>{!isNew && draft.id === defaultProviderId && <span className="connection-state"><span className="status-dot green" /> 默认使用中</span>}</div><div className="form-grid"><label className="field"><span>显示名称</span><input value={draft.name} onChange={(event) => update("name", event.target.value)} placeholder="例如：我的 Claude" /></label><label className="field"><span>协议模式</span><select value={draft.protocol || "chat_completions"} onChange={(event) => switchProtocol(event.target.value as ProviderProfile["protocol"])}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></label><label className="field field-wide"><span>Base URL</span><input value={draft.base_url} onChange={(event) => update("base_url", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1"} /></label>{draft.protocol === "anthropic_messages" && <label className="field"><span>Anthropic API 版本</span><input value={draft.api_version || "2023-06-01"} onChange={(event) => update("api_version", event.target.value)} placeholder="2023-06-01" /></label>}<label className="field"><span>默认模型</span><input value={draft.default_model || ""} onChange={(event) => update("default_model", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "claude-sonnet-4-5" : "local-storyteller"} /></label><label className="field"><span>上下文长度</span><input type="number" min="1024" value={draft.context_length || 32768} onChange={(event) => update("context_length", Number(event.target.value))} /></label><label className="field"><span>最大输出 tokens</span><input type="number" min="256" value={draft.max_output_tokens || 4096} onChange={(event) => update("max_output_tokens", Number(event.target.value))} /></label><label className="field"><span>请求超时（毫秒）</span><input type="number" min="1000" value={draft.timeout_ms || 60000} onChange={(event) => update("timeout_ms", Number(event.target.value))} /></label><label className="field field-wide"><span>API Key <small>{draft.api_key_set ? "系统凭据库中已有密钥；留空即保留" : "只在需要时填写"}</small></span><input type="password" autoComplete="new-password" value={draft.api_key || ""} onChange={(event) => update("api_key", event.target.value)} placeholder={draft.api_key_set ? "••••••••（已安全保存）" : "粘贴你的 API Key"} /></label>{draft.protocol === "anthropic_messages" && <label className="field field-wide"><span>Anthropic Workspace ID <small>可选</small></span><input value={draft.anthropic_workspace_id || ""} onChange={(event) => update("anthropic_workspace_id", event.target.value)} placeholder="workspace_…" /></label>}</div><div className="form-actions"><button className="button button-secondary" onClick={test} disabled={busy || testState === "testing"}><RefreshCw size={14} className={testState === "testing" ? "spin" : ""} /> {testState === "testing" ? "测试中…" : "测试连接"}</button><button className="button button-primary" onClick={save} disabled={busy}><Save size={14} /> {busy ? "保存中…" : "保存配置"}</button>{!isNew && draft.id && <button className="button button-quiet-danger" onClick={remove} disabled={busy}><Trash2 size={14} /> 删除</button>}</div>{notice && <p className={`settings-notice ${testState === "error" ? "is-error" : ""}`} role="status">{notice}</p>}{!isNew && <div className="provider-editor-footer"><button className="text-button" onClick={setDefault} disabled={busy || draft.id === defaultProviderId}><CheckCircle2 size={14} /> {draft.id === defaultProviderId ? "当前默认 Provider" : "设为默认 Provider"}</button>{draft.api_key_set && <button className="text-button text-danger" onClick={clearKey} disabled={busy}><Trash2 size={14} /> 删除已保存密钥</button>}</div>}</div> : <div className="settings-card provider-editor-empty"><p className="eyebrow">SELECT A PROFILE</p><h2>选择一个 Provider 开始</h2><p>左侧列表会显示本账号的模型配置。没有默认 Provider 时，生成按钮会明确引导你完成设置。</p><button className="button button-secondary" onClick={beginNew}><Plus size={14} /> 新增 Provider</button></div>}
           </div>
-          <div className="settings-card">
-            <div className="settings-card-head">
-              <div>
-                <h2>默认 Provider</h2>
-                <p>
-                  兼容 <code>/v1/chat/completions</code>；本地模型可留空 API
-                  Key。
-                </p>
-              </div>
-              <span className="connection-state">
-                <span className="status-dot green" /> 未测试
-              </span>
-            </div>
-            <div className="form-grid">
-              <label className="field">
-                <span>显示名称</span>
-                <input
-                  value={provider.name}
-                  onChange={(event) => update("name", event.target.value)}
-                  placeholder="例如：本地 Qwen"
-                />
-              </label>
-              <label className="field">
-                <span>协议模式</span>
-                <select
-                  value={provider.protocol || "chat_completions"}
-                  onChange={(event) => update("protocol", event.target.value)}
-                >
-                  <option value="demo">Demo（无需模型）</option>
-                  <option value="chat_completions">Chat Completions</option>
-                  <option value="responses">Responses API</option>
-                </select>
-              </label>
-              <label className="field field-wide">
-                <span>Base URL</span>
-                <input
-                  value={provider.base_url}
-                  onChange={(event) => update("base_url", event.target.value)}
-                  placeholder="http://127.0.0.1:11434/v1"
-                />
-              </label>
-              <label className="field">
-                <span>默认模型</span>
-                <input
-                  value={provider.default_model || ""}
-                  onChange={(event) =>
-                    update("default_model", event.target.value)
-                  }
-                  placeholder="local-storyteller"
-                />
-              </label>
-              <label className="field">
-                <span>上下文长度</span>
-                <input
-                  type="number"
-                  value={provider.context_length || 32768}
-                  onChange={(event) =>
-                    update("context_length", Number(event.target.value))
-                  }
-                />
-              </label>
-              <label className="field">
-                <span>请求超时（毫秒）</span>
-                <input
-                  type="number"
-                  value={provider.timeout_ms || 60000}
-                  onChange={(event) =>
-                    update("timeout_ms", Number(event.target.value))
-                  }
-                />
-              </label>
-              <label className="field field-wide">
-                <span>
-                  API Key <small>{provider.api_key_set ? "系统凭据库中已有密钥；留空即保留" : "本地模型可留空"}</small>
-                </span>
-                <input
-                  type="password"
-                  autoComplete="off"
-                  value={provider.api_key || ""}
-                  onChange={(event) => update("api_key", event.target.value)}
-                  placeholder={provider.api_key_set ? "••••••••（已安全保存）" : "sk-..."}
-                />
-              </label>
-            </div>
-            <div className="form-actions">
-              <button className="button button-secondary" onClick={onTest}>
-                <RefreshCw size={14} /> 测试连接
-              </button>
-              <button className="button button-primary" onClick={onSave}>
-                <Save size={14} /> 保存配置
-              </button>
-            </div>
-          </div>
-          <div className="settings-card">
-            <div className="settings-card-head">
-              <div>
-                <h2>角色映射</h2>
-                <p>质量优先模式会按顺序完成规划、写作、提取、审查和修订。</p>
-              </div>
-              <span className="role-count">6 个角色</span>
-            </div>
-            <div className="role-grid">
-              {[
-                ["planner", "剧情规划"],
-                ["drafter", "正文写作"],
-                ["extractor", "事实提取"],
-                ["auditor", "连续性审查"],
-                ["style_auditor", "风格审查"],
-                ["reviser", "定向修订"],
-              ].map(([key, label]) => (
-                <label className="role-field" key={key}>
-                  <span>{label}</span>
-                  <input
-                    value={
-                      provider.model_roles?.[key] ||
-                      provider.default_model ||
-                      ""
-                    }
-                    onChange={(event) =>
-                      onChange({
-                        ...provider,
-                        model_roles: {
-                          ...(provider.model_roles || {}),
-                          [key]: event.target.value,
-                        },
-                      })
-                    }
-                  />
-                  <small>{key}</small>
-                </label>
-              ))}
-            </div>
-          </div>
-          <div className="settings-card backup-card">
-            <div className="backup-icon">
-              <FileArchive size={18} />
-            </div>
-            <div>
-              <h2>完整备份</h2>
-              <p>
-                导出正文、正典、修订、原始导入文件和 schema
-                版本。密钥永远不会包含在内。
-              </p>
-            </div>
-            <button className="button button-secondary" onClick={onExport}>
-              <Download size={14} /> 导出项目 ZIP
-            </button>
-          </div>
+          {draft && <div className="settings-card"><div className="settings-card-head"><div><h2>质量优先角色映射</h2><p>六个角色可以共用模型，也可以分别指定。留空时沿用默认模型。</p></div><span className="role-count">6 个角色</span></div><div className="role-grid">{roles.map(([key, label]) => <label className="role-field" key={key}><span>{label}</span><input value={draft.model_roles?.[key] || ""} placeholder={draft.default_model || "沿用默认模型"} onChange={(event) => setDraft({ ...draft, model_roles: { ...(draft.model_roles || {}), [key]: event.target.value } })} /><small>{key}</small></label>)}</div></div>}
+          <div className="settings-card backup-card"><div className="backup-icon"><FileArchive size={18} /></div><div><h2>完整备份</h2><p>导出正文、正典、修订、原始导入文件和 schema 版本。密钥永远不会包含在内。</p></div><button className="button button-secondary" onClick={onExport}><Download size={14} /> 导出项目 ZIP</button></div>
         </section>
       </div>
     </div>
@@ -2667,6 +2799,9 @@ function GenerationDrawer({
   form,
   setForm,
   provider,
+  providers,
+  selectedProviderId,
+  onProviderChange,
   canonVersion,
   onClose,
   onStart,
@@ -2685,7 +2820,10 @@ function GenerationDrawer({
     must_not: string;
     revision_rounds: number;
   }) => void;
-  provider: ProviderProfile;
+  provider: ProviderProfile | null;
+  providers: ProviderProfile[];
+  selectedProviderId: string;
+  onProviderChange: (id: string) => void;
   chapter: Chapter | null;
   canonVersion: number;
   onClose: () => void;
@@ -2718,6 +2856,17 @@ function GenerationDrawer({
               </span>
             </div>
           </div>
+          <label className="field">
+            <span>本次使用的 Provider</span>
+            {providers.length ? (
+              <select value={selectedProviderId} onChange={(event) => onProviderChange(event.target.value)} required>
+                <option value="">选择一个 Provider</option>
+                {providers.map((item) => <option key={item.id} value={item.id}>{item.name}{item.id === selectedProviderId ? " · 本次选择" : ""}</option>)}
+              </select>
+            ) : (
+              <div className="drawer-provider-empty"><ServerCog size={14} /><span>尚未添加模型。请先到“模型与生成”添加 Provider。</span></div>
+            )}
+          </label>
           <label className="field">
             <span>生成目标</span>
             <select
@@ -2792,31 +2941,20 @@ function GenerationDrawer({
               </div>
             ))}
           </div>
-          <div className="provider-note">
-            <span className="status-dot" />{" "}
-            <div>
-              <strong>{provider.name}</strong>
-              <small>
-                {provider.default_model || "未配置模型"} ·{" "}
-                {provider.is_demo ? "演示连接" : "已配置"}
-              </small>
-            </div>
-            <button className="text-button">
-              <Settings size={13} /> 管理
-            </button>
-          </div>
+          {provider ? <div className="provider-note"><span className="status-dot green" /><div><strong>{provider.name}</strong><small>{provider.default_model || "未配置模型"} · {provider.protocol === "anthropic_messages" ? "Anthropic Messages" : provider.protocol === "responses" ? "Responses API" : "Chat Completions"}</small></div></div> : <div className="provider-note provider-note-warning"><CircleAlert size={15} /><div><strong>尚未添加模型</strong><small>生成任务需要你自己的 Provider，不会自动回退到其他模型。</small></div></div>}
         </div>
         <div className="drawer-footer">
           <div>
             <span className="context-budget">
               <Gauge size={13} /> 预计上下文 18.4k /{" "}
-              {formatWords(provider.context_length || 32768)} tokens
+              {formatWords(provider?.context_length || 32768)} tokens
             </span>
             <span className="context-hint">硬约束和当前状态不会被裁剪</span>
           </div>
           <button
             className="button button-primary button-wide"
             onClick={onStart}
+            disabled={!provider}
           >
             <Play size={15} fill="currentColor" /> 开始生成
           </button>

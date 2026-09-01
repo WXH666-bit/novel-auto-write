@@ -23,8 +23,8 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
 )
-from sqlalchemy.dialects.sqlite import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
+from sqlalchemy.types import JSON
 
 from .db import Base
 
@@ -49,6 +49,9 @@ class Project(Base):
     __tablename__ = "projects"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     title = synonym("name")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -99,6 +102,122 @@ class Project(Base):
     )
     import_sources: Mapped[list[ImportSource]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
+    )
+    owner: Mapped[User] = relationship(back_populates="projects")
+
+
+class User(Base):
+    """An application account and the root tenant boundary.
+
+    ``email_normalized`` is the value used for identity comparisons.  The
+    display/original email is retained separately so changing presentation
+    casing does not change an account's identity.  ``password_hash`` is
+    nullable only for the disabled legacy owner created while upgrading old
+    single-user databases.
+    """
+
+    __tablename__ = "users"
+    __table_args__ = (Index("ix_users_email_normalized", "email_normalized", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    email_normalized: Mapped[str] = mapped_column(String(320), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    is_email_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # A provider is selected explicitly by the user.  This is intentionally a
+    # plain ID instead of an FK to avoid a circular table dependency during
+    # upgrades and to allow safe provider deletion.
+    default_provider_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    projects: Mapped[list[Project]] = relationship(back_populates="owner")
+    provider_profiles: Mapped[list[ProviderProfile]] = relationship(
+        back_populates="owner", cascade="all, delete-orphan"
+    )
+    sessions: Mapped[list[UserSession]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    email_tokens: Mapped[list[EmailToken]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class UserSession(Base):
+    """Opaque server-side session; only a SHA-256 token digest is persisted."""
+
+    __tablename__ = "user_sessions"
+    __table_args__ = (
+        Index("ix_user_sessions_user_active", "user_id", "revoked_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    csrf_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    user: Mapped[User] = relationship(back_populates="sessions")
+
+
+class EmailToken(Base):
+    """Single-use email verification/password reset token digest."""
+
+    __tablename__ = "email_tokens"
+    __table_args__ = (
+        Index("ix_email_tokens_user_purpose", "user_id", "purpose", "used_at"),
+        Index("ix_email_tokens_expires", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    purpose: Mapped[str] = mapped_column(String(30), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    user: Mapped[User] = relationship(back_populates="email_tokens")
+
+
+class AuthRateLimit(Base):
+    """Small DB-backed limiter that works across application restarts/workers."""
+
+    __tablename__ = "auth_rate_limits"
+    __table_args__ = (UniqueConstraint("action", "key_hash", name="uq_auth_rate_action_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )
 
 
@@ -283,6 +402,12 @@ class GenerationRun(Base):
     input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     model_params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     context_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    # Provider selection is frozen at task creation.  The credential itself is
+    # deliberately not part of this snapshot.
+    provider_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    provider_protocol: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    provider_config_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     prompt_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
     output_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -380,6 +505,9 @@ class AuditLog(Base):
     project_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True
     )
+    actor_user_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     actor: Mapped[str] = mapped_column(String(80), default="system", nullable=False)
     action: Mapped[str] = mapped_column(String(120), nullable=False)
     entity_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
@@ -398,11 +526,18 @@ class ProviderProfile(Base):
     __tablename__ = "provider_profiles"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     base_url: Mapped[str] = mapped_column(
-        String(500), default="http://127.0.0.1:1234/v1", nullable=False
+        String(500), default="https://api.openai.com/v1", nullable=False
     )
     protocol: Mapped[str] = mapped_column(String(40), default="chat_completions", nullable=False)
+    api_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    anthropic_workspace_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    config_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     model_role_mapping: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     context_length: Mapped[int] = mapped_column(Integer, default=8192, nullable=False)
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
@@ -410,6 +545,51 @@ class ProviderProfile(Base):
     # Only a credential-manager reference is stored here, never the secret.
     api_key_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    owner: Mapped[User] = relationship(back_populates="provider_profiles")
+
+
+class SearchDocument(Base):
+    """Portable derived search document.
+
+    SQLite deployments materialise this data into the FTS5 virtual tables.
+    MySQL deployments use this table as the source for a FULLTEXT ngram index.
+    Only accepted chapter revisions and confirmed canon are written by the
+    rebuild service; keeping that policy outside the model makes migrations
+    and rebuilds idempotent.
+    """
+
+    __tablename__ = "search_documents"
+    __table_args__ = (
+        Index("ix_search_documents_owner_project", "owner_id", "project_id"),
+        Index("ix_search_documents_source", "source_type", "source_id"),
+        UniqueConstraint(
+            "owner_id", "project_id", "source_type", "source_id", "revision_id",
+            name="uq_search_documents_source_revision",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
@@ -429,7 +609,7 @@ class ImportSource(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     source_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     encoding: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    stored_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    stored_name: Mapped[str] = mapped_column(String(255), nullable=False)
     byte_size: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
@@ -461,9 +641,11 @@ def _sync_canon_text(_mapper: Any, _connection: Any, target: CanonItem) -> None:
 
 __all__ = [
     "AuditLog",
+    "AuthRateLimit",
     "CanonItem",
     "Chapter",
     "ChapterRevision",
+    "EmailToken",
     "GenerationArtifact",
     "GenerationRun",
     "Job",
@@ -471,7 +653,10 @@ __all__ = [
     "Project",
     "ProviderProfile",
     "ReviewBundle",
+    "SearchDocument",
     "TimelineEvent",
+    "User",
+    "UserSession",
     "json_text",
     "new_id",
     "utcnow",

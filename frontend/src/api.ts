@@ -1,4 +1,3 @@
-import { demoProvider } from "./demoData";
 import type {
   CanonItem,
   Chapter,
@@ -11,12 +10,38 @@ import type {
   SourceRef,
   StoryMap,
   TimelineEvent,
+  AuthSession,
+  User,
 } from "./types";
 
 const API_ROOT = (import.meta.env.VITE_API_BASE_URL || "/api").replace(
   /\/$/,
   "",
 );
+
+type AuthListener = (status: "unauthorized") => void;
+const authListeners = new Set<AuthListener>();
+
+export function onAuthEvent(listener: AuthListener) {
+  authListeners.add(listener);
+  return () => {
+    authListeners.delete(listener);
+  };
+}
+
+function readCookie(name: string) {
+  if (typeof document === "undefined") return "";
+  const encoded = `${name}=`;
+  const cookie = document.cookie
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(encoded));
+  return cookie ? decodeURIComponent(cookie.slice(encoded.length)) : "";
+}
+
+function isUnsafe(method?: string) {
+  return !["GET", "HEAD", "OPTIONS"].includes((method || "GET").toUpperCase());
+}
 
 function unwrap<T>(payload: unknown, keys: string[] = []): T {
   if (payload && typeof payload === "object") {
@@ -29,38 +54,219 @@ function unwrap<T>(payload: unknown, keys: string[] = []): T {
   return payload as T;
 }
 
+function errorMessage(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map(errorMessage).filter(Boolean).join("；");
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (typeof record.message === "string") return record.message;
+    if (typeof record.msg === "string") return record.msg;
+    if (record.detail !== undefined) return errorMessage(record.detail);
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return "";
+    }
+  }
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function parseApiError(raw: string): { message: string; code: string } {
+  try {
+    const parsed = JSON.parse(raw) as {
+      detail?: unknown;
+      code?: unknown;
+      error?: { code?: unknown; message?: unknown };
+    };
+    const detail = parsed.detail;
+    const detailRecord =
+      detail && typeof detail === "object"
+        ? (detail as Record<string, unknown>)
+        : undefined;
+    const code = String(
+      detailRecord?.code ?? parsed.code ?? parsed.error?.code ?? "",
+    );
+    const message = errorMessage(
+      detailRecord?.message ??
+        detailRecord?.detail ??
+        detail ??
+        parsed.error?.message ??
+        raw,
+    );
+    return { message, code };
+  } catch {
+    return { message: raw, code: "" };
+  }
+}
+
 export async function apiRequest<T>(
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
   const headers = new Headers(init.headers);
+  const method = (init.method || "GET").toUpperCase();
+  const csrf = readCookie("novel_csrf") || readCookie("csrf_token");
+  if (isUnsafe(method) && csrf) headers.set("X-CSRF-Token", csrf);
   if (init.body && !(init.body instanceof FormData))
     headers.set("Content-Type", "application/json");
-  const response = await fetch(`${API_ROOT}${path}`, { ...init, headers });
+  const response = await fetch(`${API_ROOT}${path}`, {
+    ...init,
+    method,
+    headers,
+    credentials: "include",
+  });
   if (!response.ok) {
+    if (response.status === 401) {
+      authListeners.forEach((listener) => listener("unauthorized"));
+    }
     let detail = "";
+    let code = "";
     try {
       const raw = await response.text();
-      try {
-        detail = String(
-          (JSON.parse(raw) as { detail?: unknown }).detail ?? raw,
-        );
-      } catch {
-        detail = raw;
-      }
+      ({ message: detail, code } = parseApiError(raw));
     } catch {
       /* server may close early */
     }
     const error = new Error(detail || `请求失败（${response.status}）`);
-    (error as Error & { status?: number }).status = response.status;
+    Object.assign(error, { status: response.status, code });
     throw error;
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
-function errorStatus(error: unknown) {
+export function apiErrorStatus(error: unknown) {
   return (error as Error & { status?: number })?.status;
+}
+
+export function apiErrorCode(error: unknown) {
+  return (error as Error & { code?: string })?.code;
+}
+
+export function normalizeUser(value: unknown): User {
+  const source = (value || {}) as Record<string, unknown>;
+  return {
+    id: String(source.id ?? source.user_id ?? ""),
+    email: String(source.email ?? source.email_address ?? ""),
+    display_name: String(source.display_name ?? source.name ?? "") || undefined,
+    is_email_verified: Boolean(
+      source.is_email_verified ?? source.email_verified ?? source.verified,
+    ),
+    is_active:
+      source.is_active === undefined ? true : Boolean(source.is_active),
+    default_provider_id:
+      source.default_provider_id === null || source.default_provider_id === undefined
+        ? null
+        : String(source.default_provider_id),
+    created_at: String(source.created_at ?? "") || undefined,
+  };
+}
+
+export function normalizeAuthSession(value: unknown): AuthSession {
+  const source = (value || {}) as Record<string, unknown>;
+  const userSource = source.user ?? source.account ?? source;
+  const session =
+    source.session && typeof source.session === "object"
+      ? (source.session as Record<string, unknown>)
+      : {};
+  return {
+    user: normalizeUser(userSource),
+    csrf_token: String(
+      source.csrf_token ?? source.csrfToken ?? session.csrf_token ?? "",
+    ) || undefined,
+  };
+}
+
+export async function getCurrentUser(): Promise<AuthSession> {
+  return normalizeAuthSession(await apiRequest<unknown>("/auth/me"));
+}
+
+export async function registerAccount(input: {
+  email: string;
+  password: string;
+  display_name?: string;
+}) {
+  return normalizeAuthSession(
+    await apiRequest<unknown>("/auth/register", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function verifyEmail(token: string) {
+  return apiRequest<unknown>("/auth/verify-email", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
+}
+
+export async function resendVerification(email?: string) {
+  const normalizedEmail = email?.trim() || "";
+  if (!normalizedEmail) {
+    throw new Error("请输入注册邮箱后重新发送验证邮件。");
+  }
+  return apiRequest<unknown>("/auth/resend-verification", {
+    method: "POST",
+    body: JSON.stringify({ email: normalizedEmail }),
+  });
+}
+
+export async function loginAccount(input: { email: string; password: string }) {
+  return normalizeAuthSession(
+    await apiRequest<unknown>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function logoutAccount() {
+  return apiRequest<unknown>("/auth/logout", { method: "POST" });
+}
+
+export async function logoutAllSessions() {
+  return apiRequest<unknown>("/auth/logout-all", { method: "POST" });
+}
+
+export async function forgotPassword(email: string) {
+  return apiRequest<unknown>("/auth/forgot-password", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export async function resetPassword(input: { token: string; password: string }) {
+  return apiRequest<unknown>("/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function changePassword(input: {
+  current_password: string;
+  new_password: string;
+  revoke_other_sessions?: boolean;
+}) {
+  return normalizeAuthSession(
+    await apiRequest<unknown>("/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function deleteAccount(password?: string) {
+  return apiRequest<unknown>("/auth/account", {
+    method: "DELETE",
+    body: JSON.stringify(password ? { password } : {}),
+  });
+}
+
+function errorStatus(error: unknown) {
+  return apiErrorStatus(error);
 }
 
 export async function getProjects(): Promise<Project[]> {
@@ -171,6 +377,7 @@ export async function createGeneration(
     .join("\n");
   const body = {
     chapter_id: input.chapter_id || null,
+    provider_id: input.provider_id ? String(input.provider_id) : null,
     idempotency_key: input.idempotency_key || crypto.randomUUID(),
     target_word_count: Number(
       input.target_word_count ?? input.word_target ?? 3500,
@@ -225,7 +432,9 @@ export function listenGenerationEvents(
   onJob: (job: GenerationJob) => void,
   onError?: () => void,
 ) {
-  const source = new EventSource(generationEventsUrl(jobId));
+  const source = new EventSource(generationEventsUrl(jobId), {
+    withCredentials: true,
+  });
   const handleProgress = (event: MessageEvent<string>) => {
     try {
       onJob(normalizeJob(JSON.parse(event.data)));
@@ -280,12 +489,52 @@ export async function reviewAction(
 }
 
 export async function getDefaultProvider(): Promise<ProviderProfile> {
-  try {
-    return normalizeProvider(await apiRequest<unknown>("/providers/default"));
-  } catch (error) {
-    if (errorStatus(error) === 404) return demoProvider;
-    throw error;
-  }
+  return normalizeProvider(await apiRequest<unknown>("/providers/default"));
+}
+
+export async function getProviders(): Promise<ProviderProfile[]> {
+  const payload = await apiRequest<unknown>("/providers");
+  const result = unwrap<unknown>(payload, ["providers", "items", "data"]);
+  return (Array.isArray(result) ? result : []).map(normalizeProvider);
+}
+
+export async function createProvider(input: Partial<ProviderProfile>) {
+  return normalizeProvider(
+    await apiRequest<unknown>("/providers", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function updateProvider(
+  providerId: string,
+  input: Partial<ProviderProfile>,
+) {
+  return normalizeProvider(
+    await apiRequest<unknown>(`/providers/${providerId}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function deleteProvider(providerId: string) {
+  return apiRequest<unknown>(`/providers/${providerId}`, { method: "DELETE" });
+}
+
+export async function setDefaultProvider(providerId: string) {
+  return normalizeProvider(
+    await apiRequest<unknown>(`/providers/${providerId}/default`, {
+      method: "PUT",
+    }),
+  );
+}
+
+export async function deleteProviderKey(providerId: string) {
+  return apiRequest<unknown>(`/providers/${providerId}/key`, {
+    method: "DELETE",
+  });
 }
 
 export async function rebuildProjectMemory(
@@ -298,16 +547,6 @@ export async function rebuildProjectMemory(
   );
 }
 
-export async function putDefaultProvider(
-  input: ProviderProfile,
-): Promise<ProviderProfile> {
-  const payload = await apiRequest<unknown>("/providers/default", {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
-  return normalizeProvider(payload);
-}
-
 export async function testProvider(
   input: Partial<ProviderProfile>,
 ): Promise<{
@@ -316,10 +555,18 @@ export async function testProvider(
   model?: string;
   message?: string;
 }> {
-  const payload = await apiRequest<unknown>("/providers/test", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
+  // A saved profile can use the key held by the credential manager.  Use the
+  // transient endpoint when the form is new or supplies an unsaved key.
+  const savedProviderId =
+    typeof input.id === "string" && input.id.trim() && !input.api_key?.trim()
+      ? encodeURIComponent(input.id.trim())
+      : "";
+  const request: RequestInit = { method: "POST" };
+  if (!savedProviderId) request.body = JSON.stringify(input);
+  const payload = await apiRequest<unknown>(
+    savedProviderId ? `/providers/${savedProviderId}/test` : "/providers/test",
+    request,
+  );
   return unwrap(payload, ["result", "data"]) as {
     ok: boolean;
     latency_ms?: number;
@@ -394,8 +641,25 @@ export async function commitImport(
 }
 
 export async function downloadExport(projectId: string): Promise<Blob> {
-  const response = await fetch(`${API_ROOT}/projects/${projectId}/export`);
-  if (!response.ok) throw new Error(`导出失败（${response.status}）`);
+  const response = await fetch(`${API_ROOT}/projects/${projectId}/export`, {
+    credentials: "include",
+  });
+  if (!response.ok) {
+    if (response.status === 401) {
+      authListeners.forEach((listener) => listener("unauthorized"));
+    }
+    let detail = "";
+    let code = "";
+    try {
+      const raw = await response.text();
+      ({ message: detail, code } = parseApiError(raw));
+    } catch {
+      /* server may close early */
+    }
+    const error = new Error(detail || `导出失败（${response.status}）`);
+    Object.assign(error, { status: response.status, code });
+    throw error;
+  }
   return response.blob();
 }
 
@@ -566,7 +830,8 @@ export function normalizeJob(value: unknown): GenerationJob {
     created_at: String(source.created_at ?? source.createdAt ?? ""),
     error: source.error as string | undefined,
     provider_name: String(source.provider_name ?? source.providerName ?? ""),
-    is_demo: Boolean(source.is_demo ?? source.isDemo ?? false),
+    provider_id:
+      String(source.provider_id ?? source.providerId ?? "") || undefined,
     review_bundle_id:
       String(source.review_bundle_id ?? source.reviewBundleId ?? "") ||
       undefined,
@@ -743,6 +1008,13 @@ export function normalizeProvider(value: unknown): ProviderProfile {
     protocol: (source.protocol ??
       source.protocol_mode ??
       "chat_completions") as ProviderProfile["protocol"],
+    api_version: String(source.api_version ?? source.apiVersion ?? "") || undefined,
+    max_output_tokens: numberOrUndefined(
+      source.max_output_tokens ?? source.maxOutputTokens,
+    ),
+    anthropic_workspace_id:
+      String(source.anthropic_workspace_id ?? source.anthropicWorkspaceId ?? "") ||
+      undefined,
     default_model: String(
       source.default_model ??
         source.model ??
@@ -760,7 +1032,12 @@ export function normalizeProvider(value: unknown): ProviderProfile {
         Number(source.timeout_seconds ?? 60) * 1000,
     ),
     capabilities: (source.capabilities ?? {}) as Record<string, boolean>,
-    is_demo: Boolean(source.is_demo ?? source.isDemo),
+    enabled:
+      source.enabled === undefined ? true : Boolean(source.enabled),
+    deleted_at:
+      source.deleted_at === null || source.deleted_at === undefined
+        ? null
+        : String(source.deleted_at),
     api_key_set: Boolean(
       source.api_key_set ?? source.apiKeySet ?? source.has_api_key,
     ),

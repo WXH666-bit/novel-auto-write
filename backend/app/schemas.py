@@ -3,13 +3,72 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+class UserRead(ORMModel):
+    id: str
+    email: str
+    display_name: str | None = None
+    is_email_verified: bool
+    default_provider_id: str | None = None
+    created_at: datetime
+    last_login_at: datetime | None = None
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=12, max_length=128)
+    display_name: str | None = Field(default=None, max_length=120)
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+    # ``password`` is accepted as a backwards-compatible client alias; new
+    # callers should use the explicit ``new_password`` name.
+    new_password: str | None = Field(default=None, min_length=12, max_length=128)
+    password: str | None = Field(default=None, min_length=12, max_length=128)
+
+    @model_validator(mode="after")
+    def require_new_password(self) -> ResetPasswordRequest:
+        if not self.new_password and self.password:
+            self.new_password = self.password
+        if not self.new_password:
+            raise ValueError("必须提供新密码")
+        return self
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=12, max_length=128)
+    revoke_other_sessions: bool = True
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
 
 
 class ProjectCreate(BaseModel):
@@ -252,6 +311,10 @@ class StoryMapResponse(BaseModel):
 class GenerationRequest(BaseModel):
     chapter_id: str | None = None
     idempotency_key: str
+    # Optional one-off Provider selection.  When omitted the authenticated
+    # user's explicit default_provider_id is resolved before any chapter/job
+    # row is created.
+    provider_id: str | None = None
     target_word_count: int | None = Field(default=None, ge=1)
     instructions: str | None = None
     mode: str = "quality"
@@ -311,13 +374,18 @@ class ReviewBundleRead(ORMModel):
 
 
 class ProviderProfileCreate(BaseModel):
-    name: str
-    base_url: str
-    protocol: str = "chat_completions"
+    name: str = Field(min_length=1, max_length=120)
+    base_url: str | None = None
+    protocol: Literal["chat_completions", "responses", "anthropic_messages"] = "chat_completions"
+    api_version: str | None = Field(default=None, max_length=80)
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    anthropic_workspace_id: str | None = Field(default=None, max_length=255)
     model_role_mapping: dict[str, Any] = Field(default_factory=dict)
     context_length: int = Field(default=8192, ge=1)
     timeout_seconds: int = Field(default=120, ge=1)
     capabilities: dict[str, Any] = Field(default_factory=dict)
+    # Legacy credential reference is metadata only; secret material never
+    # belongs in this schema or in a database export.
     api_key_ref: str | None = None
     enabled: bool = True
 

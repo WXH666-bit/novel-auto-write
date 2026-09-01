@@ -6,16 +6,19 @@ import io
 import zipfile
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select, text
 from sqlalchemy.orm import sessionmaker
 
 from backend.app import db as db_module
+from backend.app import models
 from backend.app.db import create_engine_for_url, get_db, init_db
 from backend.app.main import app
 from backend.app.routers import imports as imports_router
 from backend.app.services import exports as export_service
+from backend.tests.helpers import authenticate_client, install_fake_provider
 
 
-def _client(tmp_path, monkeypatch) -> TestClient:
+def _client(tmp_path, monkeypatch, *, with_provider: bool = True) -> TestClient:
     test_engine = create_engine_for_url(
         f"sqlite:///{(tmp_path / 'api-workflow.sqlite3').as_posix()}"
     )
@@ -38,7 +41,10 @@ def _client(tmp_path, monkeypatch) -> TestClient:
             session.close()
 
     app.dependency_overrides[get_db] = override_db
-    return TestClient(app)
+    install_fake_provider(monkeypatch)
+    client = TestClient(app, base_url="http://127.0.0.1")
+    authenticate_client(client, testing_session, with_provider=with_provider)
+    return client
 
 
 def _generate(client: TestClient, project_id: str, chapter_id: str, key: str) -> dict:
@@ -120,6 +126,9 @@ def test_import_generate_accept_and_reject_are_atomic(tmp_path, monkeypatch):
         assert replay.json()["created"] is False
 
         before_accept = client.get(f"/api/projects/{project_id}").json()["canon_version"]
+        bypass_review = client.post(f"/api/chapters/{chapter_id}/confirm")
+        assert bypass_review.status_code == 409
+        assert client.get(f"/api/projects/{project_id}").json()["canon_version"] == before_accept
         accepted = client.post(
             f"/api/reviews/{accepted_run['review_bundle_id']}/accept",
             json={},
@@ -127,6 +136,17 @@ def test_import_generate_accept_and_reject_are_atomic(tmp_path, monkeypatch):
         assert accepted.status_code == 200, accepted.text
         after_accept = client.get(f"/api/projects/{project_id}").json()["canon_version"]
         assert after_accept == before_accept + 1
+        with db_module.SessionLocal() as db:
+            accepted_revision_id = db.get(models.Chapter, chapter_id).accepted_revision_id
+            indexed_after_accept = db.execute(
+                text(
+                    "SELECT revision_id, content FROM chapter_fts "
+                    "WHERE project_id = :project_id AND chapter_id = :chapter_id"
+                ),
+                {"project_id": project_id, "chapter_id": chapter_id},
+            ).one()
+        assert indexed_after_accept[0] == accepted_revision_id
+        assert "雾港旧堤" in indexed_after_accept[1]
 
         rejected_run = _generate(client, project_id, chapter_id, "api-reject-1")
         rejected = client.post(
@@ -137,34 +157,76 @@ def test_import_generate_accept_and_reject_are_atomic(tmp_path, monkeypatch):
         assert rejected.json()["status"] == "rejected"
         assert client.get(f"/api/projects/{project_id}").json()["canon_version"] == after_accept
 
+        stale_run = _generate(client, project_id, chapter_id, "api-stale-edit-1")
+        edited = client.patch(
+            f"/api/chapters/{chapter_id}",
+            json={"content": "用户在审核期间手动重写了这一章。"},
+        )
+        assert edited.status_code == 200, edited.text
+        stale_bundle = client.get(f"/api/reviews/{stale_run['review_bundle_id']}")
+        assert stale_bundle.status_code == 200
+        assert stale_bundle.json()["status"] == "stale"
+        previously_accepted = client.get(
+            f"/api/reviews/{accepted_run['review_bundle_id']}"
+        )
+        assert previously_accepted.status_code == 200
+        assert previously_accepted.json()["status"] == "accepted"
+        stale_accept = client.post(
+            f"/api/reviews/{stale_run['review_bundle_id']}/accept",
+            json={},
+        )
+        assert stale_accept.status_code == 422
+        assert client.get(f"/api/projects/{project_id}").json()["canon_version"] == after_accept
 
-def test_default_demo_provider_round_trip(tmp_path, monkeypatch):
-    with _client(tmp_path, monkeypatch) as client:
-        saved = client.put(
-            "/api/providers/default",
+        user_id = client.get("/api/auth/me").json()["id"]
+        with db_module.SessionLocal() as db:
+            indexed_after_reject = db.execute(
+                text(
+                    "SELECT revision_id FROM chapter_fts "
+                    "WHERE project_id = :project_id AND chapter_id = :chapter_id"
+                ),
+                {"project_id": project_id, "chapter_id": chapter_id},
+            ).scalar_one()
+            review_audits = db.scalars(
+                select(models.AuditLog).where(
+                    models.AuditLog.project_id == project_id,
+                    models.AuditLog.action.in_(("review.accepted", "review.rejected")),
+                )
+            ).all()
+        assert indexed_after_reject == accepted_revision_id
+        assert {entry.action for entry in review_audits} == {
+            "review.accepted",
+            "review.rejected",
+        }
+        assert all(entry.actor_user_id == user_id for entry in review_audits)
+
+
+def test_new_account_requires_explicit_private_provider(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch, with_provider=False) as client:
+        assert client.get("/api/providers").json() == []
+        project = client.post("/api/projects", json={"title": "无模型项目"})
+        assert project.status_code == 201
+        blocked = client.post(
+            f"/api/projects/{project.json()['id']}/generations",
+            json={"idempotency_key": "no-provider", "target_word_count": 800},
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["code"] == "provider_required"
+        assert client.get(f"/api/projects/{project.json()['id']}/chapters").json() == []
+        assert client.get(f"/api/projects/{project.json()['id']}/generations/latest").status_code == 404
+
+        saved = client.post(
+            "/api/providers",
             json={
-                "name": "本地演示模型",
-                "base_url": "http://127.0.0.1:1234/v1",
-                "protocol": "demo",
-                "default_model": "demo-writer",
-                "model_roles": {"writer": "demo-writer"},
-                "context_length": 8192,
-                "timeout_ms": 30000,
+                "name": "我的 Claude",
+                "protocol": "anthropic_messages",
+                "default_model": "claude-test",
             },
         )
-        assert saved.status_code == 200, saved.text
-        assert saved.json()["default_model"] == "demo-writer"
+        assert saved.status_code == 201, saved.text
+        assert saved.json()["base_url"] == "https://api.anthropic.com/v1"
+        assert saved.json()["protocol"] == "anthropic_messages"
         assert saved.json()["api_key_set"] is False
-
-        tested = client.post(
-            "/api/providers/test",
-            json={
-                "name": "本地演示模型",
-                "base_url": "http://127.0.0.1:1234/v1",
-                "protocol": "demo",
-                "default_model": "demo-writer",
-            },
-        )
-        assert tested.status_code == 200, tested.text
-        assert tested.json()["ok"] is True
-        assert tested.json()["demo"] is True
+        selected = client.put(f"/api/providers/{saved.json()['id']}/default")
+        assert selected.status_code == 200, selected.text
+        assert selected.json()["is_default"] is True

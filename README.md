@@ -1,119 +1,124 @@
-# 章回：长篇小说连续性自动写作工作流
+# 章回：长篇小说连续性写作室
 
-“章回”是个人单机使用的中文长篇小说编剧室。它把人物状态、世界规则、时间线、关系、物品、主支线、伏笔、章节摘要和硬约束保存为可追溯的故事正典，生成内容必须经过审查包确认后才会进入后续记忆。
+“章回”把长篇小说的正文、人物状态、世界规则、时间线、关系、物品、剧情线、伏笔与审核记录保存成可追溯的故事正典。草稿只有在用户审核接受后，才会与正典在同一事务中生效；拒绝草稿不会污染后续记忆。
 
-## 产品价值与连续性保障
+当前版本支持账号与完全私有的数据空间。每位用户只能看到自己的项目、章节、正典、任务、审核包、导入文件和模型配置。系统不内置 Demo 模型，新账号必须自行添加 Provider 并明确设为默认，才能开始生成。
 
-- 正典是持久数据，不依赖聊天记录；每条事实带有章节、修订和原文范围等来源信息。
-- 正文修订采用追加版本，历史正文不可覆盖；拒绝审核包不会改变正典版本。
-- 严重矛盾默认阻止普通接受，强制接受必须填写理由并留下审计记录。
-- 章节、正典变化和审计结果作为审核包原子提交；生成阶段、输入快照和产物持久化，重启后可从最近完成阶段恢复。
-- 修改已确认旧章后，后续摘要和相关正典会标记待复核，并暂停继续生成，待记忆重建完成。
-- SQLite 使用 WAL、外键和 FTS5；项目可导出带 schema 版本的 ZIP，API Key 不进入数据库或备份。
+## 连续性与隔离保证
 
-## 核心工作流
+- 正文修订只追加、不覆盖；每条事实保留章节、修订、原文范围和摘录。
+- 严重矛盾默认阻止接受；强制接受必须填写理由并写入审计日志。
+- 每个生成阶段持久化快照和内容哈希，重启后从最近完成阶段恢复。
+- 修改已确认旧章会隔离受影响的后续摘要与正典，记忆重建前暂停继续生成。
+- SQLite/FTS5 与 MySQL/ngram 都只索引已接受正文、已确认正典，并同时按用户和项目过滤。
+- API Key 由用户自行提供，按 `user_id + provider_id` 存入操作系统凭据库；数据库、日志、任务快照和项目 ZIP 都不保存密钥。
 
-1. 新建项目，或导入 TXT/Markdown。
-2. 预览拆章结果，调整章节的合并、拆分和标题。
-3. 提取并审核故事圣经、人物、时间线、剧情线和伏笔，确认初始正典。
-4. 冻结正典版本，按章节和场景生成上下文与规划。
-5. 生成正文草稿，提取事实变化和线索，执行连续性与风格审查。
-6. 对严重冲突进行最多两轮定向修订，生成章节与正典审核包。
-7. 编辑正文、重新审查、拒绝或接受；接受时原子提交章节修订和正典版本。
-8. 自动更新摘要、检索索引、审计日志和本地备份。
+## Windows 本地运行
 
-生成任务阶段为：`queued → preparing_context → planning → drafting → extracting → auditing → revising → awaiting_review → committing → completed`；异常时会进入 `failed`、`needs_retry` 或 `cancelled`。
-
-## 功能清单
-
-- 项目库、故事圣经、题材/视角/文风、章节树和三栏写作台。
-- TXT/Markdown 导入：UTF-8、BOM、GB18030，识别中文“第 X 章”、序章、番外等标题，并提供拆章预览。
-- 不可变章节修订、历史查看、差异审核、人物/时间线/剧情线/伏笔/冲突账本。
-- 结构化正典与 SQLite FTS5 全文检索；上下文片段带来源引用并按预算裁剪。
-- 可恢复生成任务、幂等键、租约、SSE 进度、流式正文和结构化 JSON 输出降级校验。
-- Demo Provider、OpenAI-compatible Chat Completions/Responses 配置、角色模型映射、连接测试。
-- 原子审核、拒绝、普通接受、强制接受、旧章失效传播、版本恢复和 ZIP 导入导出。
-- Markdown 导入禁止原始 HTML/脚本；正文按数据处理，避免被当作提示词指令执行。
-
-## Windows PowerShell 一键安装与启动
-
-前置条件：Python 3.11+、Node.js（含 npm）和 PowerShell。
-
-在项目根目录执行：
+前置条件：Python 3.11、Node.js（含 npm）、PowerShell。邮件验证推荐使用 Docker 启动 Mailpit；也可以改用自己的 SMTP。
 
 ```powershell
-Set-Location C:\Users\<用户名>\Desktop\novel_auto_write
-.\setup.ps1
-.\start.ps1
+Set-Location C:\Users\<你的用户名>\Desktop\novel_auto_write
+./setup.ps1
+docker compose -f deploy/compose.local.yml up -d
+./start.ps1
 ```
 
-`setup.ps1` 会创建 `.venv`，升级 pip，安装 `requirements-dev.txt`，安装前端 npm 依赖并构建 `frontend/dist`。`start.ps1` 使用 `.venv` 中的 Python，以 `127.0.0.1:8000` 启动后端并提供已构建的前端。
+打开：
 
-如果本机禁止执行脚本，可在当前 PowerShell 会话临时放行：
+- 写作室：<http://127.0.0.1:8000>
+- Mailpit 收件箱：<http://127.0.0.1:8025>
+- API 文档：<http://127.0.0.1:8000/docs>
+
+注册后，到 Mailpit 打开验证邮件，再登录并在“模型设置”中添加 Provider。`setup.ps1` 会在项目根目录创建 `.venv`、安装后端依赖、安装 npm 依赖并构建前端；`start.ps1` 默认只监听 `127.0.0.1:8000`。
+
+如果 PowerShell 禁止脚本执行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\setup.ps1
-powershell -ExecutionPolicy Bypass -File .\start.ps1
+powershell -ExecutionPolicy Bypass -File ./setup.ps1
+powershell -ExecutionPolicy Bypass -File ./start.ps1
 ```
 
-启动后打开 <http://127.0.0.1:8000>。默认仅监听本机回环地址；可在启动前设置 `NOVEL_HOST`、`NOVEL_PORT`、`NOVEL_DATA_DIR` 或 `NOVEL_DATABASE_URL` 环境变量。
+不使用 Docker 时，可以在启动前设置标准 SMTP：
 
-## Demo Provider 与真实模型
+```powershell
+$env:NOVEL_SMTP_HOST = "smtp.example.com"
+$env:NOVEL_SMTP_PORT = "587"
+$env:NOVEL_SMTP_USERNAME = "novel@example.com"
+$env:NOVEL_SMTP_PASSWORD = "应用专用密码"
+$env:NOVEL_SMTP_USE_TLS = "1"
+$env:NOVEL_SMTP_FROM = "novel@example.com"
+./start.ps1
+```
 
-未配置真实模型时使用明确标记的 Demo Provider，无需 API Key；它只生成可审阅样稿，不会自动写入正典。
+## 认领升级前的旧项目
 
-真实模型可在“工作室设置”中配置，或调用 `PUT /api/providers/default`：
+原单用户数据库升级时，旧项目会先归属一个不可登录的 `legacy_owner`，不会自动交给公网第一个注册者。目标账号注册并完成邮箱验证后，由本机运维执行：
 
-- `base_url`：OpenAI-compatible 服务的 Base URL，例如 `http://127.0.0.1:1234/v1`；
-- `protocol`：`chat_completions` 或 `responses`；
-- `model_role_mapping`：为规划、写作、提取、审查、修订角色指定模型；
-- `context_length`、`timeout_seconds`、`capabilities`：上下文和能力参数；
-- `api_key`：仅用于写入操作系统凭据库（Windows Credential Manager/keyring）。
+```powershell
+$env:PYTHONPATH = "backend"
+./.venv/Scripts/python.exe -m app.cli claim-legacy --email "owner@example.com"
+```
 
-数据库只保存 Provider 配置和凭据引用，不保存密钥本身；密钥不会写入日志、生成快照、项目 ZIP 或 API 返回。切勿把 API Key 写进故事正文、项目 JSON 或提交到 Git。
+命令不重写项目、章节、修订或正典内容，内容哈希保持不变；若旧项目含原始导入文件，会同时将它们安全迁入 `uploads/<user_id>/<project_id>/` 的新租户目录。旧版以裸 `provider_id` 保存的系统凭据也会原子地改名为 `user_id:provider_id`；请务必使用原服务系统账号执行命令，以便访问同一凭据库。迁移前会自动创建 SQLite 一致性快照。
 
-## 数据与备份目录
+## 添加模型 Provider
 
-默认数据目录为项目根目录下的 `data/`：
+支持三种固定协议：
+
+- `chat_completions`：OpenAI 兼容的 `POST /v1/chat/completions`；
+- `responses`：OpenAI `POST /v1/responses`，结构化任务使用 `text.format`；
+- `anthropic_messages`：Anthropic 原生 `POST /v1/messages`，结构化任务使用 `output_config.format`。
+
+Anthropic 表单会自动填入 `https://api.anthropic.com/v1` 和默认 API 版本。Provider 可以配置六个角色模型：剧情规划、正文写作、事实提取、连续性审查、风格审查和定向修订。添加多个 Provider 后必须主动设置账户默认项；每次生成也可以临时选择另一个 Provider。任务一旦创建会冻结 Provider ID、协议、角色映射和配置版本，但永远不冻结密钥。
+
+公网模式默认只允许 `api.openai.com` 与 `api.anthropic.com`。自定义网关需要运维加入 `NOVEL_ALLOWED_PROVIDER_HOSTS`；生产环境拒绝回环、私网、重定向和 DNS 重绑定。
+
+## 数据与备份
 
 ```text
 data/
-├─ novel.sqlite3       # SQLite 主数据库
-├─ novel.sqlite3-wal   # SQLite 运行时 WAL 文件（可能短暂出现）
-├─ novel.sqlite3-shm   # SQLite 运行时共享内存文件（可能短暂出现）
-├─ backups/            # 迁移、接受审核包等操作前的一致性快照
-└─ uploads/            # 原始导入文件（按内容哈希保存）
+├─ novel.sqlite3
+├─ backups/                     # 迁移/审核前快照
+└─ uploads/
+   └─ <user_id>/<project_id>/   # 租户隔离的原始导入文件
 ```
 
-在界面或 `GET /api/projects/{project_id}/export` 导出完整项目 ZIP；使用 `POST /api/projects/restore` 恢复。导出包含正文、修订、正典、时间线、剧情线和审核包，并排除 Provider 凭据。
+项目 ZIP 包含正文、历史修订、正典、时间线、剧情线、审核包和原始导入文件，但不含 Provider 或密钥。SQLite 在迁移和审核接受前创建一致性数据库快照；MySQL 审核接受前创建用户项目 ZIP，基础设施迁移前使用 `deploy/backup-before-migrate.sh` 的 `mysqldump --single-transaction`，备份文件默认仅服务账号可读。
 
-## API 文档与常用入口
+## Linux 生产部署
 
-启动服务后访问：
+生产目标为单台应用主机、MySQL 8.4 LTS、固定 HTTPS 域名、标准 SMTP 和固定 Linux 服务账号。示例位于：
 
-- Swagger UI：<http://127.0.0.1:8000/docs>
-- ReDoc：<http://127.0.0.1:8000/redoc>
-- OpenAPI JSON：<http://127.0.0.1:8000/openapi.json>
-- 健康检查：`GET /api/health`
+- `deploy/compose.mysql.yml`：MySQL 8.4、`utf8mb4_0900_ai_ci`、`ngram_token_size=2`；
+- `deploy/novel-auto-write.service`：systemd 服务；
+- `deploy/Caddyfile`：HTTPS 反向代理；
+- `.env.example`：应用环境变量参考。
 
-主要 API 分组：`/api/projects`、`/api/projects/{id}/import/*`、`/api/projects/{id}/chapters`、`/api/chapters`、`/api/projects/{id}/canon`、`/api/projects/{id}/story-map`、`/api/projects/{id}/generations`、`/api/generations/{run_id}/events`、`/api/reviews`、`/api/providers`、`/api/projects/{id}/export` 和 `/api/projects/restore`。
+生产必须设置 `NOVEL_ENV=production`、HTTPS 的公开地址、可信 Host、精确 CORS 来源和安全 Cookie。Linux 凭据库使用 Secret Service，服务必须以固定账号运行并拥有可用的 DBus/Secret Service 会话。多应用节点不在首版范围内；扩容前需把凭据迁移到外部 Secrets Manager。
 
-## 测试与本地校验
+执行数据库迁移：
+
+```bash
+export PYTHONPATH=backend
+.venv/bin/python -m app.cli migrate
+```
+
+## 测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m ruff check backend
+./.venv/Scripts/python.exe -m pytest -q
+./.venv/Scripts/python.exe -m ruff check backend
 npm --prefix frontend run build
 ```
 
-测试覆盖拆章、不可变修订、正典版本、审核原子性、旧章失效传播、生成幂等/恢复、Provider 兼容性和导出恢复等场景。
+CI 分别执行 SQLite 测试和 MySQL 8.4 集成测试。覆盖认证、CSRF、令牌过期/复用、跨租户 404、Provider 默认/临时选择、Anthropic 非流式与 SSE 错误、审核原子性、任务恢复、中文全文检索、备份密钥扫描，并从真实旧版 SQLite 表结构验证内容指纹、owner 外键和原始导入文件迁移。
 
-## 技术栈
+## 技术栈与边界
 
-- 后端：Python 3.11、FastAPI、Pydantic 2、SQLAlchemy 2 同步 Session、SQLite/WAL/外键/FTS5、Uvicorn。
-- 前端：React 18、TypeScript、Vite、TanStack Query、Lucide 图标。
-- 本地安全：`keyring` 系统凭据库、参数化 SQL、Markdown 清洗、SQLite 一致性快照。
+- 后端：Python 3.11、FastAPI、SQLAlchemy 2、Alembic、SQLite/FTS5、MySQL 8.4/ngram。
+- 前端：React、TypeScript、Vite、TanStack Query。
+- 密码：Argon2id；会话：服务端随机令牌、HttpOnly/SameSite Cookie、Origin 与双提交 CSRF 校验。
+- 首版只支持 TXT/Markdown，不含小说共享、多人协作、组织空间、多世界线分支、图数据库或分布式任务队列。
 
-## 首版边界
-
-首版面向个人 Windows 单机使用，不包含登录、多人协作、云部署、分布式队列或外部连载发布；只支持 TXT/Markdown，不处理 DOCX/PDF。首版不提供多世界线分支、图数据库或向量数据库，优先使用结构化正典与可解释的 FTS5。系统不能保证模型永不犯错，可靠性来自持久正典、来源追踪、审查闸门、原子提交和可回滚备份。
+系统不能保证模型永不犯错；可靠性来自持久正典、来源追踪、审查闸门、原子提交、租户隔离和可恢复版本，而不是无限延长提示词。

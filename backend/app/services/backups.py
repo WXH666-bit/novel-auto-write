@@ -11,6 +11,8 @@ from typing import Any
 
 from sqlalchemy.engine import Engine
 
+from ..config import DATA_DIR
+
 
 def _safe_label(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
@@ -53,5 +55,46 @@ def create_sqlite_snapshot(bind: Engine, label: str) -> Path | None:
     return destination
 
 
-def create_session_snapshot(session: Any, label: str) -> Path | None:
-    return create_sqlite_snapshot(session.get_bind(), label)
+def create_session_snapshot(
+    session: Any,
+    label: str,
+    *,
+    project_id: str | None = None,
+    owner_id: str | None = None,
+) -> Path | None:
+    """Snapshot a risky mutation for either supported database backend.
+
+    SQLite can copy the whole local database transactionally.  On MySQL the
+    application instead writes a tenant/project ZIP immediately before review
+    acceptance; infrastructure migrations use the separate mysqldump helper.
+    """
+
+    bind = session.get_bind()
+    if bind.dialect.name == "sqlite":
+        return create_sqlite_snapshot(bind, label)
+    if bind.dialect.name != "mysql" or not project_id or not owner_id:
+        return None
+
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.orm import Session
+
+    from .exports import export_project_zip
+
+    backup_dir = (DATA_DIR / "backups" / owner_id / project_id).resolve()
+    data_root = DATA_DIR.resolve()
+    if data_root not in backup_dir.parents:
+        raise ValueError("备份路径越过数据目录")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+    destination = backup_dir / f"{stamp}-{_safe_label(label)}.zip"
+    temporary = destination.with_suffix(".zip.tmp")
+    # The caller may already have claimed a review row inside an uncommitted
+    # transaction.  Export through an independent read session so the archive
+    # is a true pre-commit view and never contains transient "committing"
+    # state.
+    snapshot_engine = bind if isinstance(bind, Engine) else bind.engine
+    with Session(bind=snapshot_engine, autoflush=False, expire_on_commit=False) as snapshot_session:
+        payload = export_project_zip(snapshot_session, project_id, owner_id=owner_id)
+    temporary.write_bytes(payload)
+    os.replace(temporary, destination)
+    return destination

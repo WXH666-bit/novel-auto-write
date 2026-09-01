@@ -9,5 +9,9 @@ openai==3.6.0
 httpx==0.28.1
 python-multipart==0.0.32
 keyring==25.7.0
+pwdlib[argon2]==0.3.1
+email-validator==2.3.0
+PyMySQL[rsa]==1.2.0
+secretstorage==3.4.0; platform_system != "Windows"
 charset-normalizer==3.5.1
 orjson==3.12.0

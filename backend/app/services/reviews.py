@@ -6,13 +6,21 @@ import json
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from .backups import create_session_snapshot
 from .common import assign, mapped_kwargs, read_json, utcnow
 from .generation import is_blocker
 from .importer import content_hash
+
+
+def provider_for(profile: Any) -> Any:
+    """Late-bind the adapter so tests and deployments can inject a provider."""
+
+    from . import providers as provider_service
+
+    return provider_service.provider_for(profile)
 
 
 class ReviewNotFound(LookupError):
@@ -38,6 +46,51 @@ def _bundle(session: Session, bundle_id: str) -> Any:
     if bundle is None:
         raise ReviewNotFound("审核包不存在")
     return bundle
+
+
+def _claim_bundle_state(
+    session: Session,
+    bundle: Any,
+    *,
+    allowed: set[str],
+    working: str,
+) -> bool:
+    """Atomically claim a review decision/edit across workers and databases."""
+
+    from ..models import ReviewBundle
+
+    revision_condition = (
+        ReviewBundle.draft_revision_id.is_(None)
+        if bundle.draft_revision_id is None
+        else ReviewBundle.draft_revision_id == bundle.draft_revision_id
+    )
+    result = session.execute(
+        update(ReviewBundle)
+        .where(
+            ReviewBundle.id == bundle.id,
+            ReviewBundle.status.in_(allowed),
+            revision_condition,
+        )
+        .values(status=working)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 1:
+        session.scalar(
+            select(ReviewBundle)
+            .where(ReviewBundle.id == bundle.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return True
+    refreshed = session.scalar(
+        select(ReviewBundle)
+        .where(ReviewBundle.id == bundle.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if refreshed is None:
+        raise ReviewNotFound("审核包不存在")
+    return False
 
 
 def _issues(bundle: Any) -> list[dict[str, Any]]:
@@ -83,7 +136,12 @@ def bundle_payload(bundle: Any) -> dict[str, Any]:
 
 
 def edit_review_draft(
-    session: Session, bundle_id: str, content: str, *, actor: str = "editor"
+    session: Session,
+    bundle_id: str,
+    content: str,
+    *,
+    actor: str = "editor",
+    actor_user_id: str | None = None,
 ) -> Any:
     """Create a new immutable draft revision and invalidate old audit results."""
 
@@ -102,13 +160,38 @@ def edit_review_draft(
     )
     if chapter is None:
         raise ReviewValidationError("审核包没有关联章节")
-    current = session.scalar(
+    observed_current = session.scalar(
         select(ChapterRevision)
         .where(ChapterRevision.chapter_id == chapter.id)
         .order_by(ChapterRevision.revision_number.desc())
     )
-    if current is not None and current.content_hash == content_hash(content):
+    if observed_current is not None and observed_current.content_hash == content_hash(content):
         return bundle
+    if not _claim_bundle_state(
+        session,
+        bundle,
+        allowed={"pending", "needs_review", "rejected"},
+        working="editing",
+    ):
+        raise ReviewValidationError("审核包正由另一项操作处理，请刷新后重试")
+    chapter = session.scalar(
+        select(Chapter)
+        .where(Chapter.id == bundle.chapter_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if chapter is None:
+        raise ReviewValidationError("审核包没有关联章节")
+    # Re-read the sequence after the bundle claim and chapter lock.  A direct
+    # revision endpoint may have appended a version while this request was
+    # waiting, and revision numbers are immutable and unique per chapter.
+    current = session.scalar(
+        select(ChapterRevision)
+        .where(ChapterRevision.chapter_id == chapter.id)
+        .order_by(ChapterRevision.revision_number.desc())
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     next_number = (current.revision_number + 1) if current else 1
     revision = ChapterRevision(
         chapter_id=chapter.id,
@@ -136,6 +219,7 @@ def edit_review_draft(
         AuditLog(
             project_id=bundle.project_id,
             actor=actor,
+            actor_user_id=actor_user_id,
             action="review.draft_edited",
             entity_type="review_bundle",
             entity_id=bundle.id,
@@ -158,6 +242,13 @@ def mark_bundle_reaudited(
     bundle = _bundle(session, bundle_id)
     if bundle.status not in {"pending", "needs_review"}:
         raise ReviewValidationError("当前审核包不在待审核状态")
+    if not _claim_bundle_state(
+        session,
+        bundle,
+        allowed={"pending", "needs_review"},
+        working="auditing",
+    ):
+        raise ReviewValidationError("审核包正由另一项操作处理，请刷新后重试")
     bundle.audit_issues = [dict(item) for item in issues]
     bundle.canon_changes = [dict(item) for item in changes]
     bundle.status = "pending"
@@ -170,10 +261,11 @@ def reaudit_review_bundle(
     bundle_id: str,
     *,
     actor: str = "editor",
+    actor_user_id: str | None = None,
 ) -> Any:
     """Re-extract and re-audit the exact draft on the trusted server side."""
 
-    from ..models import AuditLog, Chapter, ChapterRevision, Project
+    from ..models import AuditLog, Chapter, ChapterRevision, GenerationRun, Project
     from .context import build_context
     from .generation import (
         AUDIT_SCHEMA,
@@ -183,13 +275,19 @@ def reaudit_review_bundle(
         _normalize_changes,
         _normalize_issues,
         _provider_profile,
+        _provider_profile_for_run,
         _provider_structured,
     )
-    from .providers import provider_for
-
     bundle = _bundle(session, bundle_id)
     if bundle.status not in {"pending", "needs_review"}:
         raise ReviewValidationError("当前审核包不能重新审查")
+    if not _claim_bundle_state(
+        session,
+        bundle,
+        allowed={"pending", "needs_review"},
+        working="auditing",
+    ):
+        raise ReviewValidationError("审核包正由另一项操作处理，请刷新后重试")
     project = session.scalar(select(Project).where(Project.id == bundle.project_id))
     chapter = session.scalar(select(Chapter).where(Chapter.id == bundle.chapter_id))
     revision = session.scalar(
@@ -198,9 +296,18 @@ def reaudit_review_bundle(
     if project is None or chapter is None or revision is None:
         raise ReviewValidationError("审核包缺少项目、章节或草稿修订")
 
-    profile = _provider_profile(session)
+    generation_run = (
+        session.scalar(select(GenerationRun).where(GenerationRun.id == bundle.generation_run_id))
+        if bundle.generation_run_id
+        else None
+    )
+    profile = (
+        _provider_profile_for_run(session, project, generation_run)
+        if generation_run is not None
+        else _provider_profile(session, project)
+    )
     provider = provider_for(profile)
-    budget = getattr(profile, "context_length", None) if profile is not None else None
+    budget = getattr(profile, "context_length", None)
     context = build_context(session, project, chapter, budget=budget, query=revision.content[:160])
     extraction, _ = _provider_structured(
         provider,
@@ -251,6 +358,7 @@ def reaudit_review_bundle(
         AuditLog(
             project_id=project.id,
             actor=actor,
+            actor_user_id=actor_user_id,
             action="review.reaudited",
             entity_type="review_bundle",
             entity_id=bundle.id,
@@ -385,6 +493,7 @@ def accept_review(
     *,
     force_reason: str | None = None,
     actor: str = "editor",
+    actor_user_id: str | None = None,
 ) -> Any:
     """Atomically accept a review bundle and apply its chapter/canon changes."""
 
@@ -397,58 +506,106 @@ def accept_review(
         if bundle.status == "needs_review":
             raise ReviewValidationError("正文已修改，必须重新审查后才能接受")
         raise ReviewValidationError("审核包当前不能接受")
-    project = session.scalar(select(Project).where(Project.id == bundle.project_id))
-    revision = (
-        session.scalar(
-            select(ChapterRevision).where(ChapterRevision.id == bundle.draft_revision_id)
-        )
-        if bundle.draft_revision_id
-        else None
-    )
-    chapter = (
-        session.scalar(select(Chapter).where(Chapter.id == bundle.chapter_id))
-        if bundle.chapter_id
-        else None
-    )
-    if project is None or chapter is None or revision is None:
-        raise ReviewValidationError("审核包缺少项目、章节或草稿修订")
-    if chapter.project_id != project.id or revision.chapter_id != chapter.id:
-        raise ReviewValidationError("审核包的项目、章节与草稿修订不一致")
-    if project.needs_rebuild:
-        raise StaleReviewError("旧章修改后的连续性记忆尚未重建，审核包已过期")
-    current_version = int(project.canon_version or 0)
-    if current_version != int(bundle.base_canon_version or 0):
-        raise StaleReviewError("正典已在审核期间变化，请重新生成审核包")
-    if int(project.memory_epoch or 0) != int(getattr(bundle, "base_memory_epoch", 0) or 0):
-        raise StaleReviewError("章节记忆已在审核期间变化，请重新生成审核包")
-    serious = blockers(bundle)
-    reason = str(force_reason or "").strip()
-    if serious and not reason:
-        raise BlockerError("存在严重冲突，强制接受必须填写理由")
-    from .generation import _normalize_changes
-
-    changes = _normalize_changes(_changes(bundle), revision.id, revision.content)
-    _validate_change_sources(revision, changes)
-    bundle.canon_changes = changes
-
-    backup_path = create_session_snapshot(
-        session,
-        f"before-accept-{project.id[:8]}-{bundle.id[:8]}",
-    )
-    before_project = {
-        "canon_version": current_version,
-        "chapter_current_revision_id": chapter.current_revision_id,
-    }
     try:
+        if not _claim_bundle_state(
+            session,
+            bundle,
+            allowed={"pending"},
+            working="committing",
+        ):
+            if bundle.status in {"accepted", "force_accepted"}:
+                session.rollback()
+                return _bundle(session, bundle_id)
+            raise ReviewValidationError("审核包正由另一项操作处理，请刷新后重试")
+
+        # Reload every authoritative row only after this worker owns the
+        # bundle.  The revision condition in the claim prevents an edit from
+        # being accepted with audit output produced for older prose.
+        project = session.scalar(
+            select(Project)
+            .where(Project.id == bundle.project_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        chapter = (
+            session.scalar(
+                select(Chapter)
+                .where(Chapter.id == bundle.chapter_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if bundle.chapter_id
+            else None
+        )
+        revision = (
+            session.scalar(
+                select(ChapterRevision)
+                .where(ChapterRevision.id == bundle.draft_revision_id)
+                .execution_options(populate_existing=True)
+            )
+            if bundle.draft_revision_id
+            else None
+        )
+        if project is None or chapter is None or revision is None:
+            raise ReviewValidationError("审核包缺少项目、章节或草稿修订")
+        if chapter.project_id != project.id or revision.chapter_id != chapter.id:
+            raise ReviewValidationError("审核包的项目、章节与草稿修订不一致")
+        if chapter.current_revision_id != revision.id:
+            raise StaleReviewError("章节已产生更新修订，该审核包已过期")
+        if project.needs_rebuild:
+            raise StaleReviewError("旧章修改后的连续性记忆尚未重建，审核包已过期")
+
+        current_version = int(project.canon_version or 0)
+        base_canon_version = int(bundle.base_canon_version or 0)
+        base_memory_epoch = int(getattr(bundle, "base_memory_epoch", 0) or 0)
+        if current_version != base_canon_version:
+            raise StaleReviewError("正典已在审核期间变化，请重新生成审核包")
+        if int(project.memory_epoch or 0) != base_memory_epoch:
+            raise StaleReviewError("章节记忆已在审核期间变化，请重新生成审核包")
+
+        serious = blockers(bundle)
+        reason = str(force_reason or "").strip()
+        if serious and not reason:
+            raise BlockerError("存在严重冲突，强制接受必须填写理由")
+        from .generation import _normalize_changes
+
+        changes = _normalize_changes(_changes(bundle), revision.id, revision.content)
+        _validate_change_sources(revision, changes)
+        bundle.canon_changes = changes
+
+        backup_path = create_session_snapshot(
+            session,
+            f"before-accept-{project.id[:8]}-{bundle.id[:8]}",
+            project_id=str(project.id),
+            owner_id=str(project.owner_id),
+        )
+        before_project = {
+            "canon_version": current_version,
+            "chapter_current_revision_id": chapter.current_revision_id,
+        }
         next_version = current_version + 1
+        version_claim = session.execute(
+            update(Project)
+            .where(
+                Project.id == project.id,
+                Project.canon_version == current_version,
+                Project.memory_epoch == base_memory_epoch,
+            )
+            .values(
+                canon_version=next_version,
+                memory_epoch=base_memory_epoch + 1,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if version_claim.rowcount != 1:
+            raise StaleReviewError("正典或章节记忆已在提交期间变化，请重新生成审核包")
+        session.refresh(project, attribute_names=["canon_version", "memory_epoch"])
         chapter.current_revision_id = revision.id
         chapter.accepted_revision_id = revision.id
         chapter.status = "confirmed"
         chapter.confirmed_at = utcnow()
         assign(project, "current_chapter_id", chapter.id)
         created = _commit_canon_changes(session, project, revision, changes, next_version)
-        project.canon_version = next_version
-        project.memory_epoch = int(project.memory_epoch or 0) + 1
         bundle.status = "force_accepted" if serious else "accepted"
         bundle.force_accept_reason = reason or None
         bundle.resolved_at = utcnow()
@@ -476,6 +633,7 @@ def accept_review(
             AuditLog(
                 project_id=project.id,
                 actor=actor,
+                actor_user_id=actor_user_id,
                 action="review.force_accepted" if serious else "review.accepted",
                 entity_type="review_bundle",
                 entity_id=bundle.id,
@@ -489,14 +647,35 @@ def accept_review(
                 reason=reason or None,
             )
         )
+        search_owner_id = str(project.owner_id)
+        search_project_id = str(project.id)
         session.commit()
     except Exception:
         session.rollback()
         raise
+    try:
+        from ..db import rebuild_search_index
+
+        rebuild_search_index(
+            db_engine=session.get_bind(),
+            owner_id=search_owner_id,
+            project_id=search_project_id,
+        )
+    except Exception:
+        # The accepted chapter/canon transaction is authoritative.  Search is
+        # derived and will be rebuilt on the next startup if this refresh fails.
+        pass
     return bundle
 
 
-def reject_review(session: Session, bundle_id: str, reason: str, *, actor: str = "editor") -> Any:
+def reject_review(
+    session: Session,
+    bundle_id: str,
+    reason: str,
+    *,
+    actor: str = "editor",
+    actor_user_id: str | None = None,
+) -> Any:
     """Reject a bundle; no chapter pointer or canon row is modified."""
 
     from ..models import AuditLog, GenerationRun, Job
@@ -507,7 +686,20 @@ def reject_review(session: Session, bundle_id: str, reason: str, *, actor: str =
     bundle = _bundle(session, bundle_id)
     if bundle.status in {"accepted", "force_accepted"}:
         raise ReviewValidationError("已接受的审核包不能拒绝")
+    if bundle.status == "rejected":
+        return bundle
     before = bundle_payload(bundle)
+    if not _claim_bundle_state(
+        session,
+        bundle,
+        allowed={"pending", "needs_review", "stale"},
+        working="rejecting",
+    ):
+        if bundle.status == "rejected":
+            return bundle
+        if bundle.status in {"accepted", "force_accepted"}:
+            raise ReviewValidationError("已接受的审核包不能拒绝")
+        raise ReviewValidationError("审核包正由另一项操作处理，请刷新后重试")
     bundle.status = "rejected"
     bundle.rejection_reason = reason
     bundle.resolved_at = utcnow()
@@ -532,6 +724,7 @@ def reject_review(session: Session, bundle_id: str, reason: str, *, actor: str =
         AuditLog(
             project_id=bundle.project_id,
             actor=actor,
+            actor_user_id=actor_user_id,
             action="review.rejected",
             entity_type="review_bundle",
             entity_id=bundle.id,
@@ -551,6 +744,7 @@ def invalidate_after_chapter_edit(
     new_revision_id: str | None,
     *,
     actor: str = "editor",
+    actor_user_id: str | None = None,
 ) -> int:
     """Propagate an old-chapter edit to dependent canon and summaries."""
 
@@ -575,6 +769,7 @@ def invalidate_after_chapter_edit(
         AuditLog(
             project_id=project.id,
             actor=actor,
+            actor_user_id=actor_user_id,
             action="chapter.edit.invalidated_memory",
             entity_type="chapter",
             entity_id=chapter.id,
