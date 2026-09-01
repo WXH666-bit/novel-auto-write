@@ -6,6 +6,7 @@ import {
   useState,
   type ReactNode,
   type RefObject,
+  type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -102,6 +103,7 @@ import AuthScreen, {
   AccountSecurityView,
   getAuthViewFromPath,
 } from "./AuthScreen";
+import InkLandscape from "./InkLandscape";
 import type {
   AuditIssue,
   CanonChange,
@@ -179,6 +181,61 @@ function shortTime(value?: string) {
   return value.replace("T", " ").slice(0, 16);
 }
 
+function useDialogFocus<T extends HTMLElement>() {
+  const dialogRef = useRef<T>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return undefined;
+    const previous = document.activeElement as HTMLElement | null;
+    const focusableSelector = [
+      "button:not([disabled])",
+      "input:not([disabled])",
+      "textarea:not([disabled])",
+      "select:not([disabled])",
+      "[href]",
+      '[tabindex]:not([tabindex="-1"])',
+    ].join(",");
+    const focusable = () =>
+      Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector)).filter(
+        (element) => element.offsetParent !== null,
+      );
+    const frame = window.requestAnimationFrame(() => {
+      if (!dialog.contains(document.activeElement)) {
+        (focusable()[0] || dialog).focus();
+      }
+    });
+    const trapFocus = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    dialog.addEventListener("keydown", trapFocus);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      dialog.removeEventListener("keydown", trapFocus);
+      if (previous && previous !== document.body) {
+        window.requestAnimationFrame(() => previous.focus());
+      }
+    };
+  }, []);
+
+  return dialogRef;
+}
+
 function Workspace({
   session,
   onLogout,
@@ -241,6 +298,12 @@ function Workspace({
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const workspaceStageRef = useRef<HTMLDivElement>(null);
+  const lastWorkspaceFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }, [view, activeProjectId]);
 
   useEffect(() => {
     const clearWorkspaceState = () => {
@@ -368,6 +431,9 @@ function Workspace({
         setShowGeneration(false);
         setShowReview(false);
         setForceAcceptOpen(false);
+        setMobileSidebar(false);
+        setMobileLedger(false);
+        setAccountMenuOpen(false);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -822,28 +888,54 @@ function Workspace({
         : activeProject?.title || "未选择项目";
   const headerKicker =
     view === "library"
-      ? "STORY DESK / LOCAL"
+      ? "藏书阁 / 私人卷宗"
       : view === "settings"
-        ? "STORY DESK / CONFIG"
-        : "STORY DESK / CANON WORKSPACE";
+        ? "砚台 / 模型与生成"
+        : "案头 / 故事正典";
+  const overlayOpen =
+    showNewProject ||
+    showImport ||
+    showGeneration ||
+    showReview ||
+    showCommand;
+
+  useEffect(() => {
+    const stage = workspaceStageRef.current;
+    if (!stage) return;
+    if (overlayOpen) stage.setAttribute("inert", "");
+    else {
+      stage.removeAttribute("inert");
+      const returnTarget = lastWorkspaceFocusRef.current;
+      if (returnTarget?.isConnected) {
+        window.requestAnimationFrame(() => returnTarget.focus());
+      }
+    }
+  }, [overlayOpen]);
 
   return (
     <div className="app-shell">
+      <InkLandscape className="workspace-ink" />
+      <div
+        className="workspace-stage"
+        ref={workspaceStageRef}
+        onFocusCapture={(event) => {
+          lastWorkspaceFocusRef.current = event.target as HTMLElement;
+        }}
+      >
       <header className="topbar">
-        <div
+        <button
           className="brand-lockup"
           onClick={() => setView("library")}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(event) => event.key === "Enter" && setView("library")}
+          type="button"
+          aria-label="返回小说项目库"
         >
           <span className="brand-mark">
             <BookOpen size={17} strokeWidth={1.8} />
           </span>
           <span className="brand-name">章回</span>
           <span className="brand-divider" />
-          <span className="brand-caption">长篇小说编剧室</span>
-        </div>
+          <span className="brand-caption">长篇叙事案头</span>
+        </button>
         <div className="breadcrumb">
           <span>{headerKicker}</span>
           <ChevronRight size={13} />
@@ -1039,6 +1131,7 @@ function Workspace({
           />
         )}
       </main>
+      </div>
 
       {showNewProject && (
         <NewProjectModal
@@ -1203,7 +1296,7 @@ function LibraryView({
     <div className="library-page">
       <section className="library-intro">
         <div>
-          <p className="eyebrow">个人工作区 / 故事正典</p>
+          <p className="eyebrow">私人藏书阁 / 故事正典</p>
           <h1>
             把下一章写在
             <br />
@@ -2852,6 +2945,7 @@ function GenerationDrawer({
   onClose: () => void;
   onStart: () => void;
 }) {
+  const dialogRef = useDialogFocus<HTMLElement>();
   return (
     <div className="drawer-layer">
       <button
@@ -2859,7 +2953,14 @@ function GenerationDrawer({
         onClick={onClose}
         aria-label="关闭生成抽屉"
       />
-      <aside className="generation-drawer">
+      <aside
+        className="generation-drawer"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="生成下一章"
+        tabIndex={-1}
+      >
         <div className="drawer-head">
           <div>
             <p className="eyebrow">GENERATION RUN / NEW</p>
@@ -3037,7 +3138,14 @@ function JobStrip({
             {job.phase_label || statusLabels[job.status] || job.status}
           </span>
         </div>
-        <div className="job-progress-track">
+        <div
+          className="job-progress-track"
+          role="progressbar"
+          aria-label={job.phase_label || "小说生成进度"}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(job.progress || 0)}
+        >
           <span style={{ width: `${job.progress || 0}%` }} />
         </div>
       </div>
@@ -3457,6 +3565,8 @@ function CommandPalette({
   onAction: (action: () => void) => void;
 }) {
   const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const dialogRef = useDialogFocus<HTMLDivElement>();
   const actions = [
     {
       label: "生成下一章",
@@ -3492,6 +3602,21 @@ function CommandPalette({
   const visible = actions.filter((item) =>
     `${item.label}${item.hint}`.includes(query),
   );
+  useEffect(() => setActiveIndex(0), [query]);
+  const handleCommandKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveIndex((index) => (visible.length ? (index + 1) % visible.length : 0));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveIndex((index) =>
+        visible.length ? (index - 1 + visible.length) % visible.length : 0,
+      );
+    } else if (event.key === "Enter" && visible[activeIndex]) {
+      event.preventDefault();
+      onAction(visible[activeIndex].action);
+    }
+  };
   return (
     <div className="command-layer">
       <button
@@ -3499,20 +3624,33 @@ function CommandPalette({
         onClick={onClose}
         aria-label="关闭命令栏"
       />
-      <div className="command-palette">
+      <div
+        className="command-palette"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="快捷命令"
+        tabIndex={-1}
+      >
         <div className="command-input">
           <Search size={17} />
           <input
             autoFocus
             value={query}
             onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={handleCommandKeyDown}
             placeholder="输入命令或动作…"
           />
           <kbd>ESC</kbd>
         </div>
         <div className="command-list">
           {visible.map(({ label, hint, icon: Icon, action }, index) => (
-            <button key={label} onClick={() => onAction(action)}>
+            <button
+              className={index === activeIndex ? "is-active" : ""}
+              key={label}
+              onClick={() => onAction(action)}
+              onMouseEnter={() => setActiveIndex(index)}
+            >
               <span className="command-number">{index + 1}</span>
               <span className="command-icon">
                 <Icon size={15} />
@@ -3587,14 +3725,17 @@ function Modal({
   onClose: () => void;
   size?: "small" | "medium" | "large" | "xl";
 }) {
+  const dialogRef = useDialogFocus<HTMLElement>();
   return (
     <div className="modal-layer">
       <button className="modal-scrim" onClick={onClose} aria-label="关闭窗口" />
       <section
         className={`modal modal-${size}`}
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label={title}
+        tabIndex={-1}
       >
         <div className="modal-head">
           <div>

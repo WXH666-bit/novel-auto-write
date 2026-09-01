@@ -26,6 +26,7 @@ import {
   verifyEmail,
 } from "./api";
 import type { AuthConfig, AuthMode, AuthSession, AuthView } from "./types";
+import InkLandscape from "./InkLandscape";
 
 type AuthScreenProps = {
   initialView?: AuthView;
@@ -344,6 +345,7 @@ export default function AuthScreen({
   return (
     <div className="auth-shell">
       <div className="auth-manuscript" aria-hidden="true">
+        <InkLandscape className="auth-ink" tone="dark" />
         <div className="auth-manuscript-top">
           <span className="auth-seal"><BookSeal /></span>
           <span>章回 / PRIVATE STORY DESK</span>
@@ -359,7 +361,7 @@ export default function AuthScreen({
           <div className="auth-timeline-item"><i /> <span>添加 Provider</span><small>模型密钥只进你的凭据库</small></div>
           <div className="auth-timeline-item"><i /> <span>接受正典</span><small>生成前先固定故事状态</small></div>
         </div>
-        <span className="auth-page-mark">01 / CANON</span>
+        <span className="auth-page-mark">卷一 / 正典</span>
       </div>
 
       <main className="auth-panel">
