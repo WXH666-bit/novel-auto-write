@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -32,6 +33,13 @@ from ..security import get_current_user
 from . import chapter_payload, require_chapter, require_project
 
 router = APIRouter(prefix="/api", tags=["chapters"])
+
+
+class CompleteChapterPayload(BaseModel):
+    """Optimistic completion request used by the editor's explicit action."""
+
+    expected_revision_id: str | None = None
+    analyze: bool = True
 
 
 def _new_revision(chapter: Chapter, payload: ChapterRevisionCreate) -> ChapterRevision:
@@ -146,6 +154,26 @@ def _invalidate_after_edit(db: Session, project: Project, chapter: Chapter) -> d
     }
     for later in impacted_chapters:
         later.summary_status = "needs_review"
+    chapter.summary_status = "needs_review"
+
+    # Versioned summaries keep the precise stale state while the legacy
+    # chapter mirror retains ``needs_review`` for older clients.
+    try:
+        from ..models import StorySummary
+
+        summaries = db.scalars(
+            select(StorySummary).where(
+                StorySummary.project_id == project.id,
+                or_(
+                    StorySummary.scope == "project",
+                    StorySummary.chapter_id.in_(impacted_ids),
+                ),
+            )
+        ).all()
+        for summary in summaries:
+            summary.status = "stale"
+    except ImportError:  # pragma: no cover - rolling upgrade compatibility
+        pass
 
     affected_canon = db.scalars(
         select(CanonItem).where(
@@ -224,6 +252,8 @@ def create_chapter(
         title=payload.title,
         status=payload.status,
         summary=payload.summary,
+        summary_status="current" if payload.summary else "unprocessed",
+        source_type="manual",
     )
     db.add(chapter)
     try:
@@ -514,6 +544,97 @@ def confirm_chapter(
         pass
     db.refresh(chapter)
     return chapter_payload(chapter)
+
+
+@router.post("/chapters/{chapter_id}/complete")
+def complete_chapter(
+    chapter_id: str,
+    payload: CompleteChapterPayload | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Confirm stable prose, then enqueue derived memory when enabled."""
+
+    request = payload or CompleteChapterPayload()
+    before = require_chapter(db, chapter_id, current_user)
+    if request.expected_revision_id and before.current_revision_id != request.expected_revision_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "revision_conflict",
+                "message": "稿纸已产生新版本，请刷新后再完成本章",
+            },
+        )
+    confirmed = confirm_chapter(chapter_id, current_user, db)
+    chapter = require_chapter(db, chapter_id, current_user)
+    project = require_project(db, chapter.project_id, current_user)
+    auto_summary = bool(getattr(current_user, "auto_summary_enabled", True))
+    memory_run = None
+    memory_runs: list[dict[str, object]] = []
+    if request.analyze and auto_summary:
+        from ..services.memory import create_memory_run, memory_run_snapshot
+
+        created = create_memory_run(
+            db,
+            project,
+            chapter=chapter,
+            actor_user_id=current_user.id,
+        )
+        memory_run = memory_run_snapshot(created.run)
+        memory_runs.append(memory_run)
+        if project.needs_rebuild:
+            # Rebuild stale later chapters in narrative order.  The durable
+            # dispatcher serialises jobs per project, so each project summary
+            # is based on the preceding chapter's newly-current memory.
+            downstream = db.scalars(
+                select(Chapter)
+                .where(
+                    Chapter.project_id == project.id,
+                    Chapter.id != chapter.id,
+                    Chapter.status.in_(
+                        ("confirmed", "accepted", "published", "committed")
+                    ),
+                    Chapter.summary_status != "current",
+                )
+                .order_by(Chapter.sort_order, Chapter.chapter_number)
+            ).all()
+            for later in downstream:
+                queued = create_memory_run(
+                    db,
+                    project,
+                    chapter=later,
+                    actor_user_id=current_user.id,
+                )
+                memory_runs.append(memory_run_snapshot(queued.run))
+        db.refresh(chapter)
+        confirmed = chapter_payload(chapter)
+    else:
+        chapter.summary_status = "unprocessed"
+        if auto_summary and not request.analyze:
+            db.add(
+                AuditLog(
+                    project_id=project.id,
+                    action="chapter.memory_skipped_once",
+                    entity_type="chapter",
+                    entity_id=chapter.id,
+                    actor_user_id=current_user.id,
+                    reason="用户完成本章时明确选择本次跳过故事记忆整理",
+                )
+            )
+        # With derived memory disabled, accepted prose and confirmed manual
+        # settings are the authoritative context; stale summaries must not
+        # keep the writing desk locked.
+        if not auto_summary:
+            project.needs_rebuild = False
+        db.commit()
+        db.refresh(chapter)
+        confirmed = chapter_payload(chapter)
+    return {
+        "chapter": confirmed.model_dump(mode="json"),
+        "memory_run": memory_run,
+        "memory_runs": memory_runs,
+        "auto_summary_enabled": auto_summary,
+    }
 
 
 __all__ = ["router"]

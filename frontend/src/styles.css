@@ -192,9 +192,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .chapter-item.is-selected .chapter-title { font-weight: 600; }
 .chapter-status { width: 17px; display: inline-grid; place-items: center; margin-left: auto; color: var(--muted); }
 .status-accepted { color: var(--sage); }
+.status-confirmed { color: var(--sage); }
 .status-review { color: var(--red); }
 .status-planned { color: var(--muted); }
 .status-draft { color: var(--teal); }
+.status-queued { color: var(--gold); }
+.status-generating { color: var(--teal); }
+.status-failed, .status-rejected { color: var(--red); }
 .sidebar-bottom { margin-top: auto; padding: 16px 17px 19px; }
 .sidebar-rule { height: 1px; margin-bottom: 14px; background: var(--line); }
 .sidebar-stat { display: flex; justify-content: space-between; margin-bottom: 8px; color: var(--muted); font-size: 10px; }
@@ -212,8 +216,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .chapter-pill { padding: 4px 6px; font-size: 9px; line-height: 1; white-space: nowrap; }
 .pill-review { color: var(--red); background: #FAEFED; }
 .pill-accepted { color: var(--sage); background: #E8F0EA; }
+.pill-confirmed { color: var(--sage); background: #E8F0EA; }
 .pill-planned { color: var(--muted); background: var(--faint); }
 .pill-draft { color: var(--teal); background: #E6F0F1; }
+.pill-queued { color: var(--gold); background: #F6F0E3; }
+.pill-generating { color: var(--teal); background: #E5F0EF; }
+.pill-failed, .pill-rejected { color: var(--red); background: #FAEFED; }
 .editor-actions { display: flex; align-items: center; gap: 7px; }
 .save-indicator { display: inline-flex; align-items: center; gap: 4px; margin-right: 8px; color: var(--sage); font-size: 10px; white-space: nowrap; }
 .save-dirty, .save-error { color: var(--red); }
@@ -371,6 +379,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .field > span small { color: var(--muted); font-size: 9px; font-weight: 400; }
 .field output { color: var(--teal); font-size: 10px; font-weight: 500; }
 .field input, .field textarea, .field select, .role-field input { width: 100%; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 0; color: var(--ink); outline: 0; background: var(--white); font-size: 12px; }
+.preset-number-control { display: grid; grid-template-columns: minmax(0, 1fr) minmax(7rem, .82fr); gap: 7px; }
+.preset-number-control input, .preset-number-control select { min-width: 0; min-height: 44px; }
+.preset-number-help { display: block; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .field textarea { min-height: 77px; resize: vertical; line-height: 1.7; }
 .field input:hover, .field textarea:hover, .field select:hover { border-color: #96B3BD; }
 .field input[type=range] { padding: 5px 0; border: 0; accent-color: var(--teal); background: transparent; }
@@ -645,6 +656,7 @@ kbd { padding: 3px 4px; border: 1px solid var(--line-strong); color: var(--muted
   .modal > form, .modal > .dropzone, .modal > .import-preview { padding-inline: 15px; }
   .form-grid, .form-grid-two { grid-template-columns: 1fr; }
   .form-grid .field-wide { grid-column: auto; }
+  .preset-number-control { grid-template-columns: minmax(0, 1fr) minmax(8rem, .58fr); }
   .dropzone { width: calc(100% - 30px); margin: 15px; }
   .review-modal-head { flex-direction: column; padding-inline: 15px; }
   .review-grid { grid-template-columns: 1fr; }
@@ -2195,6 +2207,24 @@ html { scrollbar-color: rgba(79, 117, 107, .58) rgba(31, 41, 36, .07); }
 }
 
 @media (max-width: 620px) {
+  .text-button,
+  .button {
+    min-height: 44px;
+  }
+  .quiet-icon,
+  .card-arrow {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .topbar .brand-lockup,
+  .topbar .icon-button,
+  .topbar .avatar {
+    min-height: 44px;
+  }
+  .topbar .icon-button,
+  .topbar .avatar {
+    min-width: 44px;
+  }
   .generation-drawer {
     width: 100vw;
   }

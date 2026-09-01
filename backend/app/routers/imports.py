@@ -132,6 +132,23 @@ def import_commit(
     created = persist_import(db, project, edited, source_hash=source_hash)
     if not created:
         return {"created": [], "count": 0, "idempotent": True, "source_hash": source_hash}
+    memory_runs: list[str] = []
+    auto_summary = bool(getattr(current_user, "auto_summary_enabled", True))
+    if auto_summary:
+        from ..services.memory import create_memory_run
+
+        for chapter in created:
+            queued = create_memory_run(
+                db,
+                project,
+                chapter=chapter,
+                actor_user_id=current_user.id,
+                commit=False,
+            )
+            memory_runs.append(str(queued.run.id))
+    else:
+        for chapter in created:
+            chapter.summary_status = "unprocessed"
     if source_hash:
         stored_name = f"{current_user.id}/{project.id}/{source_hash.lower()}.source"
         tenant_dir = (UPLOAD_DIR / current_user.id / project.id).resolve()
@@ -181,6 +198,8 @@ def import_commit(
         "chapters": chapter_payloads,
         "count": len(created),
         "source_hash": source_hash,
+        "memory_run_ids": memory_runs,
+        "auto_summary_enabled": auto_summary,
     }
 
 

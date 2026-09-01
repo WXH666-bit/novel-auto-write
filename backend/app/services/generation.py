@@ -69,6 +69,10 @@ class IdempotencyConflict(RuntimeError):
     """The same idempotency key was used for a different request."""
 
 
+class MemoryNotReady(RuntimeError):
+    """Confirmed prose has derived memory that is still pending or stale."""
+
+
 class RunNotFound(LookupError):
     pass
 
@@ -303,8 +307,10 @@ def _chapter_for_run(
         chapter_number=next_number,
         sort_order=next_number,
         title=title,
-        status="draft",
+        status="generating",
         summary=None,
+        summary_status="unprocessed",
+        source_type="generated",
     )
     session.add(chapter)
     session.flush()
@@ -403,6 +409,8 @@ def _create_next_batch_rows(
             "created_at",
             "idempotency_key",
             "title",
+            "skip_memory_once",
+            "skip_memory_reason",
         }
     }
     child_input.update(
@@ -611,17 +619,74 @@ def _active_run(session: Session, project_id: str) -> Any | None:
 def create_generation_run(session: Session, project: Any, request: Any) -> RunCreation:
     """Create a queued run and its job, or return an idempotent existing run."""
 
-    from ..models import GenerationRun, Job, Project
+    from ..models import (
+        AuditLog,
+        Chapter,
+        ChapterRevision,
+        GenerationRun,
+        Job,
+        Project,
+        User,
+    )
 
     values = _get_request(request)
+    destination = str(values.get("destination") or "").strip().lower()
+    if destination and destination not in {"current_blank", "new_child"}:
+        raise ValueError("destination 只支持 current_blank 或 new_child")
+    if destination == "new_child":
+        values["chapter_id"] = None
+    elif destination == "current_blank" and not values.get("chapter_id"):
+        raise ValueError("写入当前稿纸时必须提供 chapter_id")
     requested_chapters = _chapter_count(values.get("chapter_count", 1))
     values["chapter_count"] = requested_chapters
     mode = str(values.get("mode") or "quality").strip().lower()
     if requested_chapters > 1 and mode not in {"quality", "next_chapter"}:
         raise ValueError("chapter_count 大于 1 时只支持连续下一章生成模式")
     values["mode"] = mode
-    if bool(getattr(project, "needs_rebuild", False)):
-        raise ValueError("旧章修改后的连续性记忆尚未重建，当前暂停继续生成")
+    # The account-wide memory preference deliberately gates only chapters
+    # whose status says the derived memory is not usable.  Historic rows from
+    # releases that predate StorySummary used ``current`` with an empty mirror;
+    # they remain compatible until the author explicitly initialises memory.
+    owner = session.get(User, getattr(project, "owner_id", None))
+    auto_summary = bool(getattr(owner, "auto_summary_enabled", True))
+    if auto_summary and bool(destination) and bool(getattr(project, "needs_rebuild", False)):
+        raise MemoryNotReady("旧章修改后的连续性记忆尚未重建，当前暂停继续生成")
+    # ``destination`` is the capability marker for the new memory-aware API.
+    # Requests from the pre-2.1 client omitted it; keep those integrations
+    # working while the new UI always sends an explicit destination.
+    if auto_summary and bool(destination):
+        not_ready = session.scalar(
+            select(Chapter.id)
+            .where(
+                Chapter.project_id == project.id,
+                Chapter.status.in_(("confirmed", "accepted", "published", "committed")),
+                Chapter.summary_status.in_(
+                    (
+                        "unprocessed",
+                        "queued",
+                        "running",
+                        "stale",
+                        "failed",
+                        "needs_review",
+                    )
+                ),
+            )
+            .limit(1)
+        )
+        if not_ready is not None and not bool(values.get("skip_memory_once", False)):
+            raise MemoryNotReady("小说记忆尚未整理完成；可等待、重试，或明确跳过本次")
+        if not_ready is not None:
+            session.add(
+                AuditLog(
+                    project_id=project.id,
+                    action="generation.memory_skipped_once",
+                    entity_type="project",
+                    entity_id=project.id,
+                    reason=str(values.get("skip_memory_reason") or "用户本次明确跳过"),
+                    after_json={"chapter_id": str(not_ready)},
+                    actor_user_id=getattr(owner, "id", None),
+                )
+            )
     key = str(values.get("idempotency_key") or "").strip()
     if not key:
         raise ValueError("idempotency_key 不能为空")
@@ -672,6 +737,20 @@ def create_generation_run(session: Session, project: Any, request: Any) -> RunCr
     profile = _provider_profile(session, project, values.get("provider_id"))
     provider_snapshot = provider_config_snapshot(profile)
     chapter = _chapter_for_run(session, project, values.get("chapter_id"), values)
+    if destination == "current_blank":
+        current_revision = (
+            session.get(ChapterRevision, chapter.current_revision_id)
+            if chapter.current_revision_id
+            else None
+        )
+        if chapter.accepted_revision_id or (
+            current_revision is not None and str(current_revision.content or "").strip()
+        ):
+            raise ValueError("当前稿纸已有正文；请选择续写到新章节")
+    # The chapter itself is the durable sidebar placeholder.  It appears as
+    # soon as the queue transaction commits and remains available on failure,
+    # rejection, or retry.
+    chapter.status = "generating"
     batch = {
         "batch_id": str(uuid.uuid4()),
         "chapter_index": 1,
@@ -730,6 +809,8 @@ def create_generation_run(session: Session, project: Any, request: Any) -> RunCr
     )
     session.add(job)
     session.flush()
+    assign(job, "kind", "generation")
+    assign(job, "resource_id", run.id)
     assign(run, "job_id", job.id)
     try:
         session.commit()
@@ -750,6 +831,162 @@ def create_generation_run(session: Session, project: Any, request: Any) -> RunCr
     return RunCreation(run, True)
 
 
+def retry_rejected_generation(
+    session: Session,
+    run: Any,
+    *,
+    actor_user_id: str | None = None,
+) -> RunCreation | None:
+    """Create a fresh durable run for a rejected draft on the same chapter.
+
+    A rejected review package and its artifacts are immutable evidence.  A
+    retry therefore cannot rewind or overwrite the old run; it clones the
+    frozen request/provider snapshot into a new run while keeping the rejected
+    chapter revisions available in history.
+    """
+
+    from ..models import AuditLog, Chapter, GenerationRun, Job, Project, ReviewBundle
+
+    bundle = session.scalar(
+        select(ReviewBundle).where(
+            ReviewBundle.generation_run_id == run.id,
+            ReviewBundle.status == "rejected",
+        )
+    )
+    if bundle is None:
+        return None
+    project = session.scalar(
+        select(Project).where(Project.id == run.project_id).with_for_update()
+    )
+    if project is None:
+        raise RunNotFound("项目不存在")
+    old_key = str(getattr(run, "idempotency_key", None) or run.id)
+    key = f"{old_key}:rejected:{bundle.id}"
+    existing = session.scalar(
+        select(GenerationRun).where(
+            GenerationRun.project_id == project.id,
+            GenerationRun.idempotency_key == key,
+        )
+    )
+    if existing is not None:
+        return RunCreation(existing, False)
+    active = session.scalar(
+        select(GenerationRun.id).where(
+            GenerationRun.project_id == project.id,
+            GenerationRun.id != run.id,
+            GenerationRun.status.in_(ACTIVE_RUN_STATUSES),
+        )
+    )
+    if active is not None:
+        raise GenerationBusy("该项目已有活动生成任务")
+    chapter = session.scalar(
+        select(Chapter).where(
+            Chapter.id == run.chapter_id,
+            Chapter.project_id == project.id,
+        )
+    )
+    if chapter is None:
+        raise RunNotFound("驳回稿所属章节不存在")
+
+    snapshot = dict(read_json(getattr(run, "input_snapshot", None), {}) or {})
+    snapshot.update(
+        {
+            "idempotency_key": key,
+            "chapter_id": chapter.id,
+            "retry_of_run_id": str(run.id),
+            "retry_of_review_id": str(bundle.id),
+            "retry_feedback": str(bundle.rejection_reason or "用户要求重写"),
+            "created_at": utcnow().isoformat(),
+        }
+    )
+    retry_run = GenerationRun(
+        **mapped_kwargs(
+            GenerationRun,
+            {
+                "project_id": project.id,
+                "chapter_id": chapter.id,
+                "stage": "queued",
+                "status": "queued",
+                "idempotency_key": key,
+                "input_snapshot": snapshot,
+                "model_params": dict(read_json(getattr(run, "model_params", None), {}) or {}),
+                "context_snapshot": dict(
+                    read_json(getattr(run, "context_snapshot", None), {}) or {}
+                ),
+                "provider_profile_id": getattr(run, "provider_profile_id", None),
+                "provider_protocol": getattr(run, "provider_protocol", None),
+                "provider_config_version": getattr(run, "provider_config_version", None),
+                "provider_snapshot": dict(
+                    read_json(getattr(run, "provider_snapshot", None), {}) or {}
+                ),
+                "prompt_version": getattr(run, "prompt_version", None) or PROMPT_VERSION,
+            },
+        )
+    )
+    session.add(retry_run)
+    session.flush()
+    job = Job(
+        **mapped_kwargs(
+            Job,
+            {
+                "project_id": project.id,
+                "chapter_id": chapter.id,
+                "idempotency_key": key,
+                "kind": "generation",
+                "resource_id": retry_run.id,
+                "state": "queued",
+                "current_stage": "queued",
+                "payload": snapshot,
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "max_attempts": 3,
+            },
+        )
+    )
+    session.add(job)
+    session.flush()
+    assign(retry_run, "job_id", job.id)
+    chapter.status = "generating"
+
+    # Retire only the task lifecycle.  The rejected review bundle, revisions,
+    # provider provenance, and artifacts remain untouched and exportable.
+    assign(run, "status", "completed")
+    assign(run, "stage", "rejected")
+    assign(run, "finished_at", getattr(run, "finished_at", None) or utcnow())
+    old_job = _job_for_run(session, run)
+    if old_job is not None:
+        assign(old_job, "state", "completed")
+        assign(old_job, "current_stage", "rejected")
+        assign(old_job, "lease_owner", None)
+        assign(old_job, "lease_expires_at", None)
+    session.add(
+        AuditLog(
+            project_id=project.id,
+            actor_user_id=actor_user_id,
+            action="generation.retried_after_rejection",
+            entity_type="generation_run",
+            entity_id=retry_run.id,
+            before_json={"run_id": str(run.id), "review_id": str(bundle.id)},
+            after_json={"run_id": str(retry_run.id), "chapter_id": str(chapter.id)},
+            reason=str(bundle.rejection_reason or "用户要求重写"),
+        )
+    )
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        existing = session.scalar(
+            select(GenerationRun).where(
+                GenerationRun.project_id == project.id,
+                GenerationRun.idempotency_key == key,
+            )
+        )
+        if existing is not None:
+            return RunCreation(existing, False)
+        raise
+    return RunCreation(retry_run, True)
+
+
 def _job_for_run(session: Session, run: Any) -> Any | None:
     from ..models import Job
 
@@ -763,13 +1000,37 @@ def _job_for_run(session: Session, run: Any) -> Any | None:
 def _claim_run(session: Session, run: Any) -> str | None:
     """Atomically claim a generation job so duplicate workers become no-ops."""
 
-    from ..models import Job
+    from ..models import Job, Project
 
     job = _job_for_run(session, run)
     if job is None:
         return "legacy-run-without-job"
     owner = f"local-{uuid.uuid4()}"
     now = utcnow()
+    # Background acceleration and the durable dispatcher may race.  Locking
+    # the project row makes the sibling-lease check atomic on MySQL; SQLite's
+    # write transaction provides the same one-project-at-a-time invariant.
+    session.scalar(
+        select(Project.id).where(Project.id == run.project_id).with_for_update()
+    )
+    # Requests from the pre-2.1 API do not carry ``destination``.  Preserve
+    # their synchronous review hand-off: they may run beside derived-memory
+    # analysis because acceptance still detects a changed memory epoch.  The
+    # new memory-aware API remains strictly serial per project.
+    snapshot = read_json(getattr(run, "input_snapshot", None), {}) or {}
+    sibling = None
+    if snapshot.get("destination"):
+        sibling = session.scalar(
+            select(Job.id).where(
+                Job.project_id == run.project_id,
+                Job.id != job.id,
+                Job.lease_owner.is_not(None),
+                Job.lease_expires_at > now,
+            )
+        )
+    if sibling is not None:
+        session.rollback()
+        return None
     result = session.execute(
         update(Job)
         .where(
@@ -816,6 +1077,10 @@ def _set_stage(session: Session, run: Any, stage: str, *, status: str | None = N
         assign(job, "current_stage", stage)
         assign(job, "updated_at", utcnow())
         assign(job, "lease_expires_at", utcnow() + timedelta(minutes=10))
+    # Keep an append-only progress trail.  It doubles as the replay source for
+    # SSE reconnects, while the run row remains the authoritative latest state.
+    snapshot = json.dumps(run_snapshot(run), ensure_ascii=False, sort_keys=True, default=str)
+    _artifact(session, run, stage, "event", snapshot, {"event": "progress"})
     session.commit()
 
 
@@ -967,8 +1232,21 @@ FACT_SCHEMA: dict[str, Any] = {
         "canon_changes": {"type": "array", "items": {"type": "object"}},
         "issues": {"type": "array", "items": {"type": "object"}},
         "summary": {"type": "string"},
+        "characters": {"type": "array", "items": {"type": "object"}},
+        "character_relations": {"type": "array", "items": {"type": "object"}},
+        "plot_threads": {"type": "array", "items": {"type": "object"}},
+        "timeline_events": {"type": "array", "items": {"type": "object"}},
     },
-    "required": ["facts", "canon_changes", "issues", "summary"],
+    "required": [
+        "facts",
+        "canon_changes",
+        "issues",
+        "summary",
+        "characters",
+        "character_relations",
+        "plot_threads",
+        "timeline_events",
+    ],
 }
 AUDIT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1086,7 +1364,7 @@ def _local_audit(
 def execute_generation(session: Session, run_id: str) -> Any:
     """Resume a run from its durable stage and stop at an immutable review bundle."""
 
-    from ..models import Chapter, GenerationRun, Project, ReviewBundle
+    from ..models import Chapter, GenerationRun, Job, Project, ReviewBundle, User
 
     run = session.scalar(select(GenerationRun).where(GenerationRun.id == run_id))
     if run is None:
@@ -1103,7 +1381,22 @@ def execute_generation(session: Session, run_id: str) -> Any:
         return run
     if str(run.status) == "awaiting_review":
         return run
-    if bool(getattr(project, "needs_rebuild", False)):
+    owner = session.get(User, project.owner_id)
+    auto_summary = bool(getattr(owner, "auto_summary_enabled", True))
+    request = read_json(getattr(run, "input_snapshot", None), {}) or {}
+    request_batch = request.get("batch") if isinstance(request.get("batch"), dict) else {}
+    # New clients opt into the memory gate explicitly.  Legacy continuous
+    # batches must still pause their automatically queued child chapters after
+    # acceptance, because those children depend on the preceding new canon.
+    strict_memory_gate = bool(request.get("destination"))
+    rebuild_gate_enabled = bool(
+        strict_memory_gate or request_batch.get("parent_run_id")
+    )
+    if (
+        rebuild_gate_enabled
+        and auto_summary
+        and bool(getattr(project, "needs_rebuild", False))
+    ):
         message = "旧章修改后的连续性记忆尚未重建，任务已暂停"
         assign(run, "status", "needs_retry")
         assign(run, "error", message)
@@ -1115,6 +1408,71 @@ def execute_generation(session: Session, run_id: str) -> Any:
             assign(job, "lease_expires_at", None)
         session.commit()
         return run
+    if strict_memory_gate and auto_summary and not bool(
+        request.get("skip_memory_once", False)
+    ):
+        blocking_chapter_id = session.scalar(
+            select(Chapter.id)
+            .where(
+                Chapter.project_id == project.id,
+                Chapter.status.in_(
+                    (
+                        "confirmed",
+                        "accepted",
+                        "published",
+                        "committed",
+                    )
+                ),
+                Chapter.summary_status.in_(
+                    (
+                        "unprocessed",
+                        "queued",
+                        "running",
+                        "stale",
+                        "failed",
+                        "needs_review",
+                    )
+                ),
+            )
+            .limit(1)
+        )
+        pending_memory = None
+        if hasattr(Job, "kind"):
+            pending_memory = session.scalar(
+                select(Job.id).where(
+                    Job.project_id == project.id,
+                    Job.kind == "memory",
+                    Job.state.in_(("queued", "running", "summarizing")),
+                )
+            )
+        if pending_memory is not None:
+            # Keep the generation job queued.  The durable dispatcher processes
+            # the older memory job first, then naturally retries this run.
+            assign(run, "status", "queued")
+            assign(run, "stage", "queued")
+            job = _job_for_run(session, run)
+            if job is not None:
+                assign(job, "state", "queued")
+                assign(job, "current_stage", "waiting_for_memory")
+                assign(job, "last_error", "等待小说记忆整理完成")
+            session.commit()
+            return run
+        if blocking_chapter_id is not None:
+            message = "小说记忆尚未就绪；请重试记忆任务，或明确本次跳过"
+            assign(run, "status", "needs_retry")
+            assign(run, "stage", "waiting_for_memory")
+            assign(run, "error", message)
+            job = _job_for_run(session, run)
+            if job is not None:
+                assign(job, "state", "needs_retry")
+                assign(job, "current_stage", "waiting_for_memory")
+                assign(job, "last_error", message)
+                assign(job, "lease_owner", None)
+                assign(job, "lease_expires_at", None)
+            if chapter is not None:
+                chapter.status = "queued"
+            session.commit()
+            return run
     lease_owner = _claim_run(session, run)
     if lease_owner is None:
         # A second background callback for the same idempotent request must not
@@ -1184,6 +1542,13 @@ def execute_generation(session: Session, run_id: str) -> Any:
                 request.get("instructions")
                 or "规划本章目标、场景顺序、必须推进的剧情线，并严格遵守已确认正典。"
             )
+            retry_feedback = str(request.get("retry_feedback") or "").strip()
+            if retry_feedback:
+                instruction = (
+                    f"上一版草稿被作者驳回，反馈如下：{retry_feedback}\n"
+                    "请重新规划并针对反馈产生明显不同的新版本。\n"
+                    f"{instruction}"
+                )
             batch = batch_metadata(run)
             if batch and batch["chapter_total"] > 1:
                 instruction = (
@@ -1262,6 +1627,7 @@ def execute_generation(session: Session, run_id: str) -> Any:
             )
             session.commit()
         extracted_payload = read_json(extract_artifact.content, {}) or {}
+        final_extraction = extracted_payload
         changes = _normalize_changes(
             extracted_payload.get("canon_changes", []),
             draft_revision.id,
@@ -1401,6 +1767,7 @@ def execute_generation(session: Session, run_id: str) -> Any:
                     )
                     session.commit()
                 revised_payload = read_json(revised_extract.content, {}) or {}
+                final_extraction = revised_payload
                 changes = _normalize_changes(
                     revised_payload.get("canon_changes", []),
                     draft_revision.id,
@@ -1430,6 +1797,15 @@ def execute_generation(session: Session, run_id: str) -> Any:
                         "canon_changes": changes,
                         "audit_issues": issues,
                         "source_context": context.get("sources", []),
+                        "summary_candidate": str(final_extraction.get("summary") or ""),
+                        "structured_candidates": {
+                            "characters": final_extraction.get("characters") or [],
+                            "character_relations": final_extraction.get("character_relations")
+                            or [],
+                            "plot_threads": final_extraction.get("plot_threads") or [],
+                            "timeline_events": final_extraction.get("timeline_events") or [],
+                            "facts": final_extraction.get("facts") or [],
+                        },
                     },
                 )
             )
@@ -1448,6 +1824,8 @@ def execute_generation(session: Session, run_id: str) -> Any:
         if job is not None:
             assign(job, "state", getattr(run, "status", "needs_retry"))
             assign(job, "last_error", str(exc))
+        if chapter is not None:
+            chapter.status = "failed"
         session.commit()
         _release_run(session, run, lease_owner)
         return run
@@ -1458,6 +1836,8 @@ def execute_generation(session: Session, run_id: str) -> Any:
         if job is not None:
             assign(job, "state", "failed")
             assign(job, "last_error", str(exc))
+        if chapter is not None:
+            chapter.status = "failed"
         session.commit()
         _release_run(session, run, lease_owner)
         raise
@@ -1513,6 +1893,14 @@ def recover_incomplete_runs(session: Session, *, owner_id: str | None = None) ->
 
 def run_snapshot(run: Any) -> dict[str, Any]:
     batch = batch_metadata(run)
+    stage = getattr(run, "stage", None)
+    status = getattr(run, "status", None)
+    # Rejection finishes the old attempt but remains an actionable retry in
+    # the public task model.  This lets authors either retry that draft or
+    # deliberately start a different request without an artificial project
+    # lock from the terminal run.
+    if stage == "rejected" and status == "completed":
+        status = "needs_retry"
     return {
         "id": str(run.id),
         "project_id": str(run.project_id),
@@ -1520,8 +1908,8 @@ def run_snapshot(run: Any) -> dict[str, Any]:
         "provider_id": getattr(run, "provider_profile_id", None)
         or (read_json(getattr(run, "provider_snapshot", None), {}) or {}).get("provider_id"),
         "provider_protocol": getattr(run, "provider_protocol", None),
-        "stage": getattr(run, "stage", None),
-        "status": getattr(run, "status", None),
+        "stage": stage,
+        "status": status,
         "error": getattr(run, "error", None),
         "review_bundle_id": getattr(run, "review_bundle_id", None),
         "output_hash": getattr(run, "output_hash", None),
@@ -1535,22 +1923,51 @@ def run_snapshot(run: Any) -> dict[str, Any]:
 
 
 def sse_events(
-    session_factory: Any, run_id: str, *, poll_seconds: float = 0.25, max_seconds: float = 60.0
+    session_factory: Any,
+    run_id: str,
+    *,
+    after_event_id: str | None = None,
+    poll_seconds: float = 0.25,
+    max_seconds: float = 60.0,
 ) -> Iterable[str]:
-    """Yield compact SSE snapshots until review hand-off or terminal failure."""
+    """Replay persisted stage events, then stream the latest durable state."""
 
     started = time.monotonic()
     last: str | None = None
+    delivered: set[str] = set()
+    replay_started = after_event_id is None
     while time.monotonic() - started <= max_seconds:
         session = session_factory()
         try:
-            from ..models import GenerationRun
+            from ..models import GenerationArtifact, GenerationRun
 
             run = session.scalar(select(GenerationRun).where(GenerationRun.id == run_id))
             if run is None:
                 payload = {"error": "生成任务不存在"}
                 yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 return
+            events = session.scalars(
+                select(GenerationArtifact)
+                .where(
+                    GenerationArtifact.generation_run_id == run_id,
+                    GenerationArtifact.artifact_type == "event",
+                )
+                .order_by(GenerationArtifact.created_at, GenerationArtifact.id)
+            ).all()
+            if not replay_started:
+                replay_started = not any(str(item.id) == after_event_id for item in events)
+            for item in events:
+                event_id = str(item.id)
+                if not replay_started:
+                    delivered.add(event_id)
+                    if event_id == after_event_id:
+                        replay_started = True
+                    continue
+                if event_id in delivered or event_id == after_event_id:
+                    continue
+                yield f"id: {event_id}\nevent: progress\ndata: {item.content}\n\n"
+                delivered.add(event_id)
+                last = item.content
             encoded = json.dumps(run_snapshot(run), ensure_ascii=False, sort_keys=True)
             if encoded != last:
                 yield f"event: progress\ndata: {encoded}\n\n"

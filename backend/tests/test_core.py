@@ -146,17 +146,32 @@ def test_editing_confirmed_old_chapter_invalidates_downstream_memory(tmp_path, m
 def test_tenant_storage_deletion_can_restore_or_finalize(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
     upload = tmp_path / "uploads" / "user-1" / "project-1"
+    legacy_assets = tmp_path / "assets" / "user-1" / "project-1"
+    legacy_character_assets = tmp_path / "character_assets" / "user-1" / "project-1"
+    legacy_media = tmp_path / "media" / "user-1" / "project-1"
     backup = tmp_path / "backups" / "user-1" / "project-1"
     upload.mkdir(parents=True)
+    legacy_assets.mkdir(parents=True)
+    legacy_character_assets.mkdir(parents=True)
+    legacy_media.mkdir(parents=True)
     backup.mkdir(parents=True)
     (upload / "source.bin").write_bytes(b"story")
+    (legacy_assets / "portrait.png").write_bytes(b"legacy image")
+    (legacy_character_assets / "portrait-2.png").write_bytes(b"legacy image 2")
+    (legacy_media / "reference.png").write_bytes(b"legacy image 3")
     (backup / "snapshot.zip").write_bytes(b"backup")
 
     staged = storage.stage_storage_deletion(owner_id="user-1", project_id="project-1")
     assert not upload.exists()
+    assert not legacy_assets.exists()
+    assert not legacy_character_assets.exists()
+    assert not legacy_media.exists()
     assert not backup.exists()
     staged.restore()
     assert (upload / "source.bin").read_bytes() == b"story"
+    assert (legacy_assets / "portrait.png").read_bytes() == b"legacy image"
+    assert (legacy_character_assets / "portrait-2.png").read_bytes() == b"legacy image 2"
+    assert (legacy_media / "reference.png").read_bytes() == b"legacy image 3"
     assert (backup / "snapshot.zip").read_bytes() == b"backup"
 
     staged = storage.stage_storage_deletion(owner_id="user-1", project_id="project-1")
@@ -164,6 +179,9 @@ def test_tenant_storage_deletion_can_restore_or_finalize(tmp_path, monkeypatch):
     staged.finalize()
     assert quarantine_root is not None and not quarantine_root.exists()
     assert not upload.exists()
+    assert not legacy_assets.exists()
+    assert not legacy_character_assets.exists()
+    assert not legacy_media.exists()
     assert not backup.exists()
 
 

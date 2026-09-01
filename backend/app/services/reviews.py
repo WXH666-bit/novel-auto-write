@@ -126,6 +126,11 @@ def bundle_payload(bundle: Any) -> dict[str, Any]:
         "status": bundle.status,
         "draft_revision_id": bundle.draft_revision_id,
         "canon_changes": _changes(bundle),
+        "summary_candidate": getattr(bundle, "summary_candidate", None),
+        "structured_candidates": read_json(
+            getattr(bundle, "structured_candidates", None), {}
+        )
+        or {},
         "audit_issues": _issues(bundle),
         "source_context": read_json(getattr(bundle, "source_context", None), []),
         "rejection_reason": bundle.rejection_reason,
@@ -215,6 +220,8 @@ def edit_review_draft(
     # Canon candidates depend on the exact prose; never carry old candidates
     # silently into a manually edited draft.
     bundle.canon_changes = []
+    assign(bundle, "summary_candidate", None)
+    assign(bundle, "structured_candidates", {})
     session.add(
         AuditLog(
             project_id=bundle.project_id,
@@ -351,6 +358,18 @@ def reaudit_review_bundle(
     before = bundle_payload(bundle)
     bundle.audit_issues = issues
     bundle.canon_changes = changes
+    assign(bundle, "summary_candidate", str(extraction.get("summary") or ""))
+    assign(
+        bundle,
+        "structured_candidates",
+        {
+            "characters": extraction.get("characters") or [],
+            "character_relations": extraction.get("character_relations") or [],
+            "plot_threads": extraction.get("plot_threads") or [],
+            "timeline_events": extraction.get("timeline_events") or [],
+            "facts": extraction.get("facts") or [],
+        },
+    )
     bundle.source_context = context.get("sources", [])
     bundle.status = "pending"
     bundle.rejection_reason = None
@@ -497,7 +516,16 @@ def accept_review(
 ) -> Any:
     """Atomically accept a review bundle and apply its chapter/canon changes."""
 
-    from ..models import AuditLog, Chapter, ChapterRevision, GenerationRun, Job, Project
+    from ..models import (
+        AuditLog,
+        Chapter,
+        ChapterRevision,
+        GenerationArtifact,
+        GenerationRun,
+        Job,
+        Project,
+        User,
+    )
 
     bundle = _bundle(session, bundle_id)
     if bundle.status in {"accepted", "force_accepted"}:
@@ -617,6 +645,56 @@ def accept_review(
             if bundle.generation_run_id
             else None
         )
+        owner = session.get(User, project.owner_id)
+        auto_summary_enabled = bool(
+            getattr(owner, "auto_summary_enabled", True)
+        )
+        summary_candidate = str(getattr(bundle, "summary_candidate", None) or "").strip()
+        structured_candidates = read_json(
+            getattr(bundle, "structured_candidates", None), {}
+        ) or {}
+        # Backups and databases created before the new ReviewBundle fields can
+        # still promote the final extraction artifact without another model
+        # request.
+        if run is not None and not summary_candidate:
+            final_extract = session.scalar(
+                select(GenerationArtifact)
+                .where(
+                    GenerationArtifact.generation_run_id == run.id,
+                    GenerationArtifact.stage == "extracting",
+                )
+                .order_by(GenerationArtifact.created_at.desc())
+            )
+            extracted = read_json(getattr(final_extract, "content", None), {}) or {}
+            summary_candidate = str(extracted.get("summary") or "").strip()
+            structured_candidates = {
+                "characters": extracted.get("characters") or [],
+                "character_relations": extracted.get("character_relations") or [],
+                "plot_threads": extracted.get("plot_threads") or [],
+                "timeline_events": extracted.get("timeline_events") or [],
+                "facts": extracted.get("facts") or [],
+            }
+        if auto_summary_enabled and summary_candidate:
+            from .memory import apply_generated_summary
+
+            apply_generated_summary(
+                session,
+                project=project,
+                chapter=chapter,
+                revision=revision,
+                summary_text=summary_candidate,
+                structured_candidates=structured_candidates,
+                source_run_id=str(run.id) if run is not None else None,
+                actor_user_id=actor_user_id,
+            )
+        elif auto_summary_enabled:
+            chapter.summary_status = "failed"
+        else:
+            # The account switch is authoritative.  Keep the reviewed prose,
+            # but do not promote either its derived summary or its structured
+            # character/plot candidates into memory while it is disabled.
+            chapter.summary = None
+            chapter.summary_status = "unprocessed"
         if run is not None:
             run.status = "completed"
             run.stage = "completed"
@@ -634,6 +712,17 @@ def accept_review(
             # transaction commits.  Its execution will happen after this
             # request returns, so its context sees the newly committed canon.
             from .generation import queue_next_batch_run
+
+            if auto_summary_enabled:
+                from .memory import create_memory_run
+
+                create_memory_run(
+                    session,
+                    project,
+                    scope="project",
+                    actor_user_id=actor_user_id,
+                    commit=False,
+                )
 
             next_run = queue_next_batch_run(session, project, run)
         session.add(
@@ -686,7 +775,7 @@ def reject_review(
 ) -> Any:
     """Reject a bundle; no chapter pointer or canon row is modified."""
 
-    from ..models import AuditLog, GenerationRun, Job
+    from ..models import AuditLog, Chapter, GenerationRun, Job
 
     reason = str(reason or "").strip()
     if not reason:
@@ -711,13 +800,30 @@ def reject_review(
     bundle.status = "rejected"
     bundle.rejection_reason = reason
     bundle.resolved_at = utcnow()
+    if bundle.chapter_id:
+        chapter = session.scalar(
+            select(Chapter).where(
+                Chapter.id == bundle.chapter_id,
+                Chapter.project_id == bundle.project_id,
+            )
+        )
+        if chapter is not None:
+            chapter.status = "rejected"
     if bundle.generation_run_id:
         run = session.scalar(
             select(GenerationRun).where(GenerationRun.id == bundle.generation_run_id)
         )
         if run is not None:
+            # The rejected draft and review remain immutable, but the task is
+            # deliberately retryable.  The retry endpoint creates a fresh run
+            # on this same chapter instead of overwriting these artifacts.
+            # Internally this attempt is terminal so it never blocks a fresh
+            # manual generation request.  ``run_snapshot`` presents the
+            # rejected stage as ``needs_retry`` and the retry endpoint clones
+            # a new durable run from it.
             run.status = "completed"
-            run.stage = "completed"
+            run.stage = "rejected"
+            run.error = reason
             run.finished_at = utcnow()
             if run.idempotency_key:
                 job = session.scalar(
@@ -727,7 +833,10 @@ def reject_review(
                 )
                 if job is not None:
                     job.state = "completed"
-                    job.current_stage = "completed"
+                    job.current_stage = "rejected"
+                    job.last_error = reason
+                    job.lease_owner = None
+                    job.lease_expires_at = None
     session.add(
         AuditLog(
             project_id=bundle.project_id,

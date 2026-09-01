@@ -19,6 +19,8 @@ class UserRead(ORMModel):
     display_name: str | None = None
     is_email_verified: bool
     default_provider_id: str | None = None
+    auto_summary_enabled: bool = True
+    preferences_version: int = 1
     created_at: datetime
     last_login_at: datetime | None = None
 
@@ -121,6 +123,8 @@ class ProjectCreate(BaseModel):
     must_not_happen: list[Any] = Field(default_factory=list)
     hard_constraints: list[Any] = Field(default_factory=list)
     outline: dict[str, Any] = Field(default_factory=dict)
+    start_mode: Literal["blank", "setup", "import"] = "setup"
+    first_chapter_title: str | None = Field(default=None, min_length=1, max_length=255)
 
     @model_validator(mode="after")
     def require_name(self) -> ProjectCreate:
@@ -355,6 +359,9 @@ class GenerationRequest(BaseModel):
     target_word_count: int | None = Field(default=None, ge=1)
     instructions: str | None = None
     mode: str = "quality"
+    destination: Literal["current_blank", "new_child"] | None = None
+    skip_memory_once: bool = False
+    skip_memory_reason: str | None = Field(default=None, max_length=1000)
 
 
 class JobState(ORMModel):
@@ -362,6 +369,10 @@ class JobState(ORMModel):
     project_id: str
     chapter_id: str | None = None
     idempotency_key: str
+    kind: str = "generation"
+    resource_id: str | None = None
+    attempts: int = 0
+    max_attempts: int = 3
     state: str
     current_stage: str | None = None
     lease_owner: str | None = None
@@ -402,12 +413,450 @@ class ReviewBundleRead(ORMModel):
     status: str
     draft_revision_id: str | None = None
     canon_changes: list[Any] = Field(default_factory=list)
+    summary_candidate: str | None = None
+    structured_candidates: dict[str, Any] = Field(default_factory=dict)
     audit_issues: list[Any] = Field(default_factory=list)
     source_context: list[Any] = Field(default_factory=list)
     rejection_reason: str | None = None
     force_accept_reason: str | None = None
     created_at: datetime
     resolved_at: datetime | None = None
+
+
+class PreferencesRead(ORMModel):
+    auto_summary_enabled: bool = True
+    preferences_version: int = 1
+
+
+class PreferencesUpdate(BaseModel):
+    auto_summary_enabled: bool | None = None
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class StorySummaryRevisionRead(ORMModel):
+    id: str
+    story_summary_id: str
+    source_revision_id: str | None = None
+    summary_text: str
+    structured_json: dict[str, Any] = Field(default_factory=dict)
+    provider_profile_id: str | None = None
+    model_name: str | None = None
+    prompt_version: str | None = None
+    memory_epoch: int
+    created_at: datetime
+
+
+class StorySummaryRead(ORMModel):
+    id: str
+    project_id: str
+    scope: str
+    chapter_id: str | None = None
+    current_revision_id: str | None = None
+    status: str
+    summary_text: str
+    structured_json: dict[str, Any] = Field(default_factory=dict)
+    memory_epoch: int
+    created_at: datetime
+    updated_at: datetime
+    revisions: list[StorySummaryRevisionRead] = Field(default_factory=list)
+
+
+class StorySummaryUpsert(BaseModel):
+    scope: Literal["project", "chapter", "arc"] = "project"
+    chapter_id: str | None = None
+    source_revision_id: str | None = None
+    summary_text: str = ""
+    structured_json: dict[str, Any] = Field(default_factory=dict)
+    provider_profile_id: str | None = None
+    model_name: str | None = None
+    prompt_version: str | None = None
+    memory_epoch: int | None = Field(default=None, ge=0)
+    expected_memory_epoch: int | None = Field(default=None, ge=0)
+
+
+class MemoryBuildRunCreate(BaseModel):
+    scope: Literal["project", "chapter", "arc"] = "project"
+    chapter_id: str | None = None
+    idempotency_key: str = Field(min_length=1, max_length=255)
+    provider_profile_id: str | None = None
+
+
+class MemoryBuildRunRead(ORMModel):
+    id: str
+    project_id: str
+    chapter_id: str | None = None
+    scope: str
+    status: str
+    idempotency_key: str
+    provider_profile_id: str | None = None
+    stage: str
+    resource_id: str | None = None
+    error: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class MemoryBuildArtifactRead(ORMModel):
+    id: str
+    run_id: str
+    stage: str
+    content_hash: str
+    content: str
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class CharacterFields(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    aliases: list[str] = Field(default_factory=list)
+    role: str | None = Field(default=None, max_length=120)
+    gender: str | None = Field(default=None, max_length=80)
+    pronouns: str | None = Field(default=None, max_length=80)
+    age: str | None = Field(default=None, max_length=80)
+    occupation: str | None = Field(default=None, max_length=160)
+    appearance: str | None = None
+    personality: str | None = None
+    background: str | None = None
+    goals: str | None = None
+    goal: str | None = None
+    motivation: str | None = None
+    conflict_fears: str | None = None
+    conflict: str | None = None
+    abilities: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    arc: str | None = None
+    voice: str | None = None
+    status: str = Field(default="active", max_length=40)
+    custom_fields: dict[str, Any] = Field(default_factory=dict)
+    image_media_id: str | None = None
+
+
+class CharacterCreate(CharacterFields):
+    source_type: str = Field(default="manual", max_length=40)
+
+
+class CharacterUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    aliases: list[str] | None = None
+    role: str | None = Field(default=None, max_length=120)
+    gender: str | None = Field(default=None, max_length=80)
+    pronouns: str | None = Field(default=None, max_length=80)
+    age: str | None = Field(default=None, max_length=80)
+    occupation: str | None = Field(default=None, max_length=160)
+    appearance: str | None = None
+    personality: str | None = None
+    background: str | None = None
+    goals: str | None = None
+    goal: str | None = None
+    motivation: str | None = None
+    conflict_fears: str | None = None
+    conflict: str | None = None
+    abilities: str | None = None
+    tags: list[str] | None = None
+    arc: str | None = None
+    voice: str | None = None
+    status: str | None = Field(default=None, max_length=40)
+    custom_fields: dict[str, Any] | None = None
+    image_media_id: str | None = None
+    source_type: str | None = Field(default=None, max_length=40)
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class CharacterRevisionRead(ORMModel):
+    id: str
+    character_id: str
+    revision_number: int
+    name: str
+    aliases: list[str] = Field(default_factory=list)
+    role: str | None = None
+    gender: str | None = None
+    pronouns: str | None = None
+    age: str | None = None
+    occupation: str | None = None
+    appearance: str | None = None
+    personality: str | None = None
+    background: str | None = None
+    goals: str | None = None
+    goal: str | None = None
+    motivation: str | None = None
+    conflict_fears: str | None = None
+    conflict: str | None = None
+    abilities: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    arc: str | None = None
+    voice: str | None = None
+    status: str
+    custom_fields: dict[str, Any] = Field(default_factory=dict)
+    image_media_id: str | None = None
+    source_type: str
+    source_revision_id: str | None = None
+    created_by_user_id: str | None = None
+    created_at: datetime
+
+
+class CharacterRead(CharacterFields, ORMModel):
+    id: str
+    project_id: str
+    current_revision_id: str | None = None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    revisions: list[CharacterRevisionRead] = Field(default_factory=list)
+
+
+class StoryGraphNodeCreate(BaseModel):
+    node_type: str = Field(default="custom", min_length=1, max_length=40)
+    ref_id: str | None = None
+    character_id: str | None = None
+    chapter_id: str | None = None
+    plot_thread_id: str | None = None
+    label: str = Field(default="", max_length=255)
+    data: dict[str, Any] = Field(default_factory=dict)
+    position_x: float | None = None
+    position_y: float | None = None
+    width: float | None = Field(default=None, ge=0)
+    height: float | None = Field(default=None, ge=0)
+    status: str = Field(default="active", max_length=40)
+
+
+class StoryGraphNodeUpdate(BaseModel):
+    node_type: str | None = Field(default=None, min_length=1, max_length=40)
+    ref_id: str | None = None
+    character_id: str | None = None
+    chapter_id: str | None = None
+    plot_thread_id: str | None = None
+    label: str | None = Field(default=None, max_length=255)
+    data: dict[str, Any] | None = None
+    position_x: float | None = None
+    position_y: float | None = None
+    width: float | None = Field(default=None, ge=0)
+    height: float | None = Field(default=None, ge=0)
+    status: str | None = Field(default=None, max_length=40)
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class StoryGraphNodeRead(ORMModel):
+    id: str
+    project_id: str
+    node_type: str
+    ref_id: str | None = None
+    character_id: str | None = None
+    chapter_id: str | None = None
+    plot_thread_id: str | None = None
+    label: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    position_x: float | None = None
+    position_y: float | None = None
+    width: float | None = None
+    height: float | None = None
+    status: str
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class StoryGraphEdgeCreate(BaseModel):
+    source_node_id: str
+    target_node_id: str
+    relation_type: str = Field(default="related", min_length=1, max_length=80)
+    label: str | None = Field(default=None, max_length=255)
+    directed: bool = True
+    weight: float | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    status: str = Field(default="active", max_length=40)
+
+
+class StoryGraphEdgeUpdate(BaseModel):
+    source_node_id: str | None = None
+    target_node_id: str | None = None
+    relation_type: str | None = Field(default=None, min_length=1, max_length=80)
+    label: str | None = Field(default=None, max_length=255)
+    directed: bool | None = None
+    weight: float | None = None
+    data: dict[str, Any] | None = None
+    status: str | None = Field(default=None, max_length=40)
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class StoryGraphEdgeRead(ORMModel):
+    id: str
+    project_id: str
+    source_node_id: str
+    target_node_id: str
+    relation_type: str
+    label: str | None = None
+    directed: bool
+    weight: float | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class StoryGraphLayoutUpdate(BaseModel):
+    layout_json: dict[str, Any] = Field(default_factory=dict)
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class StoryGraphLayoutRead(ORMModel):
+    id: str
+    project_id: str
+    layout_json: dict[str, Any] = Field(default_factory=dict)
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class StoryGraphRead(BaseModel):
+    nodes: list[StoryGraphNodeRead] = Field(default_factory=list)
+    edges: list[StoryGraphEdgeRead] = Field(default_factory=list)
+    layout: StoryGraphLayoutRead | None = None
+
+
+class MediaAssetRead(ORMModel):
+    id: str
+    project_id: str
+    kind: str
+    original_name: str
+    mime: str
+    size: int
+    checksum: str
+    width: int
+    height: int
+    alt: str | None = None
+    created_at: datetime
+    download_url: str | None = None
+
+
+class ChangeSetRead(ORMModel):
+    id: str
+    project_id: str
+    source_type: str
+    source_id: str | None = None
+    base_memory_epoch: int
+    status: str
+    summary: str | None = None
+    changes_json: list[Any] = Field(default_factory=list)
+    created_by_user_id: str | None = None
+    created_at: datetime
+    applied_at: datetime | None = None
+    rejected_at: datetime | None = None
+
+
+class ProposalRead(ORMModel):
+    id: str
+    project_id: str
+    change_set_id: str
+    operation: str
+    target_type: str
+    target_id: str | None = None
+    patch_json: dict[str, Any] = Field(default_factory=dict)
+    base_version: int | None = None
+    base_memory_epoch: int | None = None
+    status: str
+    reason: str | None = None
+    conflict_reason: str | None = None
+    created_by_user_id: str | None = None
+    created_at: datetime
+    resolved_at: datetime | None = None
+
+
+class ProposalApplyRequest(BaseModel):
+    expected_version: int | None = Field(default=None, ge=1)
+    expected_memory_epoch: int | None = Field(default=None, ge=0)
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class ProposalRejectRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class ProposalBatchRequest(BaseModel):
+    proposal_ids: list[str] = Field(min_length=1, max_length=100)
+    expected_memory_epoch: int | None = Field(default=None, ge=0)
+    expected_versions: dict[str, int] = Field(default_factory=dict)
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class AgentConversationCreate(BaseModel):
+    title: str = Field(default="故事设定助手", min_length=1, max_length=255)
+    purpose: str = Field(default="setup", min_length=1, max_length=80)
+    apply_mode: Literal["preview", "auto_draft"] = "preview"
+    provider_profile_id: str | None = None
+
+
+class AgentConversationRead(ORMModel):
+    id: str
+    project_id: str
+    created_by_user_id: str
+    title: str
+    purpose: str
+    apply_mode: str
+    provider_profile_id: str | None = None
+    status: str
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentMessageCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=50_000)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=255)
+    expected_version: int | None = Field(default=None, ge=1)
+    target: dict[str, Any] = Field(default_factory=dict)
+    context_snapshot: dict[str, Any] = Field(default_factory=dict)
+    authorized_asset_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
+class AgentMessageRead(ORMModel):
+    id: str
+    project_id: str
+    conversation_id: str
+    run_id: str | None = None
+    sequence: int
+    role: str
+    content: str
+    status: str
+    idempotency_key: str | None = None
+    request_id: str | None = None
+    model_name: str | None = None
+    usage_json: dict[str, Any] = Field(default_factory=dict)
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
+    target_json: dict[str, Any] = Field(default_factory=dict)
+    context_snapshot: dict[str, Any] = Field(default_factory=dict)
+    authorized_asset_ids: list[str] = Field(default_factory=list)
+    created_at: datetime
+
+
+class AgentRunRead(ORMModel):
+    id: str
+    project_id: str
+    conversation_id: str
+    message_id: str | None = None
+    job_id: str | None = None
+    resource_id: str | None = None
+    idempotency_key: str
+    status: str
+    stage: str
+    provider_profile_id: str | None = None
+    output_hash: str | None = None
+    error: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class AgentEventRead(ORMModel):
+    id: str
+    project_id: str
+    conversation_id: str
+    run_id: str | None = None
+    sequence: int
+    event_type: str
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
 
 
 class ProviderProfileCreate(BaseModel):

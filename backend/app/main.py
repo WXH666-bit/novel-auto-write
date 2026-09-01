@@ -23,6 +23,7 @@ from .config import (
     CSRF_COOKIE_NAME,
     DATABASE_URL,
     IS_PRODUCTION,
+    JOB_WORKERS,
     MAIL_MODE,
     PUBLIC_BASE_URL,
     SESSION_COOKIE_SECURE,
@@ -30,20 +31,27 @@ from .config import (
     SMTP_HOST,
     TRUSTED_HOSTS,
 )
+from .routers.assistant import router as assistant_router
 from .routers.auth import router as auth_router
 from .routers.canon import router as canon_router
 from .routers.chapters import router as chapters_router
+from .routers.characters import router as characters_router
 from .routers.exports import router as exports_router
 from .routers.generations import router as generations_router
 from .routers.imports import router as imports_router
+from .routers.media import router as media_router
+from .routers.memory import router as memory_router
+from .routers.preferences import router as preferences_router
 from .routers.projects import router as projects_router
 from .routers.providers import router as providers_router
 from .routers.reviews import router as reviews_router
+from .routers.story_graph import router as story_graph_router
 from .security import new_secret, set_csrf_cookie
-from .services.generation import recover_incomplete_runs
+from .services.tasks import DurableTaskRunner
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
+task_runner = DurableTaskRunner(db_module.SessionLocal, workers=JOB_WORKERS)
 
 
 def _validate_production_config() -> None:
@@ -116,12 +124,14 @@ async def lifespan(_: FastAPI):
 
     _validate_production_config()
     db_module.init_db()
-    session = db_module.SessionLocal()
+    # Queue state is authoritative.  The dispatcher reclaims expired leases
+    # and resumes from persisted workflow artifacts after a restart.
+    task_runner.session_factory = db_module.SessionLocal
+    task_runner.start()
     try:
-        recover_incomplete_runs(session)
+        yield
     finally:
-        session.close()
-    yield
+        task_runner.stop()
 
 
 app = FastAPI(
@@ -135,7 +145,10 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type", "X-CSRF-Token"],
+    # Native EventSource reconnects carry the persisted SSE cursor in
+    # Last-Event-ID.  Explicitly allow it for the Vite development origin as
+    # well as same-origin production requests.
+    allow_headers=["Accept", "Content-Type", "X-CSRF-Token", "Last-Event-ID"],
 )
 if TRUSTED_HOSTS:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=TRUSTED_HOSTS)
@@ -144,11 +157,17 @@ app.include_router(projects_router)
 app.include_router(auth_router)
 app.include_router(chapters_router)
 app.include_router(canon_router)
+app.include_router(characters_router)
 app.include_router(imports_router)
+app.include_router(media_router)
+app.include_router(memory_router)
+app.include_router(preferences_router)
 app.include_router(providers_router)
 app.include_router(generations_router)
 app.include_router(reviews_router)
 app.include_router(exports_router)
+app.include_router(story_graph_router)
+app.include_router(assistant_router)
 
 
 @app.get("/api/health")

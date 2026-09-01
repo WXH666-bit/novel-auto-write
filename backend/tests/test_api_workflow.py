@@ -62,7 +62,7 @@ def _generate(client: TestClient, project_id: str, chapter_id: str, key: str) ->
     run_id = created.json()["id"]
     snapshot = client.get(f"/api/generations/{run_id}")
     assert snapshot.status_code == 200, snapshot.text
-    assert snapshot.json()["status"] == "awaiting_review"
+    assert snapshot.json()["status"] == "awaiting_review", snapshot.json()
     assert snapshot.json()["review_bundle_id"]
     return snapshot.json()
 

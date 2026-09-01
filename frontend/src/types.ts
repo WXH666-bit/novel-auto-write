@@ -1,5 +1,17 @@
-export type View = "library" | "desk" | "settings";
+export type View = "library" | "desk" | "studio" | "settings";
 export type LedgerTab = "canon" | "timeline" | "threads" | "foreshadowing";
+export type StartMode = "blank" | "import" | "setup";
+export type StudioMode = "manuscript" | "characters" | "story-map";
+export type EntityViewMode = "table" | "graph";
+export type SummaryStatus =
+  | "not_started"
+  | "unprocessed"
+  | "queued"
+  | "running"
+  | "current"
+  | "needs_review"
+  | "stale"
+  | "failed";
 export type AuthView =
   | "login"
   | "register"
@@ -22,6 +34,9 @@ export interface Project {
   genre?: string;
   viewpoint?: string;
   tone?: string;
+  style?: string;
+  story_bible?: string;
+  outline?: Record<string, unknown>;
   word_target?: number;
   target_word_count?: number;
   chapter_target?: number;
@@ -34,6 +49,7 @@ export interface Project {
   updated_at?: string;
   cover_mark?: string;
   source?: "local" | "imported";
+  summary_status?: SummaryStatus;
 }
 
 export interface Chapter {
@@ -44,17 +60,83 @@ export interface Chapter {
   status?:
     | "planned"
     | "draft"
+    | "queued"
+    | "generating"
+    | "failed"
+    | "rejected"
     | "review"
     | "accepted"
     | "confirmed"
     | "archived";
   word_count?: number;
   summary?: string;
+  summary_status?: SummaryStatus;
   content?: string;
   revision_id?: string;
   updated_at?: string;
   volume?: number;
   volume_title?: string;
+}
+
+export interface AccountPreferences {
+  auto_summary_enabled: boolean;
+  default_start_mode?: StartMode;
+  preferences_version?: number;
+  updated_at?: string;
+}
+
+export interface PortraitAsset {
+  id: string;
+  project_id: string;
+  filename?: string;
+  url: string;
+  alt?: string;
+  width?: number;
+  height?: number;
+  content_type?: string;
+  byte_size?: number;
+  checksum?: string;
+  created_at?: string;
+}
+
+export type CharacterStatus =
+  | "draft"
+  | "pending"
+  | "confirmed"
+  | "needs_review"
+  | "archived"
+  | "active";
+
+export interface CharacterCard {
+  id: string;
+  project_id: string;
+  name: string;
+  aliases: string[];
+  role?: string;
+  age?: string;
+  gender?: string;
+  pronouns?: string;
+  occupation?: string;
+  appearance?: string;
+  personality?: string;
+  background?: string;
+  goals?: string;
+  motivation?: string;
+  conflict_fears?: string;
+  abilities?: string;
+  arc?: string;
+  voice?: string;
+  tags: string[];
+  custom_fields: Record<string, string>;
+  portrait?: PortraitAsset | null;
+  status: CharacterStatus;
+  image_media_id?: string | null;
+  source_refs: SourceRef[];
+  canon_item_id?: string;
+  current_revision_id?: string | null;
+  version?: number;
+  updated_at?: string;
+  created_at?: string;
 }
 
 export interface SourceRef {
@@ -76,7 +158,8 @@ export interface CanonItem {
     | "item"
     | "relationship"
     | "constraint"
-    | "setting";
+    | "setting"
+    | "general";
   subject: string;
   predicate?: string;
   value: string;
@@ -114,6 +197,213 @@ export interface PlotThread {
   }>;
   next_beat?: string;
 }
+
+export type StoryGraphNodeType = "character" | "thread" | "event";
+
+export interface StoryGraphNode {
+  id: string;
+  type: StoryGraphNodeType;
+  label: string;
+  subtitle?: string;
+  image_url?: string;
+  status?: string;
+  position: { x: number; y: number };
+  data?: Record<string, unknown>;
+  ref_id?: string | null;
+  character_id?: string | null;
+  chapter_id?: string | null;
+  plot_thread_id?: string | null;
+  source_refs?: SourceRef[];
+  version?: number;
+}
+
+export interface StoryGraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  label?: string;
+  kind?: string;
+  direction?: "directed" | "undirected";
+  status?: "active" | "draft" | "pending" | "confirmed" | "needs_review";
+  note?: string;
+  source_refs?: SourceRef[];
+  relation_type?: string;
+  directed?: boolean;
+  weight?: number;
+  data?: Record<string, unknown>;
+  source_node_id?: string;
+  target_node_id?: string;
+  version?: number;
+}
+
+export interface StoryGraph {
+  nodes: StoryGraphNode[];
+  edges: StoryGraphEdge[];
+  version?: number;
+  layout_version?: number;
+  updated_at?: string;
+}
+
+/**
+ * Memory runs are derived snapshots.  `current` is the terminal successful
+ * state returned by the API; `stale` means the source revision moved while a
+ * run was in flight.  Keep `completed`/`needs_retry` as compatibility values
+ * for older deployments, but prefer the canonical states in new UI code.
+ */
+export type MemoryRunStatus =
+  | "queued"
+  | "running"
+  | "current"
+  | "failed"
+  | "stale"
+  | "skipped"
+  | "cancelled"
+  | "completed"
+  | "needs_retry";
+
+export interface MemoryRun {
+  id: string;
+  project_id: string;
+  status: MemoryRunStatus;
+  scope?: "project" | "chapter" | "arc" | "chapters";
+  chapter_id?: string | null;
+  chapter_ids?: string[];
+  progress?: number;
+  phase_label?: string;
+  error?: string;
+  created_at?: string;
+  completed_at?: string;
+  stage?: string;
+  started_at?: string;
+  finished_at?: string;
+  idempotency_key?: string;
+  provider_profile_id?: string | null;
+}
+
+export interface StorySummary {
+  id: string;
+  project_id: string;
+  scope: string;
+  chapter_id?: string | null;
+  current_revision_id?: string | null;
+  status: string;
+  summary_text: string;
+  structured_json: Record<string, unknown>;
+  memory_epoch: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ProjectMemory {
+  project_id: string;
+  memory_epoch: number;
+  auto_summary_enabled: boolean;
+  project_summary: StorySummary | null;
+  chapter_summaries: StorySummary[];
+  runs: MemoryRun[];
+}
+
+export type MemoryRunEvent =
+  | { type: "progress"; run: MemoryRun }
+  | { type: "artifact"; sequence: number; stage?: string; content_hash?: string };
+
+export type AgentTarget =
+  | { type: "project"; id: string; chapter_id?: string | null }
+  | { type: "character"; id: string; chapter_id?: string | null }
+  | { type: "thread"; id: string; chapter_id?: string | null }
+  | { type: "relationship"; id: string; chapter_id?: string | null }
+  | { type: "chapter"; id: string; chapter_id?: string | null };
+
+export type AgentRunStatus =
+  | "idle"
+  | "streaming"
+  | "applying"
+  | "applied"
+  | "error"
+  | "disconnected"
+  | "cancelled";
+
+export interface AgentPatch {
+  path: string;
+  value: unknown;
+  label?: string;
+  source_refs?: SourceRef[];
+  confidence?: number;
+}
+
+export interface AgentSelectionSnapshot {
+  chapter_id: string;
+  base_revision_id?: string | null;
+  start: number;
+  end: number;
+  hash: string;
+  quote?: string;
+}
+
+export interface AgentContextSnapshot {
+  chapter_id?: string | null;
+  base_revision_id?: string | null;
+  selection?: AgentSelectionSnapshot | null;
+  selection_start?: number;
+  selection_end?: number;
+  selection_hash?: string;
+  selected_text?: string;
+  [key: string]: unknown;
+}
+
+export type AssistantProposalStatus = "proposed" | "applying" | "applied" | "rejected";
+
+export interface AssistantProposal {
+  id: string;
+  conversation_id: string;
+  target: AgentTarget;
+  summary: string;
+  patches: AgentPatch[];
+  status: AssistantProposalStatus;
+  created_at?: string;
+  operation?: string;
+  target_type?: string;
+  target_id?: string | null;
+  change_set_id?: string;
+  base_version?: number | null;
+  base_memory_epoch?: number | null;
+  reason?: string;
+}
+
+export interface AssistantMessage {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at?: string;
+  proposal_ids?: string[];
+  status?: string;
+  target?: AgentTarget;
+  context_snapshot?: AgentContextSnapshot;
+  authorized_asset_ids?: string[];
+}
+
+export interface AssistantConversation {
+  id: string;
+  project_id: string;
+  target: AgentTarget;
+  status: AgentRunStatus;
+  messages: AssistantMessage[];
+  proposals: AssistantProposal[];
+  title?: string;
+  purpose?: string;
+  version?: number;
+  provider_profile_id?: string | null;
+  updated_at?: string;
+}
+
+export type AssistantEvent =
+  | { sequence: number; type: "message_delta"; message_id: string; delta: string }
+  | { sequence: number; type: "message_completed"; message_id: string; reply: string; proposal_count?: number }
+  | { sequence: number; type: "proposal_created"; proposal: AssistantProposal }
+  | { sequence: number; type: "proposal_patch"; proposal_id: string; patch: AgentPatch }
+  | { sequence: number; type: "proposal_completed"; proposal_id: string }
+  | { sequence: number; type: "status"; status: AgentRunStatus; message?: string }
+  | { sequence: number; type: "error"; message: string };
 
 export interface AuditIssue {
   id: string;
@@ -256,4 +546,5 @@ export interface StoryMap {
   timeline?: TimelineEvent[];
   characters?: CanonItem[];
   foreshadowing?: CanonItem[];
+  graph?: StoryGraph;
 }

@@ -165,7 +165,16 @@ def build_context(
     can therefore be persisted verbatim in ``GenerationRun.context_snapshot``.
     """
 
-    from ..models import CanonItem, Chapter, PlotThread, TimelineEvent
+    from ..models import (
+        CanonItem,
+        Chapter,
+        Character,
+        PlotThread,
+        StoryGraphEdge,
+        StoryGraphNode,
+        StorySummary,
+        TimelineEvent,
+    )
 
     budget = max(512, int(budget or 32768))
     sources: list[ContextSource] = []
@@ -188,6 +197,20 @@ def build_context(
         mandatory.append(_source("project", project, "故事圣经", story_bible))
     if outline:
         mandatory.append(_source("outline", project, "当前大纲", outline))
+
+    project_summary = session.scalar(
+        select(StorySummary)
+        .where(
+            StorySummary.project_id == project.id,
+            StorySummary.scope == "project",
+            StorySummary.status == "current",
+        )
+        .order_by(StorySummary.updated_at.desc())
+    )
+    if project_summary is not None and project_summary.summary_text:
+        mandatory.append(
+            _source("story_summary", project_summary, "小说当前总览", project_summary.summary_text)
+        )
 
     # Project-level generation requirements are durable story settings, not
     # optional search context.  Keep both lists mandatory and label them
@@ -239,6 +262,76 @@ def build_context(
             mandatory.append(citation)
         else:
             optional.append(citation)
+
+    # First-class character cards and graph relations are authoritative only
+    # after confirmation.  Agent/analysis proposals live in ChangeSet and are
+    # intentionally absent from these queries.
+    characters = session.scalars(
+        select(Character)
+        .where(
+            Character.project_id == project.id,
+            Character.status.in_(("active", "confirmed", "current")),
+        )
+        .order_by(Character.name)
+    ).all()
+    character_names = {str(item.id): item.name for item in characters}
+    for item in characters:
+        details = [
+            f"姓名：{item.name}",
+            f"别名：{safe_text(item.aliases)}" if item.aliases else "",
+            f"定位：{safe_text(item.role)}" if item.role else "",
+            f"外貌：{safe_text(item.appearance)}" if item.appearance else "",
+            f"性格：{safe_text(item.personality)}" if item.personality else "",
+            f"背景：{safe_text(item.background)}" if item.background else "",
+            f"目标：{safe_text(item.goals)}" if item.goals else "",
+            f"动机：{safe_text(item.motivation)}" if item.motivation else "",
+            f"成长弧：{safe_text(item.arc)}" if item.arc else "",
+            f"说话风格：{safe_text(item.voice)}" if item.voice else "",
+            f"自定义：{safe_text(item.custom_fields)}" if item.custom_fields else "",
+        ]
+        optional.append(
+            _source(
+                "character",
+                item,
+                "已确认人物卷宗",
+                "；".join(value for value in details if value),
+            )
+        )
+
+    nodes = {
+        str(node.id): node
+        for node in session.scalars(
+            select(StoryGraphNode).where(
+                StoryGraphNode.project_id == project.id,
+                StoryGraphNode.status.in_(("active", "confirmed", "current")),
+            )
+        ).all()
+    }
+    for edge in session.scalars(
+        select(StoryGraphEdge).where(
+            StoryGraphEdge.project_id == project.id,
+            StoryGraphEdge.status.in_(("active", "confirmed", "current")),
+        )
+    ).all():
+        source_node = nodes.get(str(edge.source_node_id))
+        target_node = nodes.get(str(edge.target_node_id))
+        if source_node is None or target_node is None:
+            continue
+        source_label = character_names.get(
+            str(getattr(source_node, "character_id", None)), source_node.label
+        )
+        target_label = character_names.get(
+            str(getattr(target_node, "character_id", None)), target_node.label
+        )
+        direction = "→" if edge.directed else "↔"
+        optional.append(
+            _source(
+                "story_relation",
+                edge,
+                "已确认故事关系",
+                f"{source_label}{direction}{target_label}｜{edge.label or edge.relation_type}",
+            )
+        )
 
     all_chapters = (
         (

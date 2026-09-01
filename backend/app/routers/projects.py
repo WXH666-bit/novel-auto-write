@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -62,12 +62,47 @@ def create_project(
     )
     db.add(project)
     db.flush()
+    start_mode = str(getattr(payload, "start_mode", None) or "setup").strip().lower()
+    if start_mode == "assistant":  # early frontend preview compatibility
+        start_mode = "setup"
+    if start_mode not in {"blank", "setup", "import"}:
+        raise HTTPException(status_code=422, detail="start_mode 必须为 blank、setup 或 import")
+    first_chapter: Chapter | None = None
+    if start_mode == "blank":
+        first_chapter = Chapter(
+            project_id=project.id,
+            volume_number=1,
+            chapter_number=1,
+            sort_order=0,
+            title=str(getattr(payload, "first_chapter_title", None) or "第一章 · 未命名稿纸"),
+            status="draft",
+            summary=None,
+            summary_status="unprocessed",
+            source_type="manual",
+        )
+        db.add(first_chapter)
+        db.flush()
+        project.current_chapter_id = first_chapter.id
+        db.add(
+            AuditLog(
+                project=project,
+                action="chapter.created",
+                entity_type="chapter",
+                entity_id=first_chapter.id,
+                after_json={"origin": "project_wizard", "blank": True},
+                actor_user_id=current_user.id,
+            )
+        )
     db.add(
         AuditLog(
             project=project,
             action="project.created",
             entity_type="project",
             entity_id=project.id,
+            after_json={
+                "start_mode": start_mode,
+                "first_chapter_id": first_chapter.id if first_chapter else None,
+            },
             actor_user_id=current_user.id,
         )
     )

@@ -203,7 +203,11 @@ def stage_storage_deletion(
     project = _safe_id(project_id) if project_id is not None else None
     data_root = DATA_DIR.resolve()
     targets: list[tuple[str, Path]] = []
-    for category in ("uploads", "backups"):
+    # ``assets``, ``character_assets`` and ``media`` were used by early
+    # character-card builds before media moved under uploads.  Quarantine all
+    # project-scoped legacy roots too, otherwise deleting a project leaves
+    # recoverable personal images on disk.
+    for category in ("uploads", "assets", "character_assets", "media", "backups"):
         category_root = (data_root / category).resolve()
         candidate = category_root / owner
         if project is not None:

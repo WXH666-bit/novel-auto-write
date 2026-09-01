@@ -13,6 +13,7 @@ from backend.app.services.generation import (
     create_generation_run,
     execute_generation,
     reconcile_batch_next_run,
+    retry_rejected_generation,
     run_snapshot,
 )
 from backend.app.services.reviews import accept_review, reject_review
@@ -196,9 +197,43 @@ def test_rejected_batch_does_not_create_next_chapter(db: Session) -> None:
     ).run
     execute_generation(db, run.id)
     bundle = db.query(models.ReviewBundle).one()
+    rejected_revision_id = bundle.draft_revision_id
     reject_review(db, bundle.id, "需要重写")
+    db.refresh(run)
+    assert run.status == "completed"
+    assert run_snapshot(run)["status"] == "needs_retry"
+    assert db.get(models.Job, run.job_id).state == "completed"
     assert db.query(models.GenerationRun).count() == 1
     assert db.query(models.Chapter).count() == 1
+
+    retry = retry_rejected_generation(
+        db,
+        run,
+        actor_user_id=db.info["test_user_id"],
+    )
+    assert retry is not None and retry.created
+    assert retry.run.chapter_id == run.chapter_id
+    assert retry.run.status == "queued"
+    assert db.query(models.GenerationRun).count() == 2
+    assert db.query(models.Chapter).count() == 1
+    assert bundle.status == "rejected"
+    assert retry_rejected_generation(db, run).run.id == retry.run.id
+
+    execute_generation(db, retry.run.id)
+    db.refresh(retry.run)
+    assert retry.run.status == "awaiting_review"
+    assert (
+        db.query(models.ReviewBundle)
+        .filter(models.ReviewBundle.generation_run_id == retry.run.id)
+        .one()
+        .status
+        == "pending"
+    )
+    # The rejected draft remains in immutable revision history.  A provider is
+    # allowed to return identical prose, in which case content-hash de-duping
+    # may safely reuse that revision for the retry review.
+    assert db.get(models.ChapterRevision, rejected_revision_id) is not None
+    assert bundle.draft_revision_id == rejected_revision_id
 
 
 def test_non_chapter_modes_reject_multi_chapter_request(db: Session) -> None:

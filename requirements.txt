@@ -8,6 +8,7 @@ pydantic-settings==2.15.0
 openai==3.6.0
 httpx==0.28.1
 python-multipart==0.0.32
+Pillow==11.2.1
 keyring==25.7.0
 pwdlib[argon2]==0.3.1
 email-validator==2.3.0

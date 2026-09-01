@@ -715,6 +715,34 @@ def _validate_schema(value: Any, schema: Mapping[str, Any], path: str = "$") -> 
             _validate_schema(item, schema["items"], f"{path}[{index}]")
 
 
+def _responses_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate OpenAI Chat-style image blocks to Responses input blocks."""
+
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            converted.append(dict(message))
+            continue
+        blocks: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, Mapping):
+                continue
+            block_type = str(block.get("type") or "")
+            if block_type in {"text", "input_text"}:
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    blocks.append({"type": "input_text", "text": text})
+            elif block_type in {"image_url", "input_image"}:
+                image = block.get("image_url")
+                if isinstance(image, Mapping):
+                    image = image.get("url")
+                if isinstance(image, str) and image:
+                    blocks.append({"type": "input_image", "image_url": image})
+        converted.append({**message, "content": blocks})
+    return converted
+
+
 class _ProviderBase:
     """Shared lifecycle and HTTP error handling for protocol adapters."""
 
@@ -802,7 +830,7 @@ class OpenAICompatibleProvider(_ProviderBase):
 
     def _payload(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         role: str,
         model: str | None,
@@ -814,7 +842,7 @@ class OpenAICompatibleProvider(_ProviderBase):
         if protocol == "responses":
             payload: dict[str, Any] = {
                 "model": chosen_model,
-                "input": messages,
+                "input": _responses_messages(messages),
                 "temperature": temperature,
             }
             endpoint = "responses"
@@ -848,7 +876,7 @@ class OpenAICompatibleProvider(_ProviderBase):
 
     async def complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         role: str = "writer",
         model: str | None = None,
@@ -883,7 +911,7 @@ class OpenAICompatibleProvider(_ProviderBase):
 
     async def structured(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         schema: Mapping[str, Any],
         *,
         role: str = "extractor",
@@ -946,7 +974,7 @@ class OpenAICompatibleProvider(_ProviderBase):
 
     async def stream(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         role: str = "writer",
         model: str | None = None,
@@ -1014,23 +1042,71 @@ class OpenAICompatibleProvider(_ProviderBase):
         }
 
 
-def _anthropic_messages(messages: list[dict[str, str]]) -> tuple[str | None, list[dict[str, str]]]:
+def _anthropic_content(content: Any) -> str | list[dict[str, Any]]:
+    if not isinstance(content, list):
+        return str(content or "")
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            continue
+        block_type = str(block.get("type") or "")
+        if block_type in {"text", "input_text"}:
+            value = block.get("text")
+            if isinstance(value, str) and value:
+                blocks.append({"type": "text", "text": value})
+            continue
+        if block_type in {"image_url", "input_image"}:
+            image = block.get("image_url")
+            if isinstance(image, Mapping):
+                image = image.get("url")
+            if not isinstance(image, str) or not image:
+                continue
+            if image.startswith("data:") and ";base64," in image:
+                header, encoded = image.split(";base64,", 1)
+                media_type = header[5:] or "image/jpeg"
+                blocks.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": encoded,
+                        },
+                    }
+                )
+            else:
+                blocks.append(
+                    {
+                        "type": "image",
+                        "source": {"type": "url", "url": image},
+                    }
+                )
+    return blocks
+
+
+def _anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
     """Move system messages to top-level and merge adjacent non-system roles."""
 
     system_parts: list[str] = []
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     for item in messages:
         role = str(item.get("role") or "user").lower()
-        content = str(item.get("content") or "")
+        content = _anthropic_content(item.get("content"))
         if role == "system":
-            if content:
+            if isinstance(content, str) and content:
                 system_parts.append(content)
             continue
         role = "assistant" if role == "assistant" else "user"
         if normalized and normalized[-1]["role"] == role:
-            normalized[-1]["content"] += "\n\n" + content
+            previous = normalized[-1]["content"]
+            if isinstance(previous, str) and isinstance(content, str):
+                normalized[-1]["content"] = previous + "\n\n" + content
+            else:
+                previous_blocks = previous if isinstance(previous, list) else [{"type": "text", "text": previous}]
+                current_blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+                normalized[-1]["content"] = [*previous_blocks, *current_blocks]
         else:
-            normalized.append({"role": role, "content": content})
+            normalized.append({"role": role, "content": content or ""})
     return ("\n\n".join(system_parts) or None), normalized
 
 
@@ -1052,7 +1128,7 @@ class AnthropicMessagesProvider(_ProviderBase):
 
     def _payload(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         role: str,
         model: str | None,
@@ -1083,7 +1159,7 @@ class AnthropicMessagesProvider(_ProviderBase):
 
     async def complete(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         role: str = "writer",
         model: str | None = None,
@@ -1120,7 +1196,7 @@ class AnthropicMessagesProvider(_ProviderBase):
 
     async def structured(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         schema: Mapping[str, Any],
         *,
         role: str = "extractor",
@@ -1180,7 +1256,7 @@ class AnthropicMessagesProvider(_ProviderBase):
 
     async def stream(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         role: str = "writer",
         model: str | None = None,

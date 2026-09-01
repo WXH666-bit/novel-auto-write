@@ -4,32 +4,40 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import db as db_module
 from ..db import get_db
-from ..models import GenerationRun, Project, User
+from ..models import AuditLog, Chapter, GenerationRun, Project, User
 from ..schemas import GenerationRequest
 from ..security import get_current_user, require_owned_provider
 from ..services.common import ACTIVE_RUN_STATUSES
 from ..services.generation import (
     GenerationBusy,
     IdempotencyConflict,
+    MemoryNotReady,
     ProviderRequired,
     RunNotFound,
     create_generation_run,
     execute_generation,
     reconcile_batch_next_run,
     recover_incomplete_runs,
+    retry_rejected_generation,
     run_snapshot,
     sse_events,
 )
 from . import require_generation, require_project
 
 router = APIRouter(prefix="/api", tags=["generations"])
+
+
+class RetryGenerationPayload(BaseModel):
+    skip_memory_once: bool = False
+    skip_memory_reason: str | None = Field(default=None, max_length=1000)
 
 
 def _run_background(run_id: str) -> None:
@@ -57,6 +65,11 @@ def start_generation(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except IdempotencyConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except MemoryNotReady as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "memory_not_ready", "message": str(exc)},
+        ) from exc
     except ProviderRequired as exc:
         raise HTTPException(
             status_code=409,
@@ -119,6 +132,7 @@ def latest_generation(
 @router.get("/generations/{run_id}/events")
 def generation_events(
     run_id: str,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
@@ -126,7 +140,7 @@ def generation_events(
     # The generator opens short-lived sessions per poll so a disconnected
     # browser never holds a database connection.
     return StreamingResponse(
-        sse_events(db_module.SessionLocal, run_id),
+        sse_events(db_module.SessionLocal, run_id, after_event_id=last_event_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -136,10 +150,25 @@ def generation_events(
 def retry_generation(
     run_id: str,
     background: BackgroundTasks,
+    payload: RetryGenerationPayload | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     run = require_generation(db, run_id, current_user)
+    try:
+        rejected_retry = retry_rejected_generation(
+            db,
+            run,
+            actor_user_id=current_user.id,
+        )
+    except GenerationBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RunNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if rejected_retry is not None:
+        if rejected_retry.created:
+            background.add_task(_run_background, str(rejected_retry.run.id))
+        return {**run_snapshot(rejected_retry.run), "created": rejected_retry.created}
     if run.status not in {"needs_retry", "failed"}:
         raise HTTPException(status_code=409, detail="当前任务不需要重试")
     db.scalar(select(Project.id).where(Project.id == run.project_id).with_for_update())
@@ -157,6 +186,33 @@ def retry_generation(
     run.status = "queued"
     run.stage = run.stage or "queued"
     run.error = None
+    retry_options = payload or RetryGenerationPayload()
+    if retry_options.skip_memory_once:
+        snapshot = dict(run.input_snapshot or {})
+        snapshot["skip_memory_once"] = True
+        snapshot["skip_memory_reason"] = (
+            retry_options.skip_memory_reason or "用户在重试时明确跳过本次记忆门禁"
+        )
+        run.input_snapshot = snapshot
+        db.add(
+            AuditLog(
+                project_id=run.project_id,
+                actor_user_id=current_user.id,
+                action="generation.memory_skipped_once",
+                entity_type="generation_run",
+                entity_id=run.id,
+                reason=snapshot["skip_memory_reason"],
+            )
+        )
+    if run.chapter_id:
+        chapter = db.scalar(
+            select(Chapter).where(
+                Chapter.id == run.chapter_id,
+                Chapter.project_id == run.project_id,
+            )
+        )
+        if chapter is not None:
+            chapter.status = "generating"
     from ..models import Job
 
     job = db.scalar(

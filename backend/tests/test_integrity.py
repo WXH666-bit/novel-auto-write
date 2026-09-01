@@ -415,7 +415,7 @@ def test_genuine_legacy_sqlite_migrates_owner_constraints_and_flat_uploads(
     }
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260901_0003"
+            "20260901_0004"
         )
         migrated = connection.execute(
             text("SELECT owner_id,name,story_bible,canon_version,memory_epoch FROM projects")
@@ -503,7 +503,7 @@ def test_existing_0002_sqlite_adds_nullable_username_identity(tmp_path) -> None:
     }
     with engine.begin() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260901_0003"
+            "20260901_0004"
         )
         assert connection.execute(
             text("SELECT email_normalized FROM users WHERE id='old-email'")

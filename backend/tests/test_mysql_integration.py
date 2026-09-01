@@ -14,6 +14,7 @@ from collections.abc import Iterator
 import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app import models
@@ -153,7 +154,7 @@ def test_mysql_empty_database_migrates_to_head(mysql_engine: Engine) -> None:
     assert {"alembic_version", "users", "projects", "search_documents"} <= tables
     with mysql_engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260901_0003"
+            "20260901_0004"
         )
     for table in ("projects", "provider_profiles"):
         owner = next(
@@ -233,11 +234,43 @@ def test_mysql_existing_0002_users_upgrade_to_username_identity(mysql_engine: En
     }
     with mysql_engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260901_0003"
+            "20260901_0004"
         )
         assert connection.execute(
             text("SELECT email_normalized FROM users WHERE id='old-email'")
         ).scalar_one() == "old@example.test"
+
+
+def test_mysql_summary_scope_key_enforces_one_project_summary(mysql_session: Session) -> None:
+    """A nullable chapter ID must not weaken project-summary uniqueness."""
+
+    owner = _new_user(mysql_session, "summary-unique@example.test")
+    project, _chapter_row = _new_project(mysql_session, owner, "summary", "正文")
+    first = models.StorySummary(
+        project_id=project.id,
+        scope="project",
+        summary_text="第一版",
+    )
+    mysql_session.add(first)
+    mysql_session.commit()
+    assert first.scope_key == "project"
+
+    duplicate = models.StorySummary(
+        project_id=project.id,
+        scope="project",
+        summary_text="重复版",
+    )
+    mysql_session.add(duplicate)
+    with pytest.raises(IntegrityError):
+        mysql_session.commit()
+    mysql_session.rollback()
+
+    columns = {item["name"]: item for item in inspect(mysql_session.bind).get_columns("story_summaries")}
+    assert columns["scope_key"]["nullable"] is False
+    unique_names = {
+        item["name"] for item in inspect(mysql_session.bind).get_unique_constraints("story_summaries")
+    }
+    assert "uq_story_summary_project_scope_key" in unique_names
 
 
 def test_mysql_chinese_ngram_search_uses_only_accepted_content(

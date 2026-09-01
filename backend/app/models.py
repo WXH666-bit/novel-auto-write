@@ -46,6 +46,22 @@ def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def story_summary_scope_key(scope: str | None, chapter_id: str | None) -> str:
+    """Return the non-null uniqueness key for a project/chapter summary.
+
+    MySQL treats NULL values as distinct in a UNIQUE constraint, so a
+    ``(project_id, scope, chapter_id)`` key cannot enforce one project-level
+    summary.  Persisting the scope in one non-null value makes the invariant
+    portable across SQLite and MySQL while keeping the original columns for
+    filtering and API compatibility.
+    """
+
+    normalized_scope = str(scope or "project").strip().lower() or "project"
+    if normalized_scope == "project" or chapter_id is None:
+        return normalized_scope
+    return f"{normalized_scope}:{chapter_id}"
+
+
 class Project(Base):
     __tablename__ = "projects"
 
@@ -104,6 +120,36 @@ class Project(Base):
     import_sources: Mapped[list[ImportSource]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    story_summaries: Mapped[list[StorySummary]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    memory_build_runs: Mapped[list[MemoryBuildRun]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    characters: Mapped[list[Character]] = relationship(
+        back_populates="project", cascade="all, delete-orphan", order_by="Character.created_at"
+    )
+    change_sets: Mapped[list[ChangeSet]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    proposals: Mapped[list[Proposal]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    graph_nodes: Mapped[list[StoryGraphNode]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    graph_edges: Mapped[list[StoryGraphEdge]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    graph_layout: Mapped[StoryGraphLayout | None] = relationship(
+        back_populates="project", cascade="all, delete-orphan", uselist=False
+    )
+    media_assets: Mapped[list[MediaAsset]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    agent_conversations: Mapped[list[AgentConversation]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
     owner: Mapped[User] = relationship(back_populates="projects")
 
 
@@ -142,6 +188,14 @@ class User(Base):
     # plain ID instead of an FK to avoid a circular table dependency during
     # upgrades and to allow safe provider deletion.
     default_provider_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # Account-level switch for derived story memory.  Projects may still expose
+    # a manual rebuild action, but new/continued writing honours this setting.
+    auto_summary_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1", nullable=False
+    )
+    preferences_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
     failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -468,6 +522,10 @@ class ReviewBundle(Base):
     status: Mapped[str] = mapped_column(String(40), default="pending", nullable=False)
     draft_revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     canon_changes: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    # Derived-memory candidates are kept separate from canon changes so a
+    # review can display/approve them without silently mutating the story.
+    summary_candidate: Mapped[str | None] = mapped_column(Text, nullable=True)
+    structured_candidates: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     audit_issues: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     source_context: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
     rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -492,6 +550,14 @@ class Job(Base):
     )
     chapter_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    kind: Mapped[str] = mapped_column(
+        String(30), default="generation", server_default="generation", nullable=False, index=True
+    )
+    resource_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, default=3, server_default="3", nullable=False
+    )
     state: Mapped[str] = mapped_column(String(40), default="queued", nullable=False, index=True)
     current_stage: Mapped[str | None] = mapped_column(String(50), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -630,6 +696,642 @@ class ImportSource(Base):
     project: Mapped[Project] = relationship(back_populates="import_sources")
 
 
+class StorySummary(Base):
+    """The current derived memory snapshot for one project or chapter."""
+
+    __tablename__ = "story_summaries"
+    __table_args__ = (
+        UniqueConstraint("project_id", "scope_key", name="uq_story_summary_project_scope_key"),
+        Index("ix_story_summaries_project_scope", "project_id", "scope", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scope: Mapped[str] = mapped_column(String(40), default="project", nullable=False)
+    chapter_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    scope_key: Mapped[str] = mapped_column(String(300), nullable=False)
+    current_revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(40), default="current", nullable=False, index=True)
+    summary_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    structured_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    memory_epoch: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    def __init__(self, **kwargs: Any) -> None:
+        # A Python-side constructor default keeps direct ORM callers safe as
+        # well as the memory service, including chapter summaries created by
+        # older integrations that do not know about ``scope_key`` yet.
+        kwargs.setdefault(
+            "scope_key",
+            story_summary_scope_key(kwargs.get("scope"), kwargs.get("chapter_id")),
+        )
+        super().__init__(**kwargs)
+
+    project: Mapped[Project] = relationship(back_populates="story_summaries")
+    revisions: Mapped[list[StorySummaryRevision]] = relationship(
+        back_populates="story_summary",
+        cascade="all, delete-orphan",
+        order_by="StorySummaryRevision.created_at",
+    )
+
+
+class StorySummaryRevision(Base):
+    """Append-only provenance row for a derived summary snapshot."""
+
+    __tablename__ = "story_summary_revisions"
+    __table_args__ = (Index("ix_story_summary_revisions_source", "source_revision_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    story_summary_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("story_summaries.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    summary_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    structured_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    provider_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    model_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    prompt_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    memory_epoch: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    story_summary: Mapped[StorySummary] = relationship(back_populates="revisions")
+
+
+class MemoryBuildRun(Base):
+    """Durable lifecycle for a summary/memory extraction job."""
+
+    __tablename__ = "memory_build_runs"
+    __table_args__ = (
+        UniqueConstraint("project_id", "idempotency_key", name="uq_memory_build_project_idempotency"),
+        Index("ix_memory_build_runs_project_status", "project_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    chapter_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    scope: Mapped[str] = mapped_column(String(40), default="project", nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="queued", nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    stage: Mapped[str] = mapped_column(String(50), default="queued", nullable=False)
+    resource_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped[Project] = relationship(back_populates="memory_build_runs")
+    artifacts: Mapped[list[MemoryBuildArtifact]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="MemoryBuildArtifact.created_at"
+    )
+
+
+class MemoryBuildArtifact(Base):
+    """Checkpointed output from a memory build, safe to resume by stage."""
+
+    __tablename__ = "memory_build_artifacts"
+    __table_args__ = (Index("ix_memory_build_artifacts_run_stage", "run_id", "stage"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("memory_build_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stage: Mapped[str] = mapped_column(String(50), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    run: Mapped[MemoryBuildRun] = relationship(back_populates="artifacts")
+
+
+class Character(Base):
+    """A first-class, project-isolated character card."""
+
+    __tablename__ = "characters"
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name="uq_character_project_name"),
+        Index("ix_characters_project_status", "project_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    aliases: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    role: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    pronouns: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    age: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    occupation: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    appearance: Mapped[str | None] = mapped_column(Text, nullable=True)
+    personality: Mapped[str | None] = mapped_column(Text, nullable=True)
+    background: Mapped[str | None] = mapped_column(Text, nullable=True)
+    goals: Mapped[str | None] = mapped_column(Text, nullable=True)
+    motivation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    conflict_fears: Mapped[str | None] = mapped_column(Text, nullable=True)
+    abilities: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tags: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    arc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    voice: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="active", nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    image_media_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    current_revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="characters")
+    revisions: Mapped[list[CharacterRevision]] = relationship(
+        back_populates="character",
+        cascade="all, delete-orphan",
+        order_by="CharacterRevision.revision_number",
+    )
+
+    @property
+    def goal(self) -> str | None:
+        """Singular compatibility alias used by compact character forms."""
+
+        return self.goals
+
+    @goal.setter
+    def goal(self, value: str | None) -> None:
+        self.goals = value
+
+    @property
+    def conflict(self) -> str | None:
+        return self.conflict_fears
+
+    @conflict.setter
+    def conflict(self, value: str | None) -> None:
+        self.conflict_fears = value
+
+
+class CharacterRevision(Base):
+    """Append-only character-card revision with the normal form fields."""
+
+    __tablename__ = "character_revisions"
+    __table_args__ = (
+        UniqueConstraint("character_id", "revision_number", name="uq_character_revision_number"),
+        Index("ix_character_revisions_created", "character_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    character_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("characters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    revision_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    aliases: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    role: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    pronouns: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    age: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    occupation: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    appearance: Mapped[str | None] = mapped_column(Text, nullable=True)
+    personality: Mapped[str | None] = mapped_column(Text, nullable=True)
+    background: Mapped[str | None] = mapped_column(Text, nullable=True)
+    goals: Mapped[str | None] = mapped_column(Text, nullable=True)
+    motivation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    conflict_fears: Mapped[str | None] = mapped_column(Text, nullable=True)
+    abilities: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tags: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    arc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    voice: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="active", nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    image_media_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    source_type: Mapped[str] = mapped_column(String(40), default="manual", nullable=False)
+    source_revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_by_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    character: Mapped[Character] = relationship(back_populates="revisions")
+
+    @property
+    def goal(self) -> str | None:
+        return self.goals
+
+    @property
+    def conflict(self) -> str | None:
+        return self.conflict_fears
+
+
+class ChangeSet(Base):
+    """A reviewable set of user/agent mutations against one story version."""
+
+    __tablename__ = "change_sets"
+    __table_args__ = (Index("ix_change_sets_project_status", "project_id", "status"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_type: Mapped[str] = mapped_column(String(40), default="assistant", nullable=False)
+    source_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    base_memory_epoch: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="proposed", nullable=False, index=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changes_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    created_by_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped[Project] = relationship(back_populates="change_sets")
+    proposals: Mapped[list[Proposal]] = relationship(
+        back_populates="change_set", cascade="all, delete-orphan", order_by="Proposal.created_at"
+    )
+
+
+class Proposal(Base):
+    """One allow-listed mutation inside a ChangeSet."""
+
+    __tablename__ = "proposals"
+    __table_args__ = (Index("ix_proposals_project_status", "project_id", "status"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    change_set_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("change_sets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    operation: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    patch_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    base_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    base_memory_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="proposed", nullable=False, index=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    conflict_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped[Project] = relationship(back_populates="proposals")
+    change_set: Mapped[ChangeSet] = relationship(back_populates="proposals")
+
+
+class StoryGraphNode(Base):
+    """A project-scoped graph node, optionally backed by a story entity."""
+
+    __tablename__ = "story_graph_nodes"
+    __table_args__ = (
+        Index("ix_story_graph_nodes_project_type", "project_id", "node_type"),
+        UniqueConstraint("project_id", "node_type", "ref_id", name="uq_story_graph_node_ref"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    node_type: Mapped[str] = mapped_column(String(40), default="custom", nullable=False)
+    ref_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    character_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    chapter_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    plot_thread_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    label: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    position_x: Mapped[float | None] = mapped_column(nullable=True)
+    position_y: Mapped[float | None] = mapped_column(nullable=True)
+    width: Mapped[float | None] = mapped_column(nullable=True)
+    height: Mapped[float | None] = mapped_column(nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="active", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="graph_nodes")
+    outgoing_edges: Mapped[list[StoryGraphEdge]] = relationship(
+        foreign_keys="StoryGraphEdge.source_node_id",
+        back_populates="source",
+        cascade="all, delete-orphan",
+    )
+    incoming_edges: Mapped[list[StoryGraphEdge]] = relationship(
+        foreign_keys="StoryGraphEdge.target_node_id",
+        back_populates="target",
+        cascade="all, delete-orphan",
+    )
+
+
+class StoryGraphEdge(Base):
+    """A directed/undirected relationship between two same-project nodes."""
+
+    __tablename__ = "story_graph_edges"
+    __table_args__ = (
+        Index("ix_story_graph_edges_project", "project_id", "relation_type"),
+        UniqueConstraint(
+            "project_id",
+            "source_node_id",
+            "target_node_id",
+            "relation_type",
+            name="uq_story_graph_edge_relation",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_node_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("story_graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_node_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("story_graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    relation_type: Mapped[str] = mapped_column(String(80), default="related", nullable=False)
+    label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    directed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    weight: Mapped[float | None] = mapped_column(nullable=True)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="active", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="graph_edges")
+    source: Mapped[StoryGraphNode] = relationship(
+        foreign_keys=[source_node_id], back_populates="outgoing_edges"
+    )
+    target: Mapped[StoryGraphNode] = relationship(
+        foreign_keys=[target_node_id], back_populates="incoming_edges"
+    )
+
+
+class StoryGraphLayout(Base):
+    """Saved viewport/layout state for the graph view."""
+
+    __tablename__ = "story_graph_layouts"
+    __table_args__ = (UniqueConstraint("project_id", name="uq_story_graph_layout_project"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    layout_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="graph_layout")
+
+
+class MediaAsset(Base):
+    """Tenant-owned binary metadata; bytes live under the configured data dir."""
+
+    __tablename__ = "media_assets"
+    __table_args__ = (
+        Index("ix_media_assets_project_kind", "project_id", "kind"),
+        Index("ix_media_assets_owner_project", "owner_id", "project_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(40), default="character", nullable=False)
+    original_name: Mapped[str] = mapped_column(String(255), default="upload", nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    extension: Mapped[str] = mapped_column(String(10), nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    storage_key: Mapped[str] = mapped_column(String(500), nullable=False, unique=True)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    alt_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="media_assets")
+
+
+class AgentConversation(Base):
+    """Project-scoped assistant thread with replayable durable state."""
+
+    __tablename__ = "agent_conversations"
+    __table_args__ = (Index("ix_agent_conversations_project_updated", "project_id", "updated_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_by_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    title: Mapped[str] = mapped_column(String(255), default="故事设定助手", nullable=False)
+    purpose: Mapped[str] = mapped_column(String(80), default="setup", nullable=False)
+    apply_mode: Mapped[str] = mapped_column(String(40), default="preview", nullable=False)
+    provider_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    provider_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    context_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="active", nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="agent_conversations")
+    messages: Mapped[list[AgentMessage]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan", order_by="AgentMessage.sequence"
+    )
+    runs: Mapped[list[AgentRun]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan", order_by="AgentRun.created_at"
+    )
+    events: Mapped[list[AgentEvent]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan", order_by="AgentEvent.sequence"
+    )
+
+
+class AgentMessage(Base):
+    """A user/assistant message preserved independently of provider uptime."""
+
+    __tablename__ = "agent_messages"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "idempotency_key", name="uq_agent_message_idempotency"),
+        Index("ix_agent_messages_project_sequence", "project_id", "sequence"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(30), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="completed", nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    usage_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    target_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    context_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    authorized_asset_ids: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    conversation: Mapped[AgentConversation] = relationship(back_populates="messages")
+
+
+class AgentRun(Base):
+    """One assistant execution, optionally linked to a generic Job row."""
+
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "idempotency_key", name="uq_agent_run_idempotency"),
+        Index("ix_agent_runs_project_status", "project_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    job_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    resource_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="queued", nullable=False, index=True)
+    stage: Mapped[str] = mapped_column(String(50), default="queued", nullable=False)
+    provider_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    provider_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    output_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    conversation: Mapped[AgentConversation] = relationship(back_populates="runs")
+    events: Mapped[list[AgentEvent]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="AgentEvent.sequence"
+    )
+    tool_calls: Mapped[list[AgentToolCall]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="AgentToolCall.created_at"
+    )
+
+
+class AgentEvent(Base):
+    """Append-only event log used by the live right-hand assistant panel."""
+
+    __tablename__ = "agent_events"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "sequence", name="uq_agent_event_sequence"),
+        Index("ix_agent_events_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    conversation: Mapped[AgentConversation] = relationship(back_populates="events")
+    run: Mapped[AgentRun | None] = relationship(back_populates="events")
+
+
+class AgentToolCall(Base):
+    """Auditable structured tool invocation emitted by an assistant run."""
+
+    __tablename__ = "agent_tool_calls"
+    __table_args__ = (Index("ix_agent_tool_calls_project_created", "project_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_conversations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tool_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    arguments_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="completed", nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    run: Mapped[AgentRun] = relationship(back_populates="tool_calls")
+
+
 @event.listens_for(ChapterRevision, "before_insert")
 def _set_revision_hash(_mapper: Any, _connection: Any, target: ChapterRevision) -> None:
     if not target.content_hash:
@@ -651,10 +1353,28 @@ def _sync_canon_text(_mapper: Any, _connection: Any, target: CanonItem) -> None:
     target.value_text = json_text(target.value)
 
 
+@event.listens_for(StorySummary, "before_insert")
+@event.listens_for(StorySummary, "before_update")
+def _sync_story_summary_scope_key(
+    _mapper: Any, _connection: Any, target: StorySummary
+) -> None:
+    """Recompute the portable uniqueness key if scope fields are edited."""
+
+    target.scope_key = story_summary_scope_key(target.scope, target.chapter_id)
+
+
 __all__ = [
+    "AgentConversation",
+    "AgentEvent",
+    "AgentMessage",
+    "AgentRun",
+    "AgentToolCall",
     "AuditLog",
     "AuthRateLimit",
+    "Character",
+    "CharacterRevision",
     "CanonItem",
+    "ChangeSet",
     "Chapter",
     "ChapterRevision",
     "EmailToken",
@@ -663,13 +1383,23 @@ __all__ = [
     "Job",
     "PlotThread",
     "Project",
+    "Proposal",
     "ProviderProfile",
     "ReviewBundle",
     "SearchDocument",
+    "MediaAsset",
+    "MemoryBuildArtifact",
+    "MemoryBuildRun",
+    "StoryGraphEdge",
+    "StoryGraphLayout",
+    "StoryGraphNode",
+    "StorySummary",
+    "StorySummaryRevision",
     "TimelineEvent",
     "User",
     "UserSession",
     "json_text",
     "new_id",
+    "story_summary_scope_key",
     "utcnow",
 ]

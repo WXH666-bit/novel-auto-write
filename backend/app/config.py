@@ -24,6 +24,11 @@ def _database_url() -> str:
 
 
 DATABASE_URL = _database_url()
+JOB_WORKERS = int(
+    os.getenv("NOVEL_JOB_WORKERS", "2" if DATABASE_URL.startswith("mysql") else "1")
+)
+if JOB_WORKERS < 1:
+    raise ValueError("NOVEL_JOB_WORKERS 必须至少为 1")
 APP_HOST = os.getenv("NOVEL_HOST", "127.0.0.1")
 APP_PORT = int(os.getenv("NOVEL_PORT", "8000"))
 DEBUG = os.getenv("NOVEL_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
