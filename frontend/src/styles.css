@@ -521,7 +521,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .settings-page { max-width: 1120px; margin: 0 auto; padding: 25px 42px 50px; }
 .settings-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
 .settings-version { color: var(--muted); font-size: 10px; }
-.settings-layout { display: grid; grid-template-columns: 177px minmax(0, 1fr); gap: 48px; }
+.settings-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; }
 .settings-nav { padding-top: 13px; }
 .settings-nav .eyebrow { margin-bottom: 13px; }
 .settings-nav-item { width: 100%; min-height: 37px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: 0; color: var(--muted); background: transparent; font-size: 11px; text-align: left; }

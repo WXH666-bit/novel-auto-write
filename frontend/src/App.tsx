@@ -3625,6 +3625,11 @@ function GenerationDrawer({
   onStart: () => void;
 }) {
   const dialogRef = useDialogFocus<HTMLElement>();
+  const currentBlankUnavailable = !chapter || Boolean(chapter.content?.trim());
+  const visibleDestination =
+    form.destination === "current_blank" && currentBlankUnavailable
+      ? "new_child"
+      : form.destination;
   return (
     <div className="drawer-layer">
       <button
@@ -3694,7 +3699,7 @@ function GenerationDrawer({
           <label className="field">
             <span>稿纸去向 <small>默认新建下一章</small></span>
             <select
-              value={form.destination}
+              value={visibleDestination}
               onChange={(event) =>
                 setForm({
                   ...form,
@@ -3705,7 +3710,7 @@ function GenerationDrawer({
               <option value="new_child">新建子章节（默认）</option>
               <option
                 value="current_blank"
-                disabled={!chapter || Boolean(chapter.content?.trim())}
+                disabled={currentBlankUnavailable}
               >
                 写入当前空白稿纸
               </option>
