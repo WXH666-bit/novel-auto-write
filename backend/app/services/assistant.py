@@ -52,6 +52,11 @@ from ..models import (
 from ..schemas import AgentConversationCreate
 from .providers import ProviderError, provider_config_snapshot, provider_for
 
+try:  # PyYAML is optional; the small fallback below covers provider YAML.
+    import yaml as _yaml
+except ImportError:  # pragma: no cover - exercised in minimal deployments
+    _yaml = None
+
 logger = logging.getLogger(__name__)
 
 ASSISTANT_PROMPT_VERSION = "assistant-setup-v1"
@@ -262,6 +267,21 @@ ASSISTANT_SCHEMA: dict[str, Any] = {
     "required": ["reply", "proposals"],
     "additionalProperties": False,
 }
+
+ASSISTANT_EXTRACTION_INSTRUCTION = (
+    "把上一条回复中用户明确要求的新建或修改整理成待审核提案。"
+    "只返回一个 JSON 对象，形状必须是 "
+    '{"reply":"","proposals":[{"operation":"create_character",'
+    '"target_type":"character","target_id":null,"patch":{},"reason":""}]}。'
+    "人物使用 create_character/update_character，patch 的常用字段是 "
+    "name、motivation、conflict_fears、voice、personality、background、goals。"
+    "人物关系必须单独输出 upsert_graph_edge，target_type=character_relation，"
+    "patch 至少包含 source_name、target_name、relation_type，可带 label。"
+    "如果回复里有两个人物和一条关系，就必须输出三条独立提案，不能把关系埋在人物背景里。"
+    "章节修改使用 edit_chapter 或 edit_chapter_selection；全局故事设定使用 "
+    "update_project_settings。只有确实没有任何具体变更时 proposals 才能为空。"
+    "不要 Markdown、YAML、解释文字，也不要使用 create_setting_entry 或 replace。"
+)
 
 
 def _hash_text(value: str) -> str:
@@ -891,6 +911,9 @@ def _provider_messages(
             select(Chapter).where(Chapter.id == str(chapter_id), Chapter.project_id == project.id)
         )
     authoritative_context = dict(current.context_snapshot or {}) if current is not None else {}
+    # This marker is server-derived below; never trust a client-supplied
+    # context flag while a real revision is present.
+    authoritative_context.pop("empty_chapter_baseline", None)
     if chapter is not None and chapter.current_revision_id:
         base_revision = db.scalar(
             select(ChapterRevision).where(
@@ -942,6 +965,40 @@ def _provider_messages(
                         "selected_text": selected_text,
                     }
                 )
+    elif chapter is not None:
+        # A newly created blank chapter has no revision to hash yet.  Client
+        # selection/base fields are not authoritative in this state: keeping
+        # them would let a model manufacture a range or revision id later.
+        revisions = db.scalars(
+            select(ChapterRevision.content).where(ChapterRevision.chapter_id == chapter.id)
+        ).all()
+        chapter_is_empty = all(not str(content or "").strip() for content in revisions)
+        for key in (
+            "base_revision_id",
+            "base_content_hash",
+            "content_hash",
+            "base_hash",
+            "selection",
+            "selection_start",
+            "selection_end",
+            "selection_hash",
+            "selected_text",
+        ):
+            authoritative_context.pop(key, None)
+        authoritative_context["chapter_id"] = chapter.id
+        if chapter_is_empty:
+            empty_hash = _hash_text("")
+            authoritative_context.update(
+                {
+                    "empty_chapter_baseline": True,
+                    "base_revision_id": None,
+                    "base_content_hash": empty_hash,
+                    "selection_start": 0,
+                    "selection_end": 0,
+                    "selection_hash": empty_hash,
+                    "selected_text": "",
+                }
+            )
     from .context import build_context
 
     server_context = build_context(
@@ -963,7 +1020,8 @@ def _provider_messages(
     }
     turn_prompt = (
         "这是本次对话的首轮回复：请先用普通、自然的中文回答用户，"
-        "禁止输出 JSON、Markdown 代码围栏、XML 标签或工具调用格式；"
+        "禁止输出 JSON、YAML、Markdown 代码围栏、XML 标签或工具调用格式；"
+        "不要在普通回复末尾打印 proposals:/changes:；"
         "如需变更，只在独立的结构化提取步骤中返回 proposals。"
         if not any(row.role == "assistant" for row in rows)
         else "回复仍应以清晰的普通中文为主，不要把结构化 JSON 或代码围栏直接展示给用户。"
@@ -978,6 +1036,8 @@ def _provider_messages(
                 + "若目标是章节正文，单次只能修改一个章节或一个连续选区，"
                 + "必须在 patch 中保留 base_revision_id、base_content_hash、"
                 + "selection_start、selection_end、selection_hash，并用 replacement 表示替换文本。"
+                + "若服务器标记 empty_chapter_baseline=true，必须按整章空白基线生成 replacement，"
+                + "不要伪造 revision_id、选区范围或 hash。"
             ),
         }
     ]
@@ -1172,39 +1232,1029 @@ def _malformed_reply_value(value: str) -> str | None:
     return _plain_reply(parsed)
 
 
-def _normalise_provider_output(value: Any, raw_content: str = "") -> tuple[str, list[dict[str, Any]]]:
-    source_object = _json_object(value)
-    if source_object is None:
-        source_object = _json_object(raw_content)
-    if source_object is not None:
-        reply_value = source_object.get("reply", source_object.get("message", ""))
-        reply = _plain_reply(reply_value)
-        source = source_object.get("proposals") or source_object.get("changes") or []
+_PROPOSAL_MARKER = re.compile(
+    r"(?im)^[ \t]*(?:[*_`#>-]+[ \t]*)?(?:proposals?|changes?)[ \t]*:[ \t]*(.*?)\s*$"
+)
+_MACHINE_TAIL_HINT = re.compile(
+    r"(?i)(?:如果|若|如需|如有|when|if).*(?:提交|返回|提供|生成|结构化|申请|提案|proposal|change)"
+)
+_PROPOSAL_PROTOCOL_KEYS = {
+    "operation",
+    "target_type",
+    "targetType",
+    "target_id",
+    "targetId",
+    "target",
+    "patch",
+    "patch_json",
+    "reason",
+    "category",
+}
+_TARGET_TYPE_ALIASES = {
+    "character": "character",
+    "characters": "character",
+    "person": "character",
+    "people": "character",
+    "人物": "character",
+    "角色": "character",
+    "character_card": "character",
+    "character_relation": "character_relation",
+    "character_relations": "character_relation",
+    "relation": "character_relation",
+    "relations": "character_relation",
+    "relationship": "character_relation",
+    "relationships": "character_relation",
+    "关系": "character_relation",
+    "人物关系": "character_relation",
+    "graph_edge": "graph_edge",
+    "edge": "graph_edge",
+    "连线": "graph_edge",
+    "graph_node": "graph_node",
+    "node": "graph_node",
+    "节点": "graph_node",
+    "chapter": "chapter",
+    "chapters": "chapter",
+    "正文": "chapter",
+    "稿纸": "chapter",
+    "paper": "chapter",
+    "project": "project",
+    "setting": "project",
+    "settings": "project",
+    "project_settings": "project",
+    "global": "project",
+    "global_setting": "project",
+    "global_settings": "project",
+    "全局设定": "project",
+    "项目设定": "project",
+}
+_CHARACTER_CATEGORY_ALIASES = {
+    "character",
+    "characters",
+    "person",
+    "people",
+    "人物",
+    "角色",
+    "character_card",
+}
+_RELATION_CATEGORY_ALIASES = {
+    "character_relation",
+    "character_relations",
+    "relation",
+    "relations",
+    "relationship",
+    "relationships",
+    "关系",
+    "人物关系",
+}
+_PROJECT_CATEGORY_ALIASES = {
+    "project",
+    "setting",
+    "settings",
+    "world",
+    "worldview",
+    "project_settings",
+    "global",
+    "global_setting",
+    "global_settings",
+    "全局设定",
+    "项目设定",
+    "世界观",
+}
+_NODE_CATEGORY_ALIASES = {
+    "node",
+    "graph_node",
+    "plot",
+    "plot_thread",
+    "storyline",
+    "story_line",
+    "timeline",
+    "timeline_event",
+    "event",
+    "剧情",
+    "剧情线",
+    "时间线",
+}
+_CHARACTER_RELATION_ENDPOINT_KEYS = (
+    ("source_node_id", "target_node_id"),
+    ("source_character_id", "target_character_id"),
+    ("source_character", "target_character"),
+    ("source_name", "target_name"),
+    ("source", "target"),
+    ("from", "to"),
+    ("from_name", "to_name"),
+)
+
+
+def _yaml_scalar(value: str) -> Any:
+    """Parse the deliberately small scalar subset used by model YAML."""
+
+    value = value.strip()
+    if not value:
+        return None
+    if value in {"null", "Null", "NULL", "~"}:
+        return None
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    if value.startswith(("[", "{")) and value.endswith(("]", "}")):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    if value[:1] == value[-1:] == "\"" and len(value) >= 2:
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return value[1:-1]
+    if value[:1] == value[-1:] == "'" and len(value) >= 2:
+        return value[1:-1].replace("''", "'")
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+
+def _yaml_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _yaml_block_scalar(
+    lines: list[str], index: int, parent_indent: int, style: str
+) -> tuple[str, int]:
+    """Consume a literal YAML block without interpreting its content."""
+
+    content_indent: int | None = None
+    content: list[str] = []
+    cursor = index
+    while cursor < len(lines):
+        line = lines[cursor]
+        if not line.strip():
+            content.append("")
+            cursor += 1
+            continue
+        indent = _yaml_indent(line)
+        if indent <= parent_indent:
+            break
+        if content_indent is None:
+            content_indent = indent
+        content.append(line[content_indent:] if indent >= content_indent else line.strip())
+        cursor += 1
+    # ``>`` is uncommon in assistant patches, but folding it to spaces keeps
+    # the fallback useful when PyYAML is unavailable.  Literal ``|`` is the
+    # important case for chapter replacement text.
+    if style.startswith(">"):
+        result = " ".join(part.strip() for part in content)
     else:
-        reply = _plain_reply(raw_content or value)
-        source = []
+        result = "\n".join(content)
+    if not style.endswith("-"):
+        result += "\n"
+    return result, cursor
+
+
+def _fallback_yaml_load(value: str) -> Any:
+    """Parse the flat list-of-maps emitted by the fallback provider format."""
+
+    lines = value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    items: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    item_indent = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped in {"---", "..."}:
+            index += 1
+            continue
+        indent = _yaml_indent(line)
+        if stripped.startswith("-") and (current is None or indent <= item_indent):
+            current = {}
+            items.append(current)
+            item_indent = indent
+            field = stripped[1:].strip()
+            if not field or ":" not in field:
+                index += 1
+                continue
+            key, _, raw_value = field.partition(":")
+            current[key.strip()] = _yaml_scalar(raw_value)
+            index += 1
+            continue
+        if current is None or indent <= item_indent or ":" not in stripped:
+            index += 1
+            continue
+        key, _, raw_value = stripped.partition(":")
+        raw_value = raw_value.strip()
+        if raw_value.startswith(("|", ">")):
+            current[key.strip()], index = _yaml_block_scalar(lines, index + 1, indent, raw_value)
+            continue
+        if raw_value:
+            current[key.strip()] = _yaml_scalar(raw_value)
+            index += 1
+            continue
+        # Preserve one nested map (normally ``patch:``), which is enough for
+        # structured responses from older gateways without pulling in a YAML
+        # dependency solely for the fallback path.
+        nested: dict[str, Any] = {}
+        cursor = index + 1
+        while cursor < len(lines):
+            nested_line = lines[cursor]
+            nested_text = nested_line.strip()
+            nested_indent = _yaml_indent(nested_line)
+            if not nested_text:
+                cursor += 1
+                continue
+            if nested_indent <= indent or nested_text.startswith("-") or ":" not in nested_text:
+                break
+            nested_key, _, nested_value = nested_text.partition(":")
+            nested[nested_key.strip()] = _yaml_scalar(nested_value)
+            cursor += 1
+        current[key.strip()] = nested
+        index = cursor
+    return items
+
+
+def _proposal_document(value: Any) -> Any:
+    """Decode a JSON/YAML proposal body without executing provider output."""
+
+    if not isinstance(value, str):
+        return value
+    candidate = value.strip().lstrip("\ufeff")
+    fenced = _fenced_body(candidate)
+    if fenced is not None:
+        candidate = fenced.strip()
+    # ``str.strip`` above removes the transport's final newline.  Restore the
+    # implicit line terminator expected by YAML literal blocks (``|``), so a
+    # chapter replacement keeps its final newline just as the provider wrote
+    # it.  Chomping mode ``|-`` intentionally remains unchanged.
+    if (
+        not candidate.endswith("\n")
+        and re.search(r"(?m):[ \t]*\|[+]?\s*$", candidate) is not None
+    ):
+        candidate += "\n"
+    # A JSON body can be followed by a closing fence or an explanatory line;
+    # raw_decode lets us safely consume only the first complete document.
+    if candidate.startswith(("{", "[")):
+        try:
+            parsed, _end = json.JSONDecoder().raw_decode(candidate)
+            return parsed
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    if _yaml is not None:
+        try:
+            parsed = _yaml.safe_load(candidate)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except Exception:  # provider output is untrusted; try the safe fallback
+            pass
+    try:
+        return _fallback_yaml_load(candidate)
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+
+
+def _proposal_list(value: Any) -> list[Any] | None:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for key in ("proposals", "proposal", "changes", "change"):
+            candidate = value.get(key)
+            if isinstance(candidate, list):
+                return candidate
+    return None
+
+
+def _clean_prose_prefix(value: str) -> str:
+    lines = value.rstrip().splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    # Models often explain the machine section in a final paragraph.  It is
+    # useful to the model but not to the user; remove only an unmistakable
+    # instruction line, never arbitrary prose.
+    if lines and _MACHINE_TAIL_HINT.search(lines[-1]):
+        lines.pop()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines).rstrip()
+
+
+def _extract_mixed_proposals(value: Any) -> tuple[str, list[Any]]:
+    """Split ordinary prose from a trailing ``proposals:`` YAML/JSON block."""
+
+    if not isinstance(value, str):
+        return _plain_reply(value), []
+    text = value.strip().lstrip("\ufeff")
+    for match in _PROPOSAL_MARKER.finditer(text):
+        inline = match.group(1).strip()
+        remainder = text[match.end() :]
+        candidate = inline
+        if remainder.strip():
+            candidate = f"{candidate}\n{remainder}" if candidate else remainder
+        # Ignore the closing Markdown fence when a provider wrapped only the
+        # proposal section rather than the whole assistant response.
+        candidate = re.sub(r"(?m)^\s*```\s*$", "", candidate).strip()
+        source = _proposal_list(_proposal_document(candidate))
+        if source is not None:
+            return _clean_prose_prefix(text[: match.start()]), source
+    return text, []
+
+
+_MARKDOWN_CHARACTER_LABELS = {
+    "姓名": "name",
+    "名字": "name",
+    "基础身份": "background",
+    "身份": "background",
+    "身世": "background",
+    "背景": "background",
+    "来历": "background",
+    "经历": "background",
+    "核心动机": "motivation",
+    "动机": "motivation",
+    "核心目标": "goals",
+    "目标": "goals",
+    "核心冲突": "conflict_fears",
+    "冲突": "conflict_fears",
+    "恐惧": "conflict_fears",
+    "性格": "personality",
+    "性格特征": "personality",
+    "人物性格": "personality",
+    "外貌": "appearance",
+    "外形": "appearance",
+    "职业": "occupation",
+    "年龄": "age",
+    "性别": "gender",
+    "口吻": "voice",
+    "说话风格": "voice",
+    "声音": "voice",
+    "声线": "voice",
+    "角色定位": "role",
+    "定位": "role",
+}
+_MARKDOWN_DRAFT_HEADING = re.compile(r"(?im)^[ \t]{0,3}#{1,6}[ \t]+(.+?)\s*$")
+_MARKDOWN_CHARACTER_START = re.compile(
+    r"^[【\[]\s*([^：:\]】]{1,40})\s*[:：]\s*([^\]】\n]+?)\s*[\]】]$"
+)
+_MARKDOWN_ROLE_START = re.compile(
+    r"^(主角|配角|反派|男主|女主|人物|角色)\s*\d*\s*[:：]\s*(.+)$"
+)
+_MARKDOWN_NODE_LINE = re.compile(r"^(?:节点|node)\s*\d*\s*[:：]\s*(.+)$", re.I)
+_MARKDOWN_EDGE_LINE = re.compile(
+    r"^(?P<source>.+?)\s*(?:-{2,}|—+|－+)\s*[（(](?P<relation>[^）)]+)[）)]\s*"
+    r"(?:-{1,2}>|={1,2}>|→|⟶|➡)\s*(?P<destination>.+?)$"
+)
+
+
+def _markdown_clean_line(value: str) -> str:
+    value = str(value or "").strip()
+    value = re.sub(r"^\s*[-*+]\s+", "", value)
+    value = re.sub(r"^\s*#{1,6}\s+", "", value)
+    value = value.strip()
+    if value.startswith("**") and value.endswith("**") and len(value) >= 4:
+        value = value[2:-2].strip()
+    return value.strip("`*_ ")
+
+
+def _markdown_label_key(value: str) -> str:
+    return re.sub(r"[\s\u3000:：·.。、（）()\[\]【】_-]+", "", str(value or "")).lower()
+
+
+def _markdown_character_field(value: str) -> str | None:
+    label = _markdown_label_key(value)
+    for candidate, field in _MARKDOWN_CHARACTER_LABELS.items():
+        candidate_key = _markdown_label_key(candidate)
+        if label == candidate_key or (candidate_key and candidate_key in label):
+            return field
+    # A sentence such as ``与科举功名的关系`` is useful character context even
+    # though it is not a first-class card column.  Keep it in background rather
+    # than dropping a model's only explanation for that field.
+    if "关系" in label or "关联" in label:
+        return "background"
+    return None
+
+
+def _markdown_character_name(value: str) -> tuple[str, str | None]:
+    value = _markdown_clean_line(value)
+    descriptor: str | None = None
+    match = re.match(r"^(.+?)\s*[（(]([^）)]*)[）)]\s*$", value)
+    if match:
+        value, descriptor = match.group(1).strip(), match.group(2).strip() or None
+    # Graph writers often put a person's title before the actual card name,
+    # e.g. ``乡试主考官 周嵩`` or ``族学先生 陈老夫子``.  Keep the durable
+    # character key stable so the corresponding edge resolves to that card.
+    title_and_name = re.match(r"^(.+?)[\s\u3000]+([^\s\u3000]+)$", value)
+    if title_and_name and re.search(
+        r"(?:主考官|先生|夫子|父亲|母亲|表妹|堂妹|堂兄|师父|掌柜|将军|公子|小姐|秀才|官员)$",
+        title_and_name.group(1),
+    ):
+        value = title_and_name.group(2)
+    return value.strip("：:，, "), descriptor
+
+
+def _markdown_character_proposals(body: str) -> list[dict[str, Any]]:
+    proposals: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    current_field: str | None = None
+
+    def flush() -> None:
+        nonlocal current, current_field
+        if current and current.get("name"):
+            proposals.append(
+                {
+                    "operation": "create_character",
+                    "target_type": "character",
+                    "target_id": None,
+                    "patch": current,
+                    "reason": "从 Markdown 人物草稿提取",
+                }
+            )
+        current = None
+        current_field = None
+
+    for raw_line in body.splitlines():
+        line = _markdown_clean_line(raw_line)
+        if not line:
+            continue
+        name_match = _MARKDOWN_CHARACTER_START.match(line) or _MARKDOWN_ROLE_START.match(line)
+        if name_match:
+            flush()
+            role, raw_name = name_match.groups()
+            name, descriptor = _markdown_character_name(raw_name)
+            if not name:
+                continue
+            current = {"name": name}
+            if role not in {"人物", "角色"}:
+                current["role"] = role
+            if descriptor and descriptor not in {role, "人物", "角色"}:
+                current["background"] = descriptor
+                current_field = "background"
+            continue
+        if current is None or "-->" in line or "→" in line:
+            continue
+        field_match = re.match(r"^([^：:]{1,50})\s*[:：]\s*(.*)$", line)
+        if field_match:
+            field, raw_value = field_match.groups()
+            mapped = _markdown_character_field(field)
+            if mapped is None:
+                # Preserve unlabeled explanatory rows as character context,
+                # but never turn Markdown headings into arbitrary card keys.
+                if field.startswith("#"):
+                    continue
+                mapped = "background"
+            value = raw_value.strip()
+            if not value:
+                current_field = mapped
+                continue
+            previous = current.get(mapped)
+            current[mapped] = f"{previous}\n{value}" if previous else value
+            current_field = mapped
+            continue
+        if current_field:
+            previous = current.get(current_field)
+            current[current_field] = f"{previous}\n{line}" if previous else line
+    flush()
+    return proposals
+
+
+def _markdown_node_value(value: str) -> tuple[str, str | None]:
+    return _markdown_character_name(value)
+
+
+def _markdown_is_non_person_node(name: str, descriptor: str | None) -> bool:
+    value = f"{name} {descriptor or ''}"
+    return bool(
+        re.search(r"(?:地点|场所|机构|门派|物件|物品|事件|剧情线|时间线|城市|城镇|府|镇|村|楼|塔)", value)
+    )
+
+
+def _markdown_graph_proposals(body: str) -> list[dict[str, Any]]:
+    """Extract character nodes and relation edges from a provider Markdown draft."""
+
+    nodes: dict[str, tuple[str, str | None]] = {}
+    edges: list[dict[str, Any]] = []
+
+    def remember_node(raw_value: str) -> str:
+        name, descriptor = _markdown_node_value(raw_value)
+        if name:
+            key = re.sub(r"[\s\u3000]", "", name).casefold()
+            nodes.setdefault(key, (name, descriptor))
+        return name
+
+    for raw_line in body.splitlines():
+        line = _markdown_clean_line(raw_line)
+        if not line:
+            continue
+        node_match = _MARKDOWN_NODE_LINE.match(line)
+        if node_match:
+            remember_node(node_match.group(1))
+            continue
+        edge_match = _MARKDOWN_EDGE_LINE.match(line)
+        if not edge_match:
+            continue
+        source_raw = edge_match.group("source")
+        destination_raw = edge_match.group("destination")
+        source, _source_descriptor = _markdown_node_value(source_raw)
+        destination, destination_descriptor = _markdown_node_value(destination_raw)
+        remember_node(source_raw)
+        remember_node(destination_raw)
+        relation = _markdown_clean_line(edge_match.group("relation"))
+        if not source or not destination or source == destination or not relation:
+            continue
+        patch: dict[str, Any] = {
+            "source_name": source,
+            "target_name": destination,
+            "relation_type": relation[:80],
+        }
+        if destination_descriptor:
+            patch["label"] = destination_descriptor[:255]
+        edge_key = (
+            re.sub(r"[\s\u3000]", "", source).casefold(),
+            re.sub(r"[\s\u3000]", "", destination).casefold(),
+            relation.casefold(),
+        )
+        if not any(item["_key"] == edge_key for item in edges):
+            edges.append({"_key": edge_key, "patch": patch})
+
+    proposals: list[dict[str, Any]] = []
+    for _key, (name, descriptor) in nodes.items():
+        if not name:
+            continue
+        if _markdown_is_non_person_node(name, descriptor):
+            proposals.append(
+                {
+                    "operation": "upsert_graph_node",
+                    "target_type": "graph_node",
+                    "target_id": None,
+                    "patch": {
+                        "node_type": "custom",
+                        "label": name,
+                        "data": {"description": descriptor or "", "source": "assistant_markdown"},
+                    },
+                    "reason": "从 Markdown 图谱草稿提取节点",
+                }
+            )
+            continue
+        patch = {"name": name}
+        if descriptor:
+            if descriptor in {"主角", "配角", "反派", "男主", "女主"}:
+                patch["role"] = descriptor
+            else:
+                patch["background"] = descriptor
+        proposals.append(
+            {
+                "operation": "create_character",
+                "target_type": "character",
+                "target_id": None,
+                "patch": patch,
+                "reason": "从 Markdown 图谱草稿提取人物节点",
+            }
+        )
+    proposals.extend(
+        {
+            "operation": "upsert_graph_edge",
+            "target_type": "character_relation",
+            "target_id": None,
+            "patch": item["patch"],
+            "reason": "从 Markdown 图谱草稿提取关系边",
+        }
+        for item in edges
+    )
+    return proposals
+
+
+def _markdown_draft_sections(value: str) -> list[tuple[int, int, str, str]]:
+    lines = value.splitlines()
+    headings: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        match = _MARKDOWN_DRAFT_HEADING.match(line)
+        if match:
+            title = _markdown_clean_line(match.group(1)).rstrip("# ").strip()
+            lowered = title.casefold()
+            has_draft_marker = bool(
+                re.search(r"(?:草稿|待确认|设定|draft|关联)", lowered)
+            )
+            kind = (
+                "character"
+                if has_draft_marker and re.search(r"(?:人物|角色|character)", lowered)
+                else "graph"
+                if has_draft_marker and re.search(
+                    r"(?:图谱|关系|节点|graph|relationship)", lowered
+                )
+                else ""
+            )
+            if kind:
+                headings.append((index, kind))
+    sections: list[tuple[int, int, str, str]] = []
+    for offset, (start, kind) in enumerate(headings):
+        end = headings[offset + 1][0] if offset + 1 < len(headings) else len(lines)
+        sections.append((start, end, kind, "\n".join(lines[start + 1 : end])))
+    return sections
+
+
+def _extract_markdown_proposals(value: Any) -> tuple[str, list[dict[str, Any]]]:
+    """Recover proposals from the Markdown draft emitted by weak providers.
+
+    This is intentionally narrower than a general Markdown-to-data parser:
+    only explicitly labelled "待确认/草稿"人物 and graph sections become
+    proposals.  Ordinary Markdown prose/lists therefore remains ordinary
+    prose.
+    """
+
+    if not isinstance(value, str):
+        return _plain_reply(value), []
+    text = value.strip().lstrip("\ufeff")
+    sections = _markdown_draft_sections(text)
+    if not sections:
+        return text, []
+    proposals: list[dict[str, Any]] = []
+    for _start, _end, kind, body in sections:
+        proposals.extend(
+            _markdown_character_proposals(body)
+            if kind == "character"
+            else _markdown_graph_proposals(body)
+        )
+    # A graph section repeats character names already described in the person
+    # section.  Keep the richer character card and retain only genuinely new
+    # graph nodes/edges from the graph parser.
+    unique: list[dict[str, Any]] = []
+    character_names: set[str] = set()
+    for item in proposals:
+        patch = item.get("patch") if isinstance(item, dict) else None
+        operation = item.get("operation") if isinstance(item, dict) else None
+        if operation == "create_character" and isinstance(patch, dict):
+            name = str(patch.get("name") or "")
+            key = re.sub(r"[\s\u3000]", "", name).casefold()
+            if key in character_names:
+                continue
+            character_names.add(key)
+        unique.append(item)
+    lines = text.splitlines()
+    removed = {index for start, end, _kind, _body in sections for index in range(start, end)}
+    visible = "\n".join(line for index, line in enumerate(lines) if index not in removed).strip()
+    if not visible:
+        visible = "已整理人物与图谱草稿，请确认后写入项目。"
+    return visible, unique
+
+
+def _visible_reply_text(value: Any) -> str:
+    """Return the stream-safe user text while a proposal body is arriving."""
+
+    if not isinstance(value, str):
+        return _plain_reply(value)
+    clean, source = _extract_mixed_proposals(value)
+    if source:
+        return clean
+    markdown_clean, markdown_source = _extract_markdown_proposals(value)
+    if markdown_source:
+        return markdown_clean
+    if _MARKDOWN_DRAFT_HEADING.search(value):
+        # Hide an incomplete draft section while it is still streaming.  The
+        # final pass will either emit proposals or keep the concise fallback
+        # sentence, but protocol headings/fields never become chat deltas.
+        prefix = value[: _MARKDOWN_DRAFT_HEADING.search(value).start()]
+        return _clean_prose_prefix(prefix) or "已整理人物与图谱草稿，请确认后写入项目。"
+    marker = _PROPOSAL_MARKER.search(value)
+    if marker is not None:
+        # Even before the final YAML item arrives, do not stream protocol text
+        # into the conversation.  The completed parser will decide whether it
+        # becomes a proposal; this prefix is still safe to display.
+        return _clean_prose_prefix(value[: marker.start()])
+    return value
+
+
+def _normalise_name(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _canonical_target_type(value: Any) -> str:
+    raw = str(value or "").strip()
+    return _TARGET_TYPE_ALIASES.get(_normalise_name(raw), raw[:80] or "general")
+
+
+def _dict_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    parsed = _json_object(value)
+    return parsed if parsed is not None else {}
+
+
+def _item_patch(item: dict[str, Any]) -> dict[str, Any]:
+    patch = _dict_value(item.get("patch"))
+    if not patch:
+        patch = _dict_value(item.get("patch_json"))
+    for key, value in item.items():
+        if key not in _PROPOSAL_PROTOCOL_KEYS:
+            patch.setdefault(key, value)
+    return patch
+
+
+def _target_id_from_item(item: dict[str, Any], target: dict[str, Any] | None) -> str | None:
+    candidate: Any = item.get("target_id") or item.get("targetId")
+    descriptor = item.get("target")
+    if isinstance(descriptor, dict):
+        candidate = candidate or descriptor.get("id") or descriptor.get("target_id")
+    elif descriptor and candidate is None:
+        candidate = descriptor
+    if target and _canonical_target_type(target.get("type")) != "project":
+        # A project-scoped conversation describes where the request was made,
+        # not an existing entity to mutate.  Inheriting the project UUID as a
+        # character/node target makes a create proposal look like an update
+        # and prevents clients from rendering a new draft card.
+        candidate = (
+            candidate
+            or target.get("target_id")
+            or target.get("chapter_id")
+            or target.get("character_id")
+            or target.get("node_id")
+            or target.get("edge_id")
+            or target.get("relationship_id")
+            or target.get("id")
+        )
+    return str(candidate) if candidate else None
+
+
+def _context_value(context: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in context and context[name] not in (None, ""):
+            return context[name]
+    selection = context.get("selection")
+    if isinstance(selection, dict):
+        for name in names:
+            if name in selection and selection[name] not in (None, ""):
+                return selection[name]
+    return None
+
+
+def _character_patch(item: dict[str, Any], source_patch: dict[str, Any]) -> dict[str, Any]:
+    patch = dict(source_patch)
+    for old, new in (("goal", "goals"), ("conflict", "conflict_fears"), ("description", "background")):
+        if old in patch and new not in patch:
+            patch[new] = patch[old]
+    patch = {key: value for key, value in patch.items() if key in CHARACTER_FIELDS}
+    name = item.get("name") or patch.get("name")
+    if name:
+        patch["name"] = str(name).strip()
+    content = item.get("content") or item.get("summary") or item.get("description")
+    if content and not any(
+        patch.get(field) for field in ("background", "motivation", "personality", "goals", "voice")
+    ):
+        # ``content`` is the compact setting-entry format used by the live
+        # provider.  Store it in a first-class Character field, not as a
+        # legacy CanonItem blob.
+        patch["background"] = str(content).strip()
+    return patch
+
+
+def _endpoint_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return (
+            value.get("node_id")
+            or value.get("character_id")
+            or value.get("id")
+            or value.get("name")
+        )
+    return value
+
+
+def _relation_edge_patches(item: dict[str, Any], source_patch: dict[str, Any], character_name: str | None) -> list[dict[str, Any]]:
+    merged = {**item, **source_patch}
+    relations = merged.get("relationships") or merged.get("relations")
+    relation_items = relations if isinstance(relations, list) else [merged]
+    result: list[dict[str, Any]] = []
+    for relation in relation_items:
+        data = {**merged, **(relation if isinstance(relation, dict) else {})}
+        source_value = target_value = None
+        for source_key, target_key in _CHARACTER_RELATION_ENDPOINT_KEYS:
+            candidate_source = _endpoint_value(data.get(source_key))
+            candidate_target = _endpoint_value(data.get(target_key))
+            if candidate_source or candidate_target:
+                source_value = candidate_source or character_name
+                target_value = candidate_target
+                break
+        if not target_value:
+            # A character entry may use the compact ``related_to`` field.
+            target_value = (
+                _endpoint_value(data.get("related_to"))
+                or _endpoint_value(data.get("with"))
+                or _endpoint_value(data.get("other_character"))
+                or _endpoint_value(data.get("related_character"))
+            )
+            source_value = source_value or character_name
+        if not source_value or not target_value or str(source_value) == str(target_value):
+            continue
+        edge: dict[str, Any] = {
+            "source_name": source_value,
+            "target_name": target_value,
+        }
+        relation_type = (
+            data.get("relation_type")
+            or data.get("relation")
+            or (data.get("relationship") if isinstance(data.get("relationship"), (str, int, float)) else None)
+            or data.get("relationship_type")
+            or data.get("type")
+        )
+        if isinstance(relation_type, (str, int, float)) and str(relation_type).strip():
+            edge["relation_type"] = str(relation_type).strip()[:80]
+        label = data.get("label")
+        if isinstance(label, (str, int, float)) and str(label).strip():
+            edge["label"] = str(label).strip()[:255]
+        result.append(edge)
+    return result
+
+
+def _normalise_proposal_item(
+    item: dict[str, Any],
+    *,
+    target: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    context = context if isinstance(context, dict) else {}
+    raw_operation = _normalise_name(item.get("operation"))
+    raw_target_type = _canonical_target_type(item.get("target_type") or item.get("targetType"))
+    category = _normalise_name(item.get("category") or raw_target_type)
+    patch = _item_patch(item)
+    target_id = _target_id_from_item(item, target)
+    reason = _plain_reply(item.get("reason") or "助手建议")[:2000]
+
+    def result(operation: str, target_type: str, value: dict[str, Any], identifier: str | None = target_id) -> dict[str, Any] | None:
+        if operation not in ALLOWED_OPERATIONS or not value:
+            return None
+        return {
+            "operation": operation,
+            "target_type": target_type[:80] or "general",
+            "target_id": identifier,
+            "patch": value,
+            "reason": reason,
+        }
+
+    if raw_operation == "create_setting_entry":
+        if category in _CHARACTER_CATEGORY_ALIASES or raw_target_type == "character":
+            character = _character_patch(item, patch)
+            if not character.get("name"):
+                return []
+            values: list[dict[str, Any]] = []
+            proposal = result("create_character", "character", character, None)
+            if proposal is not None:
+                values.append(proposal)
+            for edge in _relation_edge_patches(item, patch, str(character["name"])):
+                edge_proposal = result("upsert_graph_edge", "character_relation", edge, None)
+                if edge_proposal is not None:
+                    values.append(edge_proposal)
+            return values
+        if category in _RELATION_CATEGORY_ALIASES or raw_target_type in {"character_relation", "graph_edge"}:
+            edge_patches = _relation_edge_patches(item, patch, None)
+            return [
+                proposal
+                for edge in edge_patches
+                if (proposal := result("upsert_graph_edge", "character_relation", edge)) is not None
+            ]
+        if category in _PROJECT_CATEGORY_ALIASES or raw_target_type == "project":
+            project_patch = {key: value for key, value in patch.items() if key in PROJECT_FIELDS}
+            if not project_patch and item.get("content"):
+                project_patch["story_bible"] = str(item["content"]).strip()
+            proposal = result("update_project_settings", "project", project_patch, None)
+            return [proposal] if proposal is not None else []
+        if category in _NODE_CATEGORY_ALIASES or raw_target_type in {"graph_node", "node"}:
+            node_patch = {key: value for key, value in patch.items() if key in NODE_FIELDS}
+            if item.get("name") and "label" not in node_patch:
+                node_patch["label"] = str(item["name"]).strip()
+            if item.get("content") and "data" not in node_patch:
+                node_patch["data"] = {"content": str(item["content"])}
+            if "node_type" not in node_patch:
+                node_patch["node_type"] = category or "custom"
+            proposal = result("upsert_graph_node", "graph_node", node_patch)
+            return [proposal] if proposal is not None else []
+        return []
+
+    operation_aliases = {
+        "create": "create_character" if category in _CHARACTER_CATEGORY_ALIASES else "",
+        "create_character": "create_character",
+        "new_character": "create_character",
+        "update_character": "update_character",
+        "upsert_character": "upsert_character",
+        "update_project": "update_project_settings",
+        "update_project_settings": "update_project_settings",
+        "update_settings": "update_project_settings",
+        "upsert_graph_node": "upsert_graph_node",
+        "create_graph_node": "upsert_graph_node",
+        "update_graph_node": "update_graph_node",
+        "upsert_graph_edge": "upsert_graph_edge",
+        "create_graph_edge": "upsert_graph_edge",
+        "update_graph_edge": "update_graph_edge",
+        "edit_chapter": "edit_chapter",
+        "edit_chapter_selection": "edit_chapter_selection",
+        "edit_selection": "edit_chapter_selection",
+        "replace": "edit_chapter",
+        "replace_chapter": "edit_chapter",
+        "rewrite": "edit_chapter",
+        "rewrite_chapter": "edit_chapter",
+    }
+    operation = operation_aliases.get(raw_operation, raw_operation)
+    if operation in {"create_character", "update_character", "upsert_character"}:
+        character = _character_patch(item, patch)
+        proposal = result(operation, "character", character)
+        return [proposal] if proposal is not None else []
+    if operation == "update_project_settings":
+        project_patch = {key: value for key, value in patch.items() if key in PROJECT_FIELDS}
+        if not project_patch and item.get("content"):
+            project_patch["story_bible"] = str(item["content"]).strip()
+        proposal = result(operation, "project", project_patch, target_id)
+        return [proposal] if proposal is not None else []
+    if operation in {"upsert_graph_node", "update_graph_node"}:
+        node_patch = {key: value for key, value in patch.items() if key in NODE_FIELDS}
+        proposal = result(operation, "graph_node", node_patch)
+        return [proposal] if proposal is not None else []
+    if operation in {"upsert_graph_edge", "update_graph_edge"}:
+        edge_patch = dict(patch)
+        proposal = result(operation, "character_relation", edge_patch)
+        return [proposal] if proposal is not None else []
+    if operation in {"edit_chapter", "edit_chapter_selection"}:
+        # The chapter selected by the server wins over model/client target
+        # ids.  A proposal must not be able to redirect an edit to another
+        # chapter in the same project.
+        chapter_id = _context_value(context, "chapter_id") or target_id or patch.get("chapter_id")
+        chapter_id = str(chapter_id) if chapter_id else None
+        chapter_patch = dict(patch)
+        if context.get("empty_chapter_baseline") is True:
+            empty_hash = _hash_text("")
+            # No revision id exists yet.  Ignore every model-provided range
+            # and hash and pin the proposal to the verified empty document.
+            chapter_patch.update(
+                {
+                    "empty_chapter_baseline": True,
+                    "base_revision_id": None,
+                    "base_content_hash": empty_hash,
+                    "selection_start": 0,
+                    "selection_end": 0,
+                    "selection_hash": empty_hash,
+                }
+            )
+        for name in ("base_revision_id", "base_content_hash", "selection_start", "selection_end", "selection_hash"):
+            if chapter_patch.get(name) in (None, ""):
+                context_name = _context_value(context, name)
+                if context_name is not None:
+                    chapter_patch[name] = context_name
+        if "replacement" not in chapter_patch:
+            replacement = chapter_patch.get("new_text") or item.get("replacement") or item.get("new_text")
+            if replacement is not None:
+                chapter_patch["replacement"] = replacement
+        if "replacement" not in chapter_patch and item.get("content") is not None:
+            chapter_patch["replacement"] = item.get("content")
+        if operation == "edit_chapter" and (
+            chapter_patch.get("selection_hash")
+            or "selection_start" in chapter_patch
+            or "selection_end" in chapter_patch
+        ):
+            operation = "edit_chapter_selection" if chapter_patch.get("selection_hash") else operation
+        proposal = result(operation, "chapter", chapter_patch, chapter_id)
+        return [proposal] if proposal is not None else []
+    return []
+
+
+def _normalise_provider_output(
+    value: Any,
+    raw_content: str = "",
+    *,
+    target: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    source_document = value if isinstance(value, (dict, list)) else _complete_json(value)
+    if source_document is None and raw_content:
+        # Older adapters return the parsed/structured value separately from
+        # the raw provider body.  If structured extraction failed, the raw
+        # body may still be a complete legacy {reply, proposals} envelope.
+        source_document = _complete_json(raw_content)
+    source: Any = []
+    embedded: list[Any] = []
+    if isinstance(source_document, dict):
+        reply_value = source_document.get("reply", source_document.get("message", ""))
+        reply = _plain_reply(reply_value)
+        source = source_document.get("proposals") or source_document.get("changes") or []
+        reply, embedded = _extract_mixed_proposals(reply)
+        if not source:
+            reply, markdown_embedded = _extract_markdown_proposals(reply)
+            embedded.extend(markdown_embedded)
+    elif isinstance(source_document, list):
+        reply = _plain_reply(raw_content)
+        source = source_document
+    else:
+        text_value = raw_content or value
+        reply = _plain_reply(text_value)
+        reply, embedded = _extract_mixed_proposals(reply)
+        if not embedded:
+            reply, markdown_embedded = _extract_markdown_proposals(reply)
+            embedded.extend(markdown_embedded)
+        source = embedded
+    if not source and embedded:
+        source = embedded
     proposals: list[dict[str, Any]] = []
     if isinstance(source, list):
         for item in source[:50]:
             if not isinstance(item, dict):
                 continue
-            operation = str(item.get("operation") or "").strip().lower()
-            patch = _json_object(item.get("patch"))
-            if patch is None:
-                patch = _json_object(item.get("patch_json"))
-            if patch is None:
-                patch = {}
-            if operation not in ALLOWED_OPERATIONS or not patch:
-                continue
-            proposals.append(
-                {
-                    "operation": operation,
-                    "target_type": str(item.get("target_type") or "general")[:80],
-                    "target_id": str(item["target_id"]) if item.get("target_id") else None,
-                    "patch": patch,
-                    "reason": _plain_reply(item.get("reason") or "助手建议")[:2000],
-                }
-            )
+            for proposal in _normalise_proposal_item(item, target=target, context=context):
+                if len(proposals) >= 50:
+                    break
+                proposals.append(proposal)
     return reply[:100_000], proposals
 
 
@@ -1223,7 +2273,10 @@ def _make_proposals(
         source_type="assistant",
         source_id=run.id,
         base_memory_epoch=project.memory_epoch,
-        status="proposed",
+        # Keep the set unappliable while its durable preview events are being
+        # published.  A worker interruption can therefore leave a visible,
+        # resumable preview without exposing a half-built mutation to Apply.
+        status="building",
         summary="助手根据对话提出的故事设定变更",
         changes_json=proposals,
         created_by_user_id=user.id,
@@ -1265,6 +2318,7 @@ def _make_proposals(
             patch_json=item["patch"],
             base_version=base_version,
             base_memory_epoch=project.memory_epoch,
+            status="building",
             reason=item["reason"],
             created_by_user_id=user.id,
         )
@@ -1291,10 +2345,10 @@ def _make_proposals(
             },
             "base_version": base_version,
             "summary": proposal.reason or "待应用的设定提案",
-            "patches": [
-                {"path": key, "value": value, "label": key}
-                for key, value in (proposal.patch_json or {}).items()
-            ],
+            # The created event is the preview skeleton.  Sending the full
+            # patch here made clients render the final state only after the
+            # transaction committed and made the event stream look atomic.
+            "patches": [],
             "status": proposal.status,
             "created_at": proposal.created_at.isoformat()
             if proposal.created_at
@@ -1314,6 +2368,10 @@ def _make_proposals(
             },
             run_id=run.id,
         )
+        # AgentEvent is consumed by a separate SSE polling session.  A flush
+        # alone is not observable there, so publish each preview step in a
+        # short transaction while the proposal remains unappliable (building).
+        db.commit()
         for patch_key, patch_value in (proposal.patch_json or {}).items():
             add_event(
                 db,
@@ -1328,6 +2386,34 @@ def _make_proposals(
                 },
                 run_id=run.id,
             )
+            db.commit()
+
+    # Flip all proposals to an applyable state together, then publish ready
+    # events with the complete patches.  If the worker dies before this point,
+    # every persisted row remains ``building`` and Apply rejects it safely.
+    change_set.status = "proposed"
+    for proposal in result:
+        proposal.status = "proposed"
+    db.flush()
+    for proposal in result:
+        proposal_payload = {
+            "id": proposal.id,
+            "conversation_id": conversation.id,
+            "target": {
+                "type": proposal.target_type,
+                "id": proposal.target_id or "",
+            },
+            "base_version": proposal.base_version,
+            "summary": proposal.reason or "待应用的设定提案",
+            "patches": [
+                {"path": key, "value": value, "label": key}
+                for key, value in (proposal.patch_json or {}).items()
+            ],
+            "status": proposal.status,
+            "created_at": proposal.created_at.isoformat()
+            if proposal.created_at
+            else None,
+        }
         add_event(
             db,
             conversation,
@@ -1339,10 +2425,11 @@ def _make_proposals(
                 "proposal": proposal_payload,
                 "attempt": _run_attempt(run),
                 "target": proposal_payload["target"],
-                "base_version": base_version,
+                "base_version": proposal.base_version,
             },
             run_id=run.id,
         )
+    db.commit()
     return result
 
 
@@ -1377,6 +2464,16 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
         provider = provider_for(profile)
         messages, authorised_asset_ids = _provider_messages(
             db, conversation, run, project, user, profile
+        )
+        target_context = (
+            dict((run.input_snapshot or {}).get("target") or {})
+            if isinstance((run.input_snapshot or {}).get("target"), dict)
+            else {}
+        )
+        authoritative_context = (
+            dict((run.input_snapshot or {}).get("authoritative_context") or {})
+            if isinstance((run.input_snapshot or {}).get("authoritative_context"), dict)
+            else {}
         )
         if authorised_asset_ids:
             add_event(
@@ -1476,6 +2573,8 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
         delta_last_flushed_at = time.monotonic()
         stream_machine_envelope: bool | None = None
         prefix_buffer: list[tuple[str, int]] = []
+        stream_visible_reply = ""
+        stream_requires_replace = False
 
         def flush_delta(*, force: bool = False) -> None:
             nonlocal delta_start_index, delta_end_index, delta_last_flushed_at
@@ -1510,6 +2609,38 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
             db.commit()
 
         try:
+            def persist_visible_reply(index: int) -> None:
+                """Persist only the user-facing prefix of a mixed response."""
+
+                nonlocal stream_visible_reply, delta_start_index, delta_end_index
+                nonlocal stream_requires_replace
+                visible = _visible_reply_text(reply)[:100_000]
+                assistant_message.content = visible
+                if visible == stream_visible_reply:
+                    return
+                if visible.startswith(stream_visible_reply):
+                    delta = visible[len(stream_visible_reply) :]
+                else:
+                    # A provider may have streamed the explanatory sentence
+                    # immediately before ``proposals:``.  The final
+                    # message.replace retracts that sentence if needed; do
+                    # not append protocol text as a second delta.
+                    delta = ""
+                    stream_requires_replace = True
+                    # If the explanatory protocol line has not been committed
+                    # yet, do not publish it at all.  Already committed deltas
+                    # are retracted by the final message.replace frame.
+                    delta_buffer.clear()
+                    delta_start_index = None
+                stream_visible_reply = visible
+                if not delta:
+                    return
+                if delta_start_index is None:
+                    delta_start_index = index
+                delta_end_index = index
+                delta_buffer.append(delta)
+                flush_delta()
+
             def persist_delta(chunk: str, index: int) -> None:
                 nonlocal reply, delta_start_index, delta_end_index, stream_machine_envelope
                 if lease_owner is None:  # pragma: no cover - claim always supplies one
@@ -1532,19 +2663,12 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                     prefix_buffer.clear()
                     assistant_message.content = ""
                     return
-                assistant_message.content = reply[:100_000]
                 if prefix_buffer:
-                    for pending_chunk, pending_index in prefix_buffer:
-                        if delta_start_index is None:
-                            delta_start_index = pending_index
-                        delta_end_index = pending_index
-                        delta_buffer.append(pending_chunk)
+                    first_pending_index = prefix_buffer[0][1]
                     prefix_buffer.clear()
-                if delta_start_index is None:
-                    delta_start_index = index
-                delta_end_index = index
-                delta_buffer.append(chunk)
-                flush_delta()
+                    persist_visible_reply(first_pending_index)
+                else:
+                    persist_visible_reply(index)
 
             chunks = _run_async(_stream_reply(provider, messages, persist_delta))
             streamed = True
@@ -1552,13 +2676,9 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 # The stream ended with fewer than three leading backticks;
                 # that is ordinary inline text, not an incomplete fence.
                 stream_machine_envelope = False
-                assistant_message.content = reply[:100_000]
-                for pending_chunk, pending_index in prefix_buffer:
-                    if delta_start_index is None:
-                        delta_start_index = pending_index
-                    delta_end_index = pending_index
-                    delta_buffer.append(pending_chunk)
+                first_pending_index = prefix_buffer[0][1] if prefix_buffer else delta_end_index
                 prefix_buffer.clear()
+                persist_visible_reply(first_pending_index or 0)
             flush_delta(force=True)
             if stream_machine_envelope:
                 assistant_message.content = ""
@@ -1582,7 +2702,9 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                     "stream_error": _safe_agent_error(exc)[:1000],
                 }
                 assistant_message.content = (
-                    INCOMPLETE_REPLY_MESSAGE if stream_machine_envelope else reply[:100_000]
+                    INCOMPLETE_REPLY_MESSAGE
+                    if stream_machine_envelope
+                    else _visible_reply_text(reply)[:100_000]
                 )
                 db.commit()
                 raise
@@ -1602,10 +2724,7 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 {"role": "assistant", "content": reply},
                 {
                     "role": "user",
-                    "content": (
-                        "请仅从上一条回复中提取需要用户审核的结构化变更，"
-                        "返回既定 JSON Schema；没有变更时 proposals 返回空数组。"
-                    ),
+                    "content": ASSISTANT_EXTRACTION_INSTRUCTION,
                 },
             ]
             try:
@@ -1633,10 +2752,7 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 {"role": "assistant", "content": reply},
                 {
                     "role": "user",
-                    "content": (
-                        "请仅从上一条回复中提取需要用户审核的结构化变更，"
-                        "返回既定 JSON Schema；没有变更时 proposals 返回空数组。"
-                    ),
+                    "content": ASSISTANT_EXTRACTION_INSTRUCTION,
                 },
             ]
             try:
@@ -1658,19 +2774,37 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
         if normalise_source is None and not raw_content and reply:
             normalise_source = reply
         normalised_reply, proposal_values = _normalise_provider_output(
-            normalise_source, raw_content or (reply if streamed else "")
+            normalise_source,
+            raw_content or (reply if streamed else ""),
+            target=target_context,
+            context=authoritative_context,
         )
-        if not reply:
-            reply = normalised_reply
-        elif streamed:
+        if streamed:
             # A misconfigured streaming gateway can send a JSON/code-fenced
             # document (including a truncated outer object).  Normalize the
             # whole stream as inert transport data, never as visible
             # Markdown, and retain any safely parsed patches.
-            streamed_reply, streamed_proposals = _normalise_provider_output(reply)
+            streamed_reply, streamed_proposals = _normalise_provider_output(
+                reply,
+                target=target_context,
+                context=authoritative_context,
+            )
             reply = streamed_reply
             if not proposal_values:
                 proposal_values = streamed_proposals
+        else:
+            # Keep the first (natural-language) provider call authoritative;
+            # this pass only removes a mixed-format protocol tail and catches
+            # proposals embedded in a fallback YAML response.  Never replace
+            # the prose with the extractor's own ``reply`` field.
+            natural_reply, natural_proposals = _normalise_provider_output(
+                reply,
+                target=target_context,
+                context=authoritative_context,
+            )
+            reply = natural_reply
+            if not proposal_values:
+                proposal_values = natural_proposals
         reply = reply[:100_000]
         previous_content = assistant_message.content
         assistant_message.content = reply
@@ -1684,7 +2818,7 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
             "streamed": streamed,
             "authorised_asset_ids": authorised_asset_ids,
         }
-        if previous_content != reply or stream_machine_envelope:
+        if previous_content != reply or stream_machine_envelope or stream_requires_replace:
             add_event(
                 db,
                 conversation,
@@ -2174,46 +3308,86 @@ def _apply_chapter_edit(
     if chapter is None:
         raise LookupError("章节不存在或不属于当前项目")
 
-    base_revision_id = str(
-        patch.get("base_revision_id")
-        or patch.get("base_revision")
-        or patch.get("source_revision_id")
-        or ""
-    )
-    if not base_revision_id:
-        raise ValueError("正文提案缺少 base_revision_id")
-    base_revision = db.scalar(
-        select(ChapterRevision).where(
-            ChapterRevision.id == base_revision_id,
-            ChapterRevision.chapter_id == chapter.id,
+    empty_baseline = patch.get("empty_chapter_baseline") is True
+    base_revision: ChapterRevision | None = None
+    if empty_baseline:
+        # A no-current-revision chapter is safe to bootstrap only when every
+        # stored revision is empty.  This check is repeated under the chapter
+        # lock so a model cannot turn an unknown/non-empty document into an
+        # empty baseline by supplying forged hashes or ranges.
+        if chapter.current_revision_id:
+            raise RuntimeError("章节正文已被其他窗口更新，请重新生成提案")
+        revisions = db.scalars(
+            select(ChapterRevision).where(ChapterRevision.chapter_id == chapter.id)
+        ).all()
+        if any(str(revision.content or "").strip() for revision in revisions):
+            raise RuntimeError("章节正文已被其他窗口更新，请重新生成提案")
+        empty_hash = _hash_text("")
+        supplied_revision = patch.get("base_revision_id")
+        if supplied_revision not in (None, ""):
+            raise RuntimeError("空白章节基线无效，请重新生成提案")
+        supplied_hash = str(
+            patch.get("base_content_hash")
+            or patch.get("content_hash")
+            or patch.get("base_hash")
+            or ""
         )
-    )
-    if base_revision is None:
-        raise LookupError("正文基准修订不存在或不属于当前章节")
-    if chapter.current_revision_id != base_revision.id:
-        raise RuntimeError("章节正文已被其他窗口更新，请重新生成提案")
+        if supplied_hash != empty_hash:
+            raise RuntimeError("空白章节基线已变化，请重新生成提案")
+        start = _patch_int(patch, "selection_start", "start", default=0)
+        end = _patch_int(patch, "selection_end", "end", default=0)
+        selection_hash = str(
+            patch.get("selection_hash") or patch.get("base_selection_hash") or ""
+        )
+        if start != 0 or end != 0 or selection_hash != empty_hash:
+            raise RuntimeError("空白章节选区已变化，请重新生成提案")
+        base_content = ""
+        selected = ""
+    else:
+        base_revision_id = str(
+            patch.get("base_revision_id")
+            or patch.get("base_revision")
+            or patch.get("source_revision_id")
+            or ""
+        )
+        if not base_revision_id:
+            raise ValueError("正文提案缺少 base_revision_id")
+        base_revision = db.scalar(
+            select(ChapterRevision).where(
+                ChapterRevision.id == base_revision_id,
+                ChapterRevision.chapter_id == chapter.id,
+            )
+        )
+        if base_revision is None:
+            raise LookupError("正文基准修订不存在或不属于当前章节")
+        if chapter.current_revision_id != base_revision.id:
+            raise RuntimeError("章节正文已被其他窗口更新，请重新生成提案")
 
-    supplied_hash = str(
-        patch.get("base_content_hash") or patch.get("content_hash") or patch.get("base_hash") or ""
-    )
-    actual_hash = ChapterRevision.hash_content(base_revision.content)
-    if not supplied_hash or supplied_hash != actual_hash or base_revision.content_hash != actual_hash:
-        raise RuntimeError("正文基准内容已变化，请重新生成提案")
+        supplied_hash = str(
+            patch.get("base_content_hash")
+            or patch.get("content_hash")
+            or patch.get("base_hash")
+            or ""
+        )
+        actual_hash = ChapterRevision.hash_content(base_revision.content)
+        if not supplied_hash or supplied_hash != actual_hash or base_revision.content_hash != actual_hash:
+            raise RuntimeError("正文基准内容已变化，请重新生成提案")
 
-    start = _patch_int(patch, "selection_start", "start", default=0)
-    end = _patch_int(patch, "selection_end", "end", default=len(base_revision.content))
-    if start is None or end is None or start < 0 or end < start or end > len(base_revision.content):
-        raise ValueError("正文选区范围无效")
-    selected = base_revision.content[start:end]
-    selection_hash = str(
-        patch.get("selection_hash") or patch.get("base_selection_hash") or ""
-    )
-    if proposal.operation == "edit_chapter_selection" and (
-        not selection_hash or selection_hash != _hash_text(selected)
-    ):
-        raise RuntimeError("正文选区已变化，请重新生成提案")
-    if selection_hash and selection_hash != _hash_text(selected):
-        raise RuntimeError("正文选区已变化，请重新生成提案")
+        base_content = base_revision.content
+        start = _patch_int(patch, "selection_start", "start", default=0)
+        end = _patch_int(patch, "selection_end", "end", default=len(base_content))
+        if start is None or end is None or start < 0 or end < start or end > len(base_content):
+            raise ValueError("正文选区范围无效")
+        selected = base_content[start:end]
+        selection_hash = str(
+            patch.get("selection_hash") or patch.get("base_selection_hash") or ""
+        )
+        if proposal.operation == "edit_chapter_selection" and (
+            not selection_hash or selection_hash != _hash_text(selected)
+        ):
+            raise RuntimeError("正文选区已变化，请重新生成提案")
+        if selection_hash and selection_hash != _hash_text(selected):
+            raise RuntimeError("正文选区已变化，请重新生成提案")
 
     replacement = patch.get("replacement")
     if replacement is None:
@@ -2225,7 +3399,7 @@ def _apply_chapter_edit(
     else:
         if not isinstance(replacement, str):
             raise ValueError("正文提案缺少 replacement")
-        new_content = base_revision.content[:start] + replacement + base_revision.content[end:]
+        new_content = base_content[:start] + replacement + base_content[end:]
     if not isinstance(new_content, str) or not new_content.strip():
         raise ValueError("正文不能为空")
     if len(new_content) > 2_000_000:
@@ -2242,11 +3416,11 @@ def _apply_chapter_edit(
         content=new_content,
         content_hash=ChapterRevision.hash_content(new_content),
         source_type="assistant_edit",
-        parent_revision_id=base_revision.id,
+        parent_revision_id=base_revision.id if base_revision is not None else None,
         is_generated=False,
         extra={
             "assistant_proposal_id": str(proposal.id),
-            "base_revision_id": base_revision.id,
+            "base_revision_id": base_revision.id if base_revision is not None else None,
             "selection_start": start,
             "selection_end": end,
             "selection_hash": _hash_text(selected),
@@ -2273,7 +3447,8 @@ def _apply_chapter_edit(
             {
                 "source": "assistant",
                 "proposal_id": str(proposal.id),
-                "base_revision_id": base_revision.id,
+                "base_revision_id": base_revision.id if base_revision is not None else None,
+                "empty_chapter_baseline": empty_baseline,
             }
         ],
     )
@@ -2290,11 +3465,447 @@ def _apply_chapter_edit(
             after_json={
                 "chapter_id": chapter.id,
                 "draft_revision_id": revision.id,
-                "base_revision_id": base_revision.id,
+                "base_revision_id": base_revision.id if base_revision is not None else None,
+                "empty_chapter_baseline": empty_baseline,
             },
         )
     )
     return bundle, None
+
+
+_PROPOSAL_EDITABLE_STATUSES = {"pending", "proposed"}
+
+
+class ProposalNotEditableError(ValueError):
+    """Raised when a proposal is valid but no longer in an editable state."""
+
+
+# These values are part of the server-side proposal address, not suggested
+# story content.  A proposal edit may never redirect a mutation or weaken its
+# optimistic-concurrency baseline.  Some names are retained for old provider
+# payloads, but are still immutable once the proposal row exists.
+_PROPOSAL_IMMUTABLE_PATCH_KEYS = {
+    "id",
+    "project_id",
+    "change_set_id",
+    "operation",
+    "target",
+    "target_type",
+    "target_id",
+    "base_version",
+    "base_memory_epoch",
+    "chapter_id",
+    "base_revision_id",
+    "base_revision",
+    "source_revision_id",
+    "base_content_hash",
+    "content_hash",
+    "base_hash",
+    "selection",
+    "selection_start",
+    "selection_end",
+    "selection_hash",
+    "base_selection_hash",
+    "selected_text",
+    "empty_chapter_baseline",
+    # Graph references determine the endpoints of an edge/node.  They are
+    # deliberately not user-editable through a proposal-value endpoint.
+    "node_type",
+    "ref_id",
+    "character_id",
+    "plot_thread_id",
+    "source_node_id",
+    "target_node_id",
+    "source_character_id",
+    "target_character_id",
+    "source_character",
+    "target_character",
+    "source_name",
+    "target_name",
+    "source",
+    "from",
+    "to",
+    "from_name",
+    "to_name",
+    "related_to",
+    "with",
+    "other_character",
+    "related_character",
+    "relationships",
+    "relations",
+}
+
+_CHAPTER_EDITABLE_PATCH_KEYS = {
+    "replacement",
+    "new_text",
+    "content",
+    "new_content",
+}
+_EDGE_LEGACY_EDITABLE_PATCH_KEYS = {"relation", "relationship"}
+
+
+def _proposal_mutable_patch_keys(operation: str) -> set[str]:
+    if operation in {"create_character", "update_character", "upsert_character"}:
+        # ``goal``/``conflict`` are compatibility aliases accepted by the
+        # existing apply path and may therefore be edited when already
+        # present in a legacy proposal.
+        return CHARACTER_FIELDS | {"goal", "conflict"}
+    if operation == "update_project_settings":
+        return PROJECT_FIELDS
+    if operation in {"upsert_graph_node", "update_graph_node"}:
+        return NODE_FIELDS
+    if operation in {"upsert_graph_edge", "update_graph_edge"}:
+        return EDGE_FIELDS | _EDGE_LEGACY_EDITABLE_PATCH_KEYS
+    if operation in {"edit_chapter", "edit_chapter_selection"}:
+        return _CHAPTER_EDITABLE_PATCH_KEYS
+    return set()
+
+
+def _proposal_path_key(path: Any, existing: dict[str, Any]) -> str:
+    """Convert one shallow editor path to an existing proposal key.
+
+    The frontend uses plain keys (``name``), while accepting a one-segment
+    JSON pointer (``/name``) keeps the endpoint convenient for generic form
+    editors.  Nested pointers are intentionally rejected: they would create
+    new sub-paths inside an otherwise existing JSON field.
+    """
+
+    if not isinstance(path, str):
+        raise ValueError("提案字段路径必须是字符串")
+    raw = path.strip()
+    if not raw:
+        raise ValueError("提案字段路径不能为空")
+    if raw.startswith("/"):
+        if raw.count("/") != 1:
+            raise ValueError("提案只允许修改已有顶层字段")
+        key = raw[1:].replace("~1", "/").replace("~0", "~")
+    else:
+        key = raw
+        if "/" in key:
+            raise ValueError("提案只允许修改已有顶层字段")
+    if not key or key not in existing:
+        raise ValueError("只能修改提案中已有的字段")
+    return key
+
+
+def _proposal_patch_value_is_json_safe(value: Any) -> None:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("提案字段值必须是有效的 JSON 值") from exc
+    if len(encoded) > 1_000_000:
+        raise ValueError("提案字段值超过长度限制")
+
+
+def _validate_edited_proposal_patch(
+    proposal: Proposal,
+    patch_operations: list[Any],
+) -> dict[str, Any]:
+    """Apply editor operations to a proposal copy after strict path checks."""
+
+    operation = str(proposal.operation or "")
+    if operation not in ALLOWED_OPERATIONS:
+        raise ValueError("不支持编辑该提案操作")
+    original = proposal.patch_json
+    if not isinstance(original, dict) or not original:
+        raise ValueError("提案没有可编辑的字段")
+    allowed = _proposal_mutable_patch_keys(operation)
+    if not allowed:
+        raise ValueError("不支持编辑该提案操作")
+
+    result = dict(original)
+    seen: set[str] = set()
+    for item in patch_operations:
+        # Pydantic request models expose attributes; accepting a mapping keeps
+        # the service useful to internal callers and tests without weakening
+        # the HTTP schema's extra-field checks.
+        if isinstance(item, dict):
+            item_op = item.get("op", "replace")
+            item_path = item.get("path")
+            item_value = item.get("value")
+            value_supplied = "value" in item
+        else:
+            item_op = getattr(item, "op", "replace")
+            item_path = getattr(item, "path", None)
+            item_value = getattr(item, "value", None)
+            value_supplied = "value" in getattr(item, "model_fields_set", {"value"})
+        key = _proposal_path_key(item_path, original)
+        if key in seen:
+            raise ValueError("同一提案字段不能重复修改")
+        seen.add(key)
+        if key in _PROPOSAL_IMMUTABLE_PATCH_KEYS or key not in allowed:
+            raise ValueError("该提案字段为只读或不允许修改")
+        if item_op not in {"add", "replace", "remove"}:
+            raise ValueError("不支持的提案字段操作")
+        if item_op == "remove":
+            result.pop(key, None)
+            continue
+        if not value_supplied:
+            raise ValueError("replace/add 操作必须提供字段值")
+        _proposal_patch_value_is_json_safe(item_value)
+        # ``add`` is accepted only for an existing key (checked above), so it
+        # cannot extend the proposal's patch surface.  It has replace
+        # semantics here, which is what shallow form editors expect.
+        result[key] = item_value
+
+    if not result:
+        raise ValueError("提案至少需要保留一个字段")
+    if operation in {"create_character", "update_character", "upsert_character"}:
+        requires_name = operation == "create_character" or (
+            operation == "upsert_character" and not proposal.target_id
+        )
+        if requires_name and (
+            "name" not in result
+            or not isinstance(result.get("name"), str)
+            or not result["name"].strip()
+        ):
+            raise ValueError("人物提案必须保留非空 name")
+        if "name" in result and (
+            not isinstance(result.get("name"), str) or not result["name"].strip()
+        ):
+            raise ValueError("人物提案中的 name 不能为空")
+    if operation in {"edit_chapter", "edit_chapter_selection"}:
+        replacement_keys = _CHAPTER_EDITABLE_PATCH_KEYS & set(result)
+        if not any(isinstance(result.get(key), str) for key in replacement_keys):
+            raise ValueError("正文提案必须保留 replacement 或新正文")
+    return result
+
+
+def _proposal_entity_for_version(
+    db: Session, project: Project, proposal: Proposal
+) -> Any | None:
+    if proposal.base_version is None or not proposal.target_id:
+        return None
+    if proposal.operation in {"create_character", "update_character", "upsert_character"}:
+        model = Character
+    elif proposal.operation in {"update_graph_node", "upsert_graph_node"}:
+        model = StoryGraphNode
+    elif proposal.operation in {"update_graph_edge", "upsert_graph_edge"}:
+        model = StoryGraphEdge
+    else:
+        return None
+    return db.scalar(
+        select(model)
+        .where(model.id == proposal.target_id, model.project_id == project.id)
+        .with_for_update()
+    )
+
+
+def _chapter_proposal_conflict(
+    db: Session, project: Project, proposal: Proposal
+) -> str | None:
+    """Return a stale-base reason for a chapter proposal, if any."""
+
+    if proposal.operation not in {"edit_chapter", "edit_chapter_selection"}:
+        return None
+    patch = proposal.patch_json if isinstance(proposal.patch_json, dict) else {}
+    chapter_id = str(proposal.target_id or patch.get("chapter_id") or "")
+    if not chapter_id:
+        return "正文提案缺少章节目标"
+    chapter = db.scalar(
+        select(Chapter)
+        .where(Chapter.id == chapter_id, Chapter.project_id == project.id)
+        .with_for_update()
+    )
+    if chapter is None:
+        return "章节不存在或不属于当前项目"
+    if patch.get("empty_chapter_baseline") is True:
+        if chapter.current_revision_id:
+            return "章节正文已被其他窗口更新，请重新生成提案"
+        revisions = db.scalars(
+            select(ChapterRevision.content).where(ChapterRevision.chapter_id == chapter.id)
+        ).all()
+        if any(str(content or "").strip() for content in revisions):
+            return "章节正文已被其他窗口更新，请重新生成提案"
+        empty_hash = _hash_text("")
+        if patch.get("base_revision_id") not in (None, ""):
+            return "空白章节基线已变化，请重新生成提案"
+        if str(
+            patch.get("base_content_hash")
+            or patch.get("content_hash")
+            or patch.get("base_hash")
+            or ""
+        ) != empty_hash:
+            return "空白章节基线已变化，请重新生成提案"
+        if _patch_int(patch, "selection_start", "start", default=0) != 0:
+            return "空白章节选区已变化，请重新生成提案"
+        if _patch_int(patch, "selection_end", "end", default=0) != 0:
+            return "空白章节选区已变化，请重新生成提案"
+        if str(patch.get("selection_hash") or patch.get("base_selection_hash") or "") != empty_hash:
+            return "空白章节选区已变化，请重新生成提案"
+        return None
+
+    base_revision_id = str(
+        patch.get("base_revision_id")
+        or patch.get("base_revision")
+        or patch.get("source_revision_id")
+        or ""
+    )
+    if not base_revision_id:
+        return "正文提案缺少正文基线"
+    base_revision = db.scalar(
+        select(ChapterRevision).where(
+            ChapterRevision.id == base_revision_id,
+            ChapterRevision.chapter_id == chapter.id,
+        )
+    )
+    if base_revision is None:
+        return "正文基准修订不存在或不属于当前章节"
+    if chapter.current_revision_id != base_revision.id:
+        return "章节正文已被其他窗口更新，请重新生成提案"
+    supplied_hash = str(
+        patch.get("base_content_hash")
+        or patch.get("content_hash")
+        or patch.get("base_hash")
+        or ""
+    )
+    actual_hash = ChapterRevision.hash_content(base_revision.content)
+    if supplied_hash != actual_hash or base_revision.content_hash != actual_hash:
+        return "正文基准内容已变化，请重新生成提案"
+    return None
+
+
+def _mark_proposal_conflict(db: Session, proposal: Proposal, reason: str) -> None:
+    proposal.status = "conflict"
+    proposal.conflict_reason = reason[:2000]
+    proposal.resolved_at = utcnow()
+    db.commit()
+
+
+def _sync_change_set_patch(
+    change_set: ChangeSet,
+    proposal: Proposal,
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> None:
+    """Keep the denormalised ChangeSet preview in step with Proposal.patch_json."""
+
+    changes = change_set.changes_json
+    if not isinstance(changes, list):
+        return
+    updated = list(changes)
+    for index, item in enumerate(updated):
+        if not isinstance(item, dict):
+            continue
+        if (
+            item.get("operation") != proposal.operation
+            or item.get("target_type") != proposal.target_type
+            or item.get("target_id") != proposal.target_id
+        ):
+            continue
+        if item.get("patch") == before:
+            replacement = dict(item)
+            replacement["patch"] = dict(after)
+            updated[index] = replacement
+            change_set.changes_json = updated
+            return
+        if item.get("patch_json") == before:
+            replacement = dict(item)
+            replacement["patch_json"] = dict(after)
+            updated[index] = replacement
+            change_set.changes_json = updated
+            return
+
+
+def update_proposal(
+    db: Session,
+    proposal: Proposal,
+    user: User,
+    patch_operations: list[Any],
+    *,
+    expected_version: int | None = None,
+    expected_memory_epoch: int | None = None,
+) -> Proposal:
+    """Edit only suggested values of a tenant-owned pending assistant draft.
+
+    This deliberately does not call any story mutation helper.  The returned
+    row remains a normal ``proposed`` Proposal and must still pass the regular
+    CAS-protected ``apply_proposal`` path.
+    """
+
+    project = db.scalar(
+        select(Project)
+        .where(Project.id == proposal.project_id, Project.owner_id == user.id)
+        .with_for_update()
+    )
+    if project is None:
+        raise LookupError("项目不存在")
+    locked = db.scalar(
+        select(Proposal)
+        .where(Proposal.id == proposal.id, Proposal.project_id == project.id)
+        .with_for_update()
+    )
+    if locked is None:
+        raise LookupError("提案不存在")
+    proposal = locked
+    if proposal.status not in _PROPOSAL_EDITABLE_STATUSES:
+        raise ProposalNotEditableError("该提案当前不可编辑")
+    change_set = db.scalar(
+        select(ChangeSet)
+        .where(ChangeSet.id == proposal.change_set_id, ChangeSet.project_id == project.id)
+        .with_for_update()
+    )
+    if change_set is None:
+        raise LookupError("提案所属变更集不存在")
+    if change_set.status not in {"pending", "proposed"}:
+        raise ProposalNotEditableError("该提案所属变更集已处理")
+
+    current_epoch = int(project.memory_epoch or 0)
+    if expected_memory_epoch is not None and current_epoch != int(expected_memory_epoch):
+        reason = "故事记忆版本已变化，请重新生成提案"
+        _mark_proposal_conflict(db, proposal, reason)
+        raise RuntimeError(reason)
+    if proposal.base_memory_epoch is not None and current_epoch != int(proposal.base_memory_epoch):
+        reason = "故事记忆版本已变化，请重新生成提案"
+        _mark_proposal_conflict(db, proposal, reason)
+        raise RuntimeError(reason)
+    if expected_memory_epoch is not None and proposal.base_memory_epoch is not None and int(
+        expected_memory_epoch
+    ) != int(proposal.base_memory_epoch):
+        reason = "客户端提交的记忆版本与提案基线不一致"
+        _mark_proposal_conflict(db, proposal, reason)
+        raise RuntimeError(reason)
+    if expected_version is not None:
+        if proposal.base_version is None or int(expected_version) != int(proposal.base_version):
+            reason = "客户端提交的实体版本与提案基线不一致"
+            _mark_proposal_conflict(db, proposal, reason)
+            raise RuntimeError(reason)
+    if proposal.base_version is not None:
+        entity = _proposal_entity_for_version(db, project, proposal)
+        if entity is None or getattr(entity, "version", None) != proposal.base_version:
+            reason = "实体已被其他窗口更新或删除"
+            _mark_proposal_conflict(db, proposal, reason)
+            raise RuntimeError(reason)
+    chapter_conflict = _chapter_proposal_conflict(db, project, proposal)
+    if chapter_conflict is not None:
+        _mark_proposal_conflict(db, proposal, chapter_conflict)
+        raise RuntimeError(chapter_conflict)
+
+    before = dict(proposal.patch_json or {})
+    after = _validate_edited_proposal_patch(proposal, patch_operations)
+    proposal.patch_json = after
+    # A legacy/pending row becomes the same applyable state used by the
+    # existing endpoint after a successful edit.  ``building`` is excluded so
+    # an interrupted streaming proposal cannot be manually made applyable.
+    proposal.status = "proposed"
+    if change_set.status == "pending":
+        change_set.status = "proposed"
+    _sync_change_set_patch(change_set, proposal, before, after)
+    db.add(
+        AuditLog(
+            project_id=project.id,
+            actor_user_id=user.id,
+            actor=user.username or user.email or user.id,
+            action="assistant.proposal_edited",
+            entity_type="proposal",
+            entity_id=proposal.id,
+            before_json={"patch": before},
+            after_json={"patch": after, "status": proposal.status},
+        )
+    )
+    db.commit()
+    db.refresh(proposal)
+    return proposal
 
 
 def apply_proposal(

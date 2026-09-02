@@ -339,6 +339,19 @@ export interface AgentPatch {
   confidence?: number;
 }
 
+export interface AssistantProposalUpdatePatch {
+  op: "add" | "replace" | "remove";
+  path: string;
+  value?: unknown;
+}
+
+export interface AssistantProposalActionDetail {
+  projectId?: string;
+  proposalId: string;
+  action: "apply" | "reject";
+  patches?: AssistantProposalUpdatePatch[];
+}
+
 export interface AgentSelectionSnapshot {
   chapter_id: string;
   base_revision_id?: string | null;
@@ -360,10 +373,13 @@ export interface AgentContextSnapshot {
 }
 
 export type AssistantProposalStatus =
+  | "building"
   | "proposed"
   | "applying"
   | "applied"
-  | "rejected";
+  | "rejected"
+  | "conflict"
+  | "stale";
 
 export interface AssistantProposal {
   id: string;
@@ -384,6 +400,7 @@ export interface AssistantProposal {
 
 export interface AssistantMessage {
   id: string;
+  run_id?: string | null;
   role: "user" | "assistant" | "system";
   content: string;
   created_at?: string;

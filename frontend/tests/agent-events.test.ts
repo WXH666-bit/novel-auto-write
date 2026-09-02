@@ -4,6 +4,7 @@ import {
   normalizeAssistantEvent,
   normalizeAssistantRun,
 } from "../src/api";
+import { classifyLiveAgentEvent } from "../src/StoryStudio";
 
 describe("assistant event protocol", () => {
   it("keeps running for run-stage events and run snapshots", () => {
@@ -26,6 +27,105 @@ describe("assistant event protocol", () => {
         stage: "drafting",
       }),
     ).toMatchObject({ id: "run-1", status: "running", stage: "drafting" });
+  });
+
+  it("does not turn a completed reply into a second status notice", () => {
+    const event = normalizeAssistantEvent({
+      sequence: 9,
+      event_type: "run.completed",
+      payload_json: {
+        status: "completed",
+        reply: "已整理人物设定。",
+      },
+    });
+
+    expect(event).toMatchObject({ type: "status", status: "idle" });
+    expect(event.message).toBeUndefined();
+  });
+
+  it("only follows proposals emitted after this send's cursor and run", () => {
+    const pending = {
+      conversationId: "conversation-1",
+      baselineSequence: 20,
+      runId: "run-live",
+    };
+    expect(
+      classifyLiveAgentEvent(
+        { sequence: 19, run_id: "run-live" },
+        "conversation-1",
+        pending,
+        new Set(["run-old"]),
+      ),
+    ).toBe("stale");
+    expect(
+      classifyLiveAgentEvent(
+        { sequence: 21, run_id: "run-old" },
+        "conversation-1",
+        pending,
+        new Set(["run-old"]),
+      ),
+    ).toBe("stale");
+    expect(
+      classifyLiveAgentEvent(
+        { sequence: 21, run_id: "run-live" },
+        "conversation-1",
+        pending,
+        new Set(["run-old"]),
+      ),
+    ).toBe("current");
+  });
+
+  it("buffers legacy proposal frames that omit run_id", () => {
+    expect(
+      classifyLiveAgentEvent(
+        { sequence: 21 },
+        "conversation-1",
+        {
+          conversationId: "conversation-1",
+          baselineSequence: 20,
+          runId: "",
+        },
+        new Set(["run-old"]),
+      ),
+    ).toBe("awaiting-run");
+  });
+
+  it("keeps character relations as graph targets instead of character cards", () => {
+    const event = normalizeAssistantEvent({
+      sequence: 10,
+      event_type: "proposal.created",
+      payload_json: {
+        operation: "upsert_graph_edge",
+        proposal: {
+          id: "proposal-edge",
+          conversation_id: "conversation-1",
+          target: { type: "character_relation", id: "" },
+          patches: [],
+          status: "building",
+        },
+      },
+    });
+
+    expect(event.type).toBe("proposal_created");
+    if (event.type === "proposal_created") {
+      expect(event.proposal.target.type).toBe("relationship");
+      expect(event.proposal.operation).toBe("upsert_graph_edge");
+      expect(event.proposal.status).toBe("building");
+    }
+  });
+
+  it("keeps the durable run id on proposal events used for live following", () => {
+    const event = normalizeAssistantEvent({
+      sequence: 12,
+      run_id: "run-live",
+      event_type: "proposal.patch",
+      payload_json: {
+        proposal_id: "proposal-1",
+        patch: { path: "name", value: "青萝" },
+      },
+    });
+
+    expect(event.run_id).toBe("run-live");
   });
 
   it("inherits outer metadata when proposal.created nests a partial proposal", () => {

@@ -786,7 +786,13 @@ def _validate_schema(value: Any, schema: Mapping[str, Any], path: str = "$") -> 
         "boolean": isinstance(value, bool),
         "null": value is None,
     }
-    if expected in valid and not valid[expected]:
+    if isinstance(expected, list):
+        allowed = [item for item in expected if isinstance(item, str) and item in valid]
+        if allowed and not any(valid[item] for item in allowed):
+            raise StructuredOutputError(
+                f"结构化输出 {path} 应为 {' 或 '.join(allowed)}"
+            )
+    elif isinstance(expected, str) and expected in valid and not valid[expected]:
         raise StructuredOutputError(f"结构化输出 {path} 应为 {expected}")
     if isinstance(value, dict):
         for field in schema.get("required", []):

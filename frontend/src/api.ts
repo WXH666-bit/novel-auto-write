@@ -7,6 +7,7 @@ import type {
   AssistantEvent,
   AssistantMessage,
   AssistantProposal,
+  AssistantProposalUpdatePatch,
   AssistantRun,
   CanonItem,
   CharacterCard,
@@ -1020,7 +1021,7 @@ export async function sendAssistantMessage(
     expected_version?: number;
     idempotency_key?: string;
   } = {},
-): Promise<AssistantMessage> {
+): Promise<{ message: AssistantMessage; run: AssistantRun }> {
   const payload = await apiRequest<unknown>(
     `/projects/${projectId}/assistant/conversations/${conversationId}/messages`,
     {
@@ -1037,8 +1038,13 @@ export async function sendAssistantMessage(
       }),
     },
   );
-  const message = unwrap<unknown>(payload, ["message", "data"]);
-  return normalizeAssistantMessage(message);
+  const record = (payload && typeof payload === "object"
+    ? payload
+    : {}) as Record<string, unknown>;
+  return {
+    message: normalizeAssistantMessage(record.message),
+    run: normalizeAssistantRun(record.run),
+  };
 }
 
 export async function applyAssistantProposal(
@@ -1084,6 +1090,22 @@ export async function rejectAssistantProposal(
       {
         method: "POST",
         body: JSON.stringify(options.reason ? { reason: options.reason } : {}),
+      },
+    ),
+  );
+}
+
+export async function updateAssistantProposal(
+  projectId: string,
+  proposalId: string,
+  patches: AssistantProposalUpdatePatch[],
+): Promise<AssistantProposal> {
+  return normalizeAssistantProposal(
+    await apiRequest<unknown>(
+      `/projects/${projectId}/assistant/proposals/${proposalId}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ patches }),
       },
     ),
   );
@@ -2404,15 +2426,15 @@ function normalizeAgentTarget(value: unknown): AgentTarget {
     raw.type ?? raw.target_type ?? raw.targetType ?? "project",
   ).toLowerCase();
   const type =
-    rawType.includes("character") || rawType === "person"
-      ? "character"
-      : rawType.includes("chapter") || rawType.includes("selection")
+    rawType.includes("relation") || rawType.includes("edge")
+      ? "relationship"
+      : rawType.includes("character") || rawType === "person"
+        ? "character"
+        : rawType.includes("chapter") || rawType.includes("selection")
         ? "chapter"
         : rawType.includes("thread") || rawType.includes("plot")
           ? "thread"
-          : rawType.includes("relation") || rawType.includes("edge")
-            ? "relationship"
-            : "project";
+          : "project";
   return {
     type,
     id: String(raw.id ?? raw.target_id ?? raw.targetId ?? ""),
@@ -2443,6 +2465,10 @@ function normalizeAssistantMessage(value: unknown): AssistantMessage {
   const role = String(raw.role ?? "assistant");
   return {
     id: String(raw.id ?? raw.message_id ?? crypto.randomUUID()),
+    run_id:
+      raw.run_id === null
+        ? null
+        : String(raw.run_id ?? raw.runId ?? "") || undefined,
     role: role === "user" || role === "system" ? role : "assistant",
     content: String(raw.content ?? raw.text ?? ""),
     status: String(raw.status ?? "") || undefined,
@@ -2466,12 +2492,24 @@ function normalizeAssistantMessage(value: unknown): AssistantMessage {
 
 function normalizeAssistantProposal(value: unknown): AssistantProposal {
   const raw = (value || {}) as Record<string, unknown>;
-  const rawStatus = String(raw.status ?? "proposed");
-  const status = (
-    ["proposed", "applying", "applied", "rejected"] as const
-  ).includes(rawStatus as AssistantProposal["status"])
-    ? (rawStatus as AssistantProposal["status"])
-    : "proposed";
+  const rawStatus = String(raw.status ?? "proposed").toLowerCase();
+  // The worker uses `pending` while a proposal is being assembled. Keep that
+  // state distinct from an actionable proposal so the central controls cannot
+  // accidentally apply an incomplete row. Conflict/stale rows remain
+  // inspectable in durable history but are never rendered as live drafts.
+  const status = rawStatus === "pending"
+    ? "building"
+    : ([
+        "building",
+        "proposed",
+        "applying",
+        "applied",
+        "rejected",
+        "conflict",
+        "stale",
+      ] as const).includes(rawStatus as AssistantProposal["status"])
+      ? (rawStatus as AssistantProposal["status"])
+      : "proposed";
   const patchJson =
     raw.patch_json && typeof raw.patch_json === "object"
       ? (raw.patch_json as Record<string, unknown>)
@@ -2740,7 +2778,11 @@ export function normalizeAssistantEvent(value: unknown): AssistantEvent {
     type: "status",
     status,
     stage: String(payload.stage ?? "") || undefined,
-    message: String(payload.message ?? payload.reply ?? "") || undefined,
+    // `run.completed` carries the final assistant reply for transport and
+    // audit purposes. It is not a status notice: surfacing the reply here
+    // makes the panel render the same text twice (message card + notice).
+    // Only an explicit status message belongs in the notice region.
+    message: String(payload.message ?? "") || undefined,
   };
 }
 

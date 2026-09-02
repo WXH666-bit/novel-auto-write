@@ -11,6 +11,8 @@ export interface MockRequest {
 export interface MockStoryApiOptions {
   /** Projects returned by the first library request. An empty list is used by default. */
   initialProjects?: Array<JsonRecord>;
+  /** Optional proposal emitted by the mocked Agent after the next message. */
+  assistantProposal?: JsonRecord;
 }
 
 export interface MockStoryApiState {
@@ -556,7 +558,25 @@ export async function mockStoryApi(
             const userMessage = { id: "user-message-1", role: "user", content, target, context_snapshot: input.context_snapshot || {}, authorized_asset_ids: input.authorized_asset_ids || [], proposal_ids: ["proposal-1"], created_at: now };
             const assistantMessage = { id: "assistant-message-1", role: "assistant", content: "已整理人物设定。", proposal_ids: ["proposal-1"], created_at: now };
             data.messages = [userMessage, assistantMessage];
-            data.proposals = [{ id: "proposal-1", conversation_id: conversationId, target, summary: "补充人物动机", patches: [{ path: "motivation", value: "守护灯塔", label: "深层动机" }], status: "proposed", created_at: now }];
+            data.proposals = [
+              options.assistantProposal
+                ? {
+                    ...clone(options.assistantProposal),
+                    conversation_id: conversationId,
+                    created_at: now,
+                  }
+                : {
+                    id: "proposal-1",
+                    conversation_id: conversationId,
+                    target,
+                    summary: "补充人物动机",
+                    patches: [
+                      { path: "motivation", value: "守护灯塔", label: "深层动机" },
+                    ],
+                    status: "proposed",
+                    created_at: now,
+                  },
+            ];
             await json(route, { message: userMessage, run: { id: "assistant-run-1", status: "running" } }, 202);
             return;
           }
@@ -567,6 +587,25 @@ export async function mockStoryApi(
         }
         if (assistantPart === "proposals" && parts.length === 4 && method === "GET") {
           await json(route, { proposals: clone(data.proposals) });
+          return;
+        }
+        if (assistantPart === "proposals" && parts.length === 5 && method === "PATCH") {
+          const proposalId = parts[4];
+          const proposal = data.proposals.find((item) => item.id === proposalId);
+          if (!proposal) { await json(route, { detail: "proposal not found" }, 404); return; }
+          const input = bodyRecord(body);
+          const edits = Array.isArray(input.patches) ? input.patches.map(bodyRecord) : [];
+          const proposalPatches = Array.isArray(proposal.patches)
+            ? (proposal.patches as JsonRecord[])
+            : [];
+          for (const edit of edits) {
+            const path = String(edit.path || "").replace(/^\//, "");
+            const patch = proposalPatches.find(
+              (candidate) => String(candidate.path || "").replace(/^\//, "") === path,
+            );
+            if (patch) patch.value = edit.value;
+          }
+          await json(route, proposal);
           return;
         }
         if (assistantPart === "proposals" && parts.length === 6 && method === "POST") {

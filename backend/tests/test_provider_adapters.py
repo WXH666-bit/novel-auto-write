@@ -17,6 +17,32 @@ from backend.app.services import providers
 from backend.app.services.generation import create_generation_run
 
 
+def test_parse_structured_accepts_json_schema_union_types() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"target_id": {"type": ["string", "null"]}},
+        "required": ["target_id"],
+    }
+
+    assert providers.parse_structured('{"target_id":null}', schema) == {
+        "target_id": None
+    }
+    assert providers.parse_structured('{"target_id":"character-1"}', schema) == {
+        "target_id": "character-1"
+    }
+
+
+def test_parse_structured_rejects_values_outside_union_types() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"target_id": {"type": ["string", "null"]}},
+        "required": ["target_id"],
+    }
+
+    with pytest.raises(providers.StructuredOutputError, match="string.*null"):
+        providers.parse_structured('{"target_id":42}', schema)
+
+
 def _profile(**overrides: object) -> SimpleNamespace:
     values: dict[str, object] = {
         "id": "provider-1",

@@ -6,8 +6,14 @@ import {
   storyProjectFixture,
 } from "./support/story-api";
 
-async function openStudio(page: Page) {
-  const mock = await mockStoryApi(page, { initialProjects: [storyProjectFixture] });
+async function openStudio(
+  page: Page,
+  assistantProposal?: Record<string, unknown>,
+) {
+  const mock = await mockStoryApi(page, {
+    initialProjects: [storyProjectFixture],
+    assistantProposal,
+  });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "我的小说" })).toBeVisible();
   await page.getByRole("button", { name: "打开雾中灯塔" }).click();
@@ -60,7 +66,7 @@ test.describe("双栏协作台核心流程", () => {
       .toBeGreaterThan(0);
   });
 
-  test("Agent 对话展示实时提案并可应用到人物表格", async ({ page }) => {
+  test("Agent 改动直接显示在人物字段并可就地修改后接受", async ({ page }) => {
     const mock = await openStudio(page);
     await page.getByRole("button", { name: /^人物/ }).first().click();
     await expect(page.getByRole("button", { name: "打开人物林渡" })).toBeVisible();
@@ -69,14 +75,131 @@ test.describe("双栏协作台核心流程", () => {
     await composer.fill("补充人物动机");
     await page.getByRole("button", { name: "发送" }).click();
 
-    await expect(page.getByText("实时提案", { exact: true })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText("Agent 草稿", { exact: false }).first()).toBeVisible();
-    await expect(page.getByText("守护灯塔", { exact: true }).first()).toBeVisible();
+    await expect(page.getByText("改动已显示在当前内容", { exact: true })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText("实时提案", { exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "跟随 Agent 草稿" })).toHaveCount(0);
+    const characterField = page
+      .locator(".character-field")
+      .filter({ hasText: "深层动机" });
+    const inlineDraft = characterField.locator(".agent-field-draft");
+    await expect(inlineDraft).toBeVisible();
+    await expect(inlineDraft).toContainText("守护灯塔");
     await expect(page.getByLabel("深层动机")).toHaveValue("守住不该被遗忘的真相");
-    await expect(page.getByRole("button", { name: "应用到表格" })).toBeVisible();
-    await page.getByRole("button", { name: "应用到表格" }).click();
+    await inlineDraft.getByRole("button", { name: "手动修改" }).click();
+    await page
+      .getByRole("textbox", { name: "深层动机 Agent 草稿手动修改" })
+      .fill("守住最后一束灯光");
+    await inlineDraft.getByRole("button", { name: "接受改动" }).click();
+    await expect.poll(
+      () => mock.requests.some(
+        (request) =>
+          request.method === "PATCH" &&
+          request.path === "/projects/project-1/assistant/proposals/proposal-1" &&
+          JSON.stringify(request.body).includes("守住最后一束灯光"),
+      ),
+    ).toBe(true);
     await expect.poll(
       () => mock.requests.some((request) => request.method === "POST" && request.path.includes("/assistant/proposals/proposal-1/apply")),
+    ).toBe(true);
+  });
+
+  test("Agent 正文草稿在稿纸下实时出现并支持手动修改", async ({ page }) => {
+    const mock = await openStudio(page, {
+      id: "chapter-proposal-1",
+      operation: "edit_chapter",
+      target_type: "chapter",
+      target_id: "chapter-1",
+      target: { type: "chapter", id: "chapter-1" },
+      summary: "补写灯塔异响",
+      patches: [
+        {
+          path: "new_content",
+          value: "林渡在雾里看见灯塔亮起。楼梯深处传来三声敲击。",
+          label: "完整草稿",
+        },
+      ],
+      status: "proposed",
+      base_version: 1,
+      base_memory_epoch: 3,
+    });
+
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("在这一章补一段异响");
+    await page.getByRole("button", { name: "发送" }).click();
+
+    const draft = page.getByRole("region", {
+      name: "Agent 正文草稿（待确认）",
+    });
+    await expect(draft).toBeVisible({ timeout: 15_000 });
+    await expect(draft).toContainText("楼梯深处传来三声敲击");
+    await draft.getByRole("button", { name: "手动修改" }).click();
+    const editor = draft.getByRole("textbox", { name: "Agent 正文草稿预览" });
+    await expect(editor).toBeEditable();
+    await editor.fill("林渡在雾里看见灯塔亮起。楼梯深处传来两声敲击。");
+    await draft.getByRole("button", { name: "接受改动" }).click();
+
+    await expect.poll(() =>
+      mock.requests.some(
+        (request) =>
+          request.method === "PATCH" &&
+          request.path ===
+            "/projects/project-1/assistant/proposals/chapter-proposal-1" &&
+          JSON.stringify(request.body).includes("两声敲击"),
+      ),
+    ).toBe(true);
+    await expect.poll(() =>
+      mock.requests.some(
+        (request) =>
+          request.method === "POST" &&
+          request.path.includes("/chapter-proposal-1/apply"),
+      ),
+    ).toBe(true);
+  });
+
+  test("Agent 关系草稿直接画进图谱并在图上处理", async ({ page }) => {
+    const mock = await openStudio(page, {
+      id: "edge-proposal-1",
+      operation: "upsert_graph_edge",
+      target_type: "relationship",
+      target: { type: "relationship", id: "" },
+      summary: "增加追查阻力",
+      patches: [
+        { path: "source_node_id", value: "node-char-1", label: "来源" },
+        { path: "target_node_id", value: "node-thread-1", label: "目标" },
+        { path: "relation_type", value: "互相试探", label: "关系类型" },
+        { path: "label", value: "隐瞒线索", label: "关系标签" },
+      ],
+      status: "proposed",
+      base_memory_epoch: 3,
+    });
+    await page.getByRole("button", { name: "故事图谱" }).click();
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("让林渡和灯塔秘密之间更有张力");
+    await page.getByRole("button", { name: "发送" }).click();
+
+    const graphDraft = page
+      .locator(".story-graph-agent-draft")
+      .filter({ hasText: "隐瞒线索" });
+    await expect(graphDraft).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator(".react-flow__edge.agent-draft-edge")).toHaveCount(1, {
+      timeout: 15_000,
+    });
+    await graphDraft.getByRole("button", { name: "手动修改" }).click();
+    await graphDraft
+      .getByRole("textbox", { name: "关系标签 Agent 草稿手动修改" })
+      .fill("隐瞒真相");
+    await graphDraft.getByRole("button", { name: "接受改动" }).click();
+
+    await expect.poll(() =>
+      mock.requests.some(
+        (request) =>
+          request.method === "PATCH" &&
+          request.path ===
+            "/projects/project-1/assistant/proposals/edge-proposal-1" &&
+          JSON.stringify(request.body).includes("隐瞒真相"),
+      ),
     ).toBe(true);
   });
 
@@ -260,10 +383,12 @@ test.describe("双栏协作台核心流程", () => {
       .getByRole("button", { name: /自动分析补充人物动机/ })
       .click();
 
-    await expect(page.getByText("自动分析补充人物动机", { exact: true })).toBeVisible();
-    await expect(page.getByText("Agent 草稿", { exact: false }).first()).toBeVisible();
-    await expect(page.getByText("守住雾港居民的共同秘密", { exact: true }).first()).toBeVisible();
-    await page.getByRole("button", { name: "应用到表格" }).click();
+    const inlineDraft = page
+      .locator(".agent-field-draft")
+      .filter({ hasText: "守住雾港居民的共同秘密" });
+    await expect(inlineDraft).toBeVisible();
+    await expect(page.getByText("改动已显示在当前内容", { exact: true })).toBeVisible();
+    await inlineDraft.getByRole("button", { name: "接受改动" }).click();
     await expect.poll(() => applied).toBe(true);
   });
 });

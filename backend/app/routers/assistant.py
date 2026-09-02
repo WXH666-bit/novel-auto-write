@@ -42,14 +42,17 @@ from ..schemas import (
     ProposalBatchRequest,
     ProposalRead,
     ProposalRejectRequest,
+    ProposalUpdateRequest,
 )
 from ..security import get_current_user, user_id_of
 from ..services.assistant import (
+    ProposalNotEditableError,
     add_event,
     apply_proposal,
     create_conversation,
     create_message_run,
     reject_proposal,
+    update_proposal,
 )
 from ..services.providers import normalize_capabilities, parse_capability_bool
 from . import require_project
@@ -939,6 +942,97 @@ def list_change_sets(
         select(ChangeSet).where(ChangeSet.project_id == project.id).order_by(ChangeSet.created_at.desc())
     ).all()
     return [ChangeSetRead.model_validate(row) for row in rows]
+
+
+def _update(
+    proposal_id: str,
+    payload: ProposalUpdateRequest,
+    current_user: User,
+    db: Session,
+) -> ProposalRead:
+    proposal = _proposal(db, proposal_id, current_user)
+    try:
+        proposal = update_proposal(
+            db,
+            proposal,
+            current_user,
+            payload.patches,
+            expected_version=payload.expected_version,
+            expected_memory_epoch=payload.expected_memory_epoch,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "proposal_conflict", "message": str(exc)},
+        ) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProposalNotEditableError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "proposal_not_editable", "message": str(exc)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "proposal_patch_invalid", "message": str(exc)},
+        ) from exc
+    return ProposalRead.model_validate(proposal)
+
+
+@router.patch(
+    "/projects/{project_id}/assistant/proposals/{proposal_id}",
+    response_model=ProposalRead,
+)
+def update_project_proposal(
+    project_id: str,
+    proposal_id: str,
+    payload: ProposalUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProposalRead:
+    project = require_project(db, project_id, current_user)
+    proposal = _proposal(db, proposal_id, current_user)
+    if proposal.project_id != project.id:
+        raise HTTPException(status_code=404, detail="提案不存在")
+    return _update(proposal_id, payload, current_user, db)
+
+
+@router.patch("/assistant/proposals/{proposal_id}", response_model=ProposalRead)
+def update_proposal_direct(
+    proposal_id: str,
+    payload: ProposalUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProposalRead:
+    return _update(proposal_id, payload, current_user, db)
+
+
+@router.patch(
+    "/projects/{project_id}/assistant/conversations/{conversation_id}/proposals/{proposal_id}",
+    response_model=ProposalRead,
+    include_in_schema=False,
+)
+def update_conversation_proposal(
+    project_id: str,
+    conversation_id: str,
+    proposal_id: str,
+    payload: ProposalUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProposalRead:
+    project = require_project(db, project_id, current_user)
+    conversation = _conversation(db, project, conversation_id)
+    proposal = _proposal(db, proposal_id, current_user)
+    source_run = db.scalar(
+        select(AgentRun).where(
+            AgentRun.id == proposal.change_set.source_id,
+            AgentRun.conversation_id == conversation.id,
+        )
+    )
+    if proposal.project_id != project.id or source_run is None:
+        raise HTTPException(status_code=404, detail="提案不存在")
+    return _update(proposal_id, payload, current_user, db)
 
 
 def _apply(

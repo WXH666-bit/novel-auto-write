@@ -769,6 +769,34 @@ class ProposalApplyRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
 
 
+class ProposalPatchOperation(BaseModel):
+    """One safe edit to an already persisted assistant proposal patch.
+
+    The service deliberately treats ``path`` as a proposal-field key rather
+    than as a general JSON-patch pointer.  Keeping the transport explicit is
+    useful for the editor, while the server still decides which paths are
+    mutable and whether their values are safe to apply.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["add", "replace", "remove"] = "replace"
+    path: str = Field(min_length=1, max_length=255)
+    value: Any = None
+
+
+class ProposalUpdateRequest(BaseModel):
+    """Change values in a pending/proposed assistant draft only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    patches: list[ProposalPatchOperation] = Field(min_length=1, max_length=50)
+    # Optional optimistic-concurrency assertions.  The proposal's persisted
+    # base values remain authoritative and can never be changed by this body.
+    expected_version: int | None = Field(default=None, ge=1)
+    expected_memory_epoch: int | None = Field(default=None, ge=0)
+
+
 class ProposalRejectRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
 

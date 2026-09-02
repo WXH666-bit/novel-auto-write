@@ -6,6 +6,7 @@ import {
   motion,
   useReducedMotion,
 } from "motion/react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import {
   addEdge,
   Background,
@@ -71,6 +72,7 @@ import {
   retryAssistantRun,
   saveStoryGraph,
   sendAssistantMessage,
+  updateAssistantProposal,
   updateCharacter,
   uploadCharacterPortrait,
 } from "./api";
@@ -82,6 +84,9 @@ import type {
   AssistantConversation,
   AssistantEvent,
   AssistantProposal,
+  AssistantProposalActionDetail,
+  AssistantProposalStatus,
+  AssistantProposalUpdatePatch,
   CharacterCard,
   Chapter,
   EntityViewMode,
@@ -100,12 +105,35 @@ import type {
 type AgentFieldDraft = {
   proposalId: string;
   label: string;
+  status: AssistantProposalStatus;
   before: string;
   value: unknown;
   conflict: boolean;
 };
 
+type AgentDraftPatch = AssistantProposalUpdatePatch & {
+  label?: string;
+};
+
+export type ChapterAgentDraft = {
+  proposalId: string;
+  summary: string;
+  status: AssistantProposalStatus;
+  before: string;
+  after: string;
+  replacement: string;
+  editPath: string;
+  editValue: string;
+  editsWholeChapter: boolean;
+  start: number;
+  end: number;
+};
+
 type NoticeTone = "info" | "success" | "warning" | "error";
+
+function isPreviewProposal(proposal: AssistantProposal) {
+  return proposal.status === "building" || proposal.status === "proposed";
+}
 
 /**
  * Empty-state shortcuts should only be offered when their target exists.
@@ -406,7 +434,7 @@ function characterAgentDrafts(
   proposals
     .filter(
       (proposal) =>
-        proposal.status === "proposed" && targetsCharacter(proposal, character),
+        isPreviewProposal(proposal) && targetsCharacter(proposal, character),
     )
     .forEach((proposal) => {
       proposal.patches.forEach((patch) => {
@@ -415,6 +443,7 @@ function characterAgentDrafts(
         result[path] = {
           proposalId: proposal.id,
           label: patch.label || path,
+          status: proposal.status,
           before: fieldValue(character, path as keyof CharacterCard),
           value: patch.value,
           conflict: manualPaths.has(path),
@@ -428,7 +457,7 @@ function proposalDraftCharacter(
   projectId: string,
   proposal: AssistantProposal,
 ): CharacterCard | null {
-  if (!isCharacterProposal(proposal) || proposal.status !== "proposed")
+  if (!isCharacterProposal(proposal) || !isPreviewProposal(proposal))
     return null;
   if (
     proposal.target_id ||
@@ -443,6 +472,91 @@ function proposalDraftCharacter(
       status: "pending",
     } as CharacterCard,
   );
+}
+
+function chapterPatchValues(proposal: AssistantProposal) {
+  return Object.fromEntries(
+    proposal.patches.map((patch) => [patchPath(patch.path), patch.value]),
+  ) as Record<string, unknown>;
+}
+
+export function chapterAgentDraft(
+  chapter: Pick<Chapter, "id"> | null,
+  content: string,
+  proposals: AssistantProposal[],
+): ChapterAgentDraft | null {
+  if (!chapter) return null;
+  for (const proposal of [...proposals].reverse()) {
+    if (!isPreviewProposal(proposal)) continue;
+    const operation = String(proposal.operation || "").toLowerCase();
+    const targetType = String(
+      proposal.target_type || proposal.target.type || "",
+    ).toLowerCase();
+    if (!targetType.includes("chapter") && !operation.includes("chapter")) {
+      continue;
+    }
+    const patch = chapterPatchValues(proposal);
+    const patchChapterId = String(
+      patch.chapter_id ?? patch.chapterId ?? "",
+    );
+    const proposalChapterId = String(
+      proposal.target_id || proposal.target.id || patchChapterId || "",
+    );
+    if (
+      (proposalChapterId && proposalChapterId !== chapter.id) &&
+      patchChapterId !== chapter.id
+    ) {
+      continue;
+    }
+    const directPatch = proposal.patches.find((item) =>
+      ["new_content", "newContent"].includes(patchPath(item.path)),
+    );
+    const replacementPatch = proposal.patches.find((item) =>
+      ["replacement", "new_text", "newText", "content"].includes(
+        patchPath(item.path),
+      ),
+    );
+    const directContent = directPatch?.value;
+    const replacementValue = replacementPatch?.value;
+    if (typeof directContent !== "string" && typeof replacementValue !== "string") {
+      continue;
+    }
+    const startValue = Number(
+      patch.selection_start ?? patch.selectionStart ?? patch.start ?? 0,
+    );
+    const endValue = Number(
+      patch.selection_end ?? patch.selectionEnd ?? patch.end ?? content.length,
+    );
+    const start = Number.isFinite(startValue)
+      ? Math.max(0, Math.min(content.length, startValue))
+      : 0;
+    const end = Number.isFinite(endValue)
+      ? Math.max(start, Math.min(content.length, endValue))
+      : content.length;
+    const replacement =
+      typeof directContent === "string"
+        ? directContent
+        : String(replacementValue || "");
+    const after =
+      typeof directContent === "string"
+        ? directContent
+        : content.slice(0, start) + replacement + content.slice(end);
+    return {
+      proposalId: proposal.id,
+      summary: proposal.summary,
+      status: proposal.status,
+      before: content,
+      after,
+      replacement,
+      editPath: String((directPatch || replacementPatch)?.path || "replacement"),
+      editValue:
+        typeof directContent === "string" ? directContent : replacement,
+      editsWholeChapter: typeof directContent === "string",
+      start,
+      end,
+    };
+  }
+  return null;
 }
 
 function findGraphNode(
@@ -469,7 +583,7 @@ function findGraphNode(
   );
 }
 
-function graphWithAgentDrafts(
+export function graphWithAgentDrafts(
   graph: StoryGraph,
   proposals: AssistantProposal[],
 ): StoryGraph {
@@ -482,8 +596,57 @@ function graphWithAgentDrafts(
     data: { ...(edge.data || {}) },
   }));
   const working: StoryGraph = { ...graph, nodes, edges };
-  proposals
-    .filter((proposal) => proposal.status === "proposed")
+  const ensureDraftEndpoint = (
+    value: unknown,
+    proposal: AssistantProposal,
+    endpointIndex: number,
+  ) => {
+    const existing = findGraphNode(working, value);
+    if (existing) return existing;
+    const label =
+      typeof value === "object" && value
+        ? String(
+            (value as Record<string, unknown>).name ||
+              (value as Record<string, unknown>).label ||
+              (value as Record<string, unknown>).id ||
+              "",
+          ).trim()
+        : String(value || "").trim();
+    if (!label) return undefined;
+    const endpoint: StoryGraphNode = {
+      id: `agent-draft-endpoint-${textHash(label)}`,
+      type: "character",
+      label,
+      subtitle: "关系草稿端点",
+      status: "Agent 草稿",
+      position: {
+        x: 90 + (endpointIndex % 3) * 245,
+        y: 90 + Math.floor(endpointIndex / 3) * 145,
+      },
+      data: {
+        agentDraft: true,
+        agentEndpointDraft: true,
+        sourceProposalId: proposal.id,
+      },
+    };
+    working.nodes.push(endpoint);
+    return endpoint;
+  };
+  const previewRows = proposals.filter(isPreviewProposal);
+  // Provider/list responses are commonly newest-first, which puts a
+  // relationship before the two character proposals it references. Build
+  // every node first, then resolve edge names against that complete draft
+  // graph so the canvas and the accessible relation table stay equivalent.
+  const orderedRows = [
+    ...previewRows.filter(
+      (proposal) =>
+        !String(proposal.operation || "").toLowerCase().includes("graph_edge"),
+    ),
+    ...previewRows.filter((proposal) =>
+      String(proposal.operation || "").toLowerCase().includes("graph_edge"),
+    ),
+  ];
+  orderedRows
     .forEach((proposal, index) => {
       const operation = String(proposal.operation || "");
       const patch = Object.fromEntries(
@@ -504,6 +667,8 @@ function graphWithAgentDrafts(
             ...(existing.data || {}),
             agentDraft: true,
             proposalId: proposal.id,
+            draftPatches: proposalUpdatePatches(proposal),
+            draftStatus: proposal.status,
           };
           existing.status = "Agent 草稿";
         } else {
@@ -517,7 +682,12 @@ function graphWithAgentDrafts(
               x: 90 + (index % 3) * 245,
               y: 90 + Math.floor(index / 3) * 145,
             },
-            data: { agentDraft: true, proposalId: proposal.id },
+            data: {
+              agentDraft: true,
+              proposalId: proposal.id,
+              draftPatches: proposalUpdatePatches(proposal),
+              draftStatus: proposal.status,
+            },
           });
         }
         return;
@@ -535,6 +705,8 @@ function graphWithAgentDrafts(
             ...patch,
             agentDraft: true,
             proposalId: proposal.id,
+            draftPatches: proposalUpdatePatches(proposal),
+            draftStatus: proposal.status,
           };
           existing.status = "Agent 草稿";
         } else {
@@ -551,29 +723,45 @@ function graphWithAgentDrafts(
               x: 120 + (index % 3) * 245,
               y: 120 + Math.floor(index / 3) * 145,
             },
-            data: { ...patch, agentDraft: true, proposalId: proposal.id },
+            data: {
+              ...patch,
+              agentDraft: true,
+              proposalId: proposal.id,
+              draftPatches: proposalUpdatePatches(proposal),
+              draftStatus: proposal.status,
+            },
           });
         }
         return;
       }
       if (operation.includes("graph_edge")) {
-        const source = findGraphNode(
-          working,
+        const sourceValue =
           patch.source_node_id ||
-            patch.source_character_id ||
-            patch.source_character ||
-            patch.source_name ||
-            patch.source ||
-            patch.from,
-        );
-        const target = findGraphNode(
-          working,
+          patch.source_character_id ||
+          patch.source_character ||
+          patch.source_name ||
+          patch.source ||
+          patch.from;
+        const targetValue =
           patch.target_node_id ||
-            patch.target_character_id ||
-            patch.target_character ||
-            patch.target_name ||
-            patch.target ||
-            patch.to,
+          patch.target_character_id ||
+          patch.target_character ||
+          patch.target_name ||
+          patch.target ||
+          patch.to;
+        // A relationship proposal must stay reviewable even if its related
+        // character proposal was rejected first. Temporary endpoint nodes keep
+        // the dotted edge and its inline actions visible without creating any
+        // formal story data.
+        const source = ensureDraftEndpoint(
+          sourceValue,
+          proposal,
+          working.nodes.length,
+        );
+        const target = ensureDraftEndpoint(
+          targetValue,
+          proposal,
+          working.nodes.length,
         );
         if (!source || !target || source.id === target.id) return;
         working.edges.push({
@@ -586,7 +774,13 @@ function graphWithAgentDrafts(
           kind: String(patch.relation_type || patch.relation || "relationship"),
           direction: patch.directed === false ? "undirected" : "directed",
           status: "draft",
-          data: { ...patch, agentDraft: true, proposalId: proposal.id },
+          data: {
+            ...patch,
+            agentDraft: true,
+            proposalId: proposal.id,
+            draftPatches: proposalUpdatePatches(proposal),
+            draftStatus: proposal.status,
+          },
         });
       }
     });
@@ -910,6 +1104,12 @@ function CharacterForm({
     } else
       onChange({ ...character, [key]: value } as CharacterCard, String(key));
   };
+  const [agentFieldEditValues, setAgentFieldEditValues] = useState<
+    Record<string, string>
+  >({});
+  const [agentFieldEditing, setAgentFieldEditing] = useState<Set<string>>(
+    new Set(),
+  );
   const [customKey, setCustomKey] = useState("");
   const [customValue, setCustomValue] = useState("");
   const addCustom = () => {
@@ -943,6 +1143,18 @@ function CharacterForm({
             {group.fields.map((field) => {
               const path = String(field.key);
               const draft = agentDrafts[path];
+              const draftValue = draft
+                ? Array.isArray(draft.value)
+                  ? draft.value.join("、")
+                  : String(draft.value ?? "")
+                : "";
+              const editingDraft = agentFieldEditing.has(path);
+              const editedDraftValue = Object.prototype.hasOwnProperty.call(
+                agentFieldEditValues,
+                path,
+              )
+                ? agentFieldEditValues[path]
+                : draftValue;
               return (
                 <label
                   className={`character-field ${draft ? "is-agent-updated" : ""} ${draft?.conflict ? "has-agent-conflict" : ""}`}
@@ -968,21 +1180,68 @@ function CharacterForm({
                     />
                   )}
                   {draft && (
-                    <span className="agent-field-draft">
+                    <div className="agent-field-draft">
                       <em>
                         <Sparkles size={11} /> Agent 草稿
                         {draft.conflict ? " · 与手动编辑冲突" : ""}
                       </em>
-                      <small>
-                        <del>{draft.before || "空白"}</del>
-                        <ArrowRight size={11} />
-                        <strong>
-                          {Array.isArray(draft.value)
-                            ? draft.value.join("、")
-                            : String(draft.value ?? "空白")}
-                        </strong>
-                      </small>
-                    </span>
+                      {editingDraft ? (
+                        field.multiline ? (
+                          <textarea
+                            rows={3}
+                            value={editedDraftValue}
+                            onChange={(event) =>
+                              setAgentFieldEditValues((current) => ({
+                                ...current,
+                                [path]: event.target.value,
+                              }))
+                            }
+                            aria-label={`${field.label} Agent 草稿手动修改`}
+                          />
+                        ) : (
+                          <input
+                            value={editedDraftValue}
+                            onChange={(event) =>
+                              setAgentFieldEditValues((current) => ({
+                                ...current,
+                                [path]: event.target.value,
+                              }))
+                            }
+                            aria-label={`${field.label} Agent 草稿手动修改`}
+                          />
+                        )
+                      ) : (
+                        <small>
+                          <del>{draft.before || "空白"}</del>
+                          <ArrowRight size={11} />
+                          <strong>{draftValue || "空白"}</strong>
+                        </small>
+                      )}
+                      <AgentDraftActions
+                        proposalId={draft.proposalId}
+                        status={draft.status}
+                        editing={editingDraft}
+                        patches={[
+                          {
+                            op: "replace",
+                            path,
+                            value: editedDraftValue,
+                          },
+                        ]}
+                        onManualEdit={() => {
+                          setAgentFieldEditValues((current) => ({
+                            ...current,
+                            [path]: current[path] ?? draftValue,
+                          }));
+                          setAgentFieldEditing((current) => {
+                            const next = new Set(current);
+                            if (next.has(path)) next.delete(path);
+                            else next.add(path);
+                            return next;
+                          });
+                        }}
+                      />
+                    </div>
                   )}
                 </label>
               );
@@ -1060,7 +1319,7 @@ function CharacterForm({
       </section>
       <div className="character-form-footer">
         <span>
-          <CheckCircle2 size={13} /> Agent 草稿不会随表单保存；请在右侧单独确认
+          <CheckCircle2 size={13} /> 可直接在字段下接受、拒绝或修改 Agent 草稿
         </span>
         <button
           type="button"
@@ -1076,6 +1335,88 @@ function CharacterForm({
   );
 }
 
+type AgentCharacterDraft = {
+  proposal: AssistantProposal;
+  character: CharacterCard;
+};
+
+function AgentCharacterDraftCard({
+  proposal,
+  character,
+}: AgentCharacterDraft) {
+  const [editing, setEditing] = useState(false);
+  const [editedValues, setEditedValues] = useState<Record<string, string>>(
+    {},
+  );
+  const patches = proposal.patches.slice(0, 6);
+  return (
+    <article
+      className="character-card character-card-agent-draft"
+      aria-label={`${character.name || "未命名人物"} Agent 草稿`}
+    >
+      <div className="character-card-image">
+        <CharacterPortrait character={character} />
+        <span className="character-card-status status-pending">Agent 草稿</span>
+      </div>
+      <div className="character-card-copy">
+        <h3>{character.name || "未命名人物"}</h3>
+        <p>
+          {character.role || character.motivation || "正在形成的人物建议"}
+        </p>
+        <dl className="character-draft-fields">
+          {patches.map((patch) => {
+            const path = patch.path;
+            const value = Object.prototype.hasOwnProperty.call(
+              editedValues,
+              path,
+            )
+              ? editedValues[path]
+              : Array.isArray(patch.value)
+                ? patch.value.join("、")
+                : String(patch.value ?? "");
+            return (
+              <div key={path}>
+                <dt>{patch.label || patchPath(path)}</dt>
+                <dd>
+                  {editing ? (
+                    <input
+                      value={value}
+                      onChange={(event) =>
+                        setEditedValues((current) => ({
+                          ...current,
+                          [path]: event.target.value,
+                        }))
+                      }
+                      aria-label={`${patch.label || patchPath(path)} Agent 草稿手动修改`}
+                    />
+                  ) : (
+                    value || "空白"
+                  )}
+                </dd>
+              </div>
+            );
+          })}
+        </dl>
+        <AgentDraftActions
+          proposalId={proposal.id}
+          status={proposal.status}
+          editing={editing}
+          disabled={proposal.status !== "proposed"}
+          patches={
+            editing
+              ? proposalUpdatePatches(proposal, editedValues).filter((patch) =>
+                  Object.prototype.hasOwnProperty.call(editedValues, patch.path),
+                )
+              : undefined
+          }
+          onManualEdit={() => setEditing((current) => !current)}
+        />
+        <small>草稿只在此处预览，不会写入卷宗</small>
+      </div>
+    </article>
+  );
+}
+
 function CharacterGallery({
   characters,
   draftCharacters = [],
@@ -1083,7 +1424,7 @@ function CharacterGallery({
   onCreate,
 }: {
   characters: CharacterCard[];
-  draftCharacters?: CharacterCard[];
+  draftCharacters?: AgentCharacterDraft[];
   onOpen: (character: CharacterCard) => void;
   onCreate: () => void;
 }) {
@@ -1115,28 +1456,12 @@ function CharacterGallery({
               onOpen={() => onOpen(character)}
             />
           ))}
-          {draftCharacters.map((character) => (
-            <article
-              className="character-card character-card-agent-draft"
-              key={character.id}
-              aria-label={`${character.name || "未命名人物"} Agent 草稿`}
-            >
-              <div className="character-card-image">
-                <CharacterPortrait character={character} />
-                <span className="character-card-status status-pending">
-                  Agent 草稿
-                </span>
-              </div>
-              <div className="character-card-copy">
-                <h3>{character.name || "未命名人物"}</h3>
-                <p>
-                  {character.role ||
-                    character.motivation ||
-                    "正在形成的人物建议"}
-                </p>
-                <small>确认右侧提案后才会写入卷宗</small>
-              </div>
-            </article>
+          {draftCharacters.map(({ proposal, character }) => (
+            <AgentCharacterDraftCard
+              key={proposal.id}
+              proposal={proposal}
+              character={character}
+            />
           ))}
         </div>
       ) : (
@@ -1164,6 +1489,9 @@ type GraphData = {
   version?: number;
   agentDraft?: boolean;
   proposalId?: string;
+  draftPatches?: AgentDraftPatch[];
+  draftStatus?: AssistantProposalStatus;
+  agentEndpointDraft?: boolean;
   [key: string]: unknown;
 };
 type FlowNode = Node<GraphData>;
@@ -1177,13 +1505,40 @@ type FlowEdgeData = {
   version?: number;
   agentDraft?: boolean;
   proposalId?: string;
+  draftPatches?: AgentDraftPatch[];
+  draftStatus?: AssistantProposalStatus;
 };
 type FlowEdge = Edge<FlowEdgeData>;
 
 function GraphNode({ data }: NodeProps<FlowNode>) {
+  const [editing, setEditing] = useState(false);
+  const [editedValues, setEditedValues] = useState<Record<string, string>>(
+    {},
+  );
+  const draftPatches = data.draftPatches || [];
+  const editablePatches = draftPatches
+    .filter((patch) =>
+      [
+        "name",
+        "role",
+        "motivation",
+        "personality",
+        "label",
+        "subtitle",
+        "description",
+        "status",
+      ].includes(patchPath(patch.path)),
+    )
+    .slice(0, 2)
+    .map((patch) => ({
+      ...patch,
+      value: Object.prototype.hasOwnProperty.call(editedValues, patch.path)
+        ? editedValues[patch.path]
+        : patch.value,
+    }));
   return (
     <div
-      className={`story-flow-node node-${data.type} ${data.agentDraft ? "is-agent-draft" : ""}`}
+      className={`story-flow-node node-${data.type} ${data.agentDraft ? "is-agent-draft" : ""} ${data.agentEndpointDraft ? "is-agent-endpoint-draft" : ""}`}
     >
       <Handle type="target" position={Position.Left} />
       <div className="story-flow-node-icon">
@@ -1202,6 +1557,53 @@ function GraphNode({ data }: NodeProps<FlowNode>) {
         {data.subtitle && <small>{data.subtitle}</small>}
       </div>
       {data.status && <em>{data.status}</em>}
+      {data.agentDraft && data.proposalId && (
+        <>
+          {editing && (
+            <div
+              className="story-flow-node-draft-fields"
+              onPointerDown={(event) => event.stopPropagation()}
+            >
+              {editablePatches.map((patch) => (
+                <input
+                  key={patch.path}
+                  value={String(patch.value ?? "")}
+                  onChange={(event) =>
+                    setEditedValues((current) => ({
+                      ...current,
+                      [patch.path]: event.target.value,
+                    }))
+                  }
+                  aria-label={`${patch.label || patch.path} Agent 草稿手动修改`}
+                />
+              ))}
+            </div>
+          )}
+          <AgentDraftActions
+            proposalId={data.proposalId}
+            status={data.draftStatus}
+            patches={
+              editing
+                ? data.draftPatches
+                    ?.filter((patch) =>
+                      Object.prototype.hasOwnProperty.call(
+                        editedValues,
+                        patch.path,
+                      ),
+                    )
+                    .map((patch) => ({
+                      ...patch,
+                      value: editedValues[patch.path],
+                    }))
+                : undefined
+            }
+            disabled={data.draftStatus === "building"}
+            onManualEdit={() => setEditing((current) => !current)}
+            compact
+            onPointerDown={(event) => event.stopPropagation()}
+          />
+        </>
+      )}
       <Handle type="source" position={Position.Right} />
     </div>
   );
@@ -1497,6 +1899,15 @@ function GraphRelationTable({
             ))}
           </tbody>
         </table>
+        {edges.some((edge) => edge.data?.agentDraft) && (
+          <div className="story-graph-agent-drafts" aria-label="Agent 图谱草稿">
+            {edges
+              .filter((edge) => edge.data?.agentDraft)
+              .map((edge) => (
+                <AgentGraphEdgeDraft key={edge.id} edge={edge} nodes={nodes} />
+              ))}
+          </div>
+        )}
         {edges.length === 0 && (
           <div className="relation-table-empty">
             <Link2 size={17} /> 还没有关系；从下方添加第一条。
@@ -1586,6 +1997,86 @@ function GraphRelationTable({
   );
 }
 
+function AgentGraphEdgeDraft({
+  edge,
+  nodes,
+}: {
+  edge: FlowEdge;
+  nodes: FlowNode[];
+}) {
+  const [editing, setEditing] = useState(false);
+  const [editedValues, setEditedValues] = useState<Record<string, string>>(
+    {},
+  );
+  const source =
+    nodes.find((node) => node.id === edge.source)?.data.label || "起点";
+  const target =
+    nodes.find((node) => node.id === edge.target)?.data.label || "终点";
+  const patches = edge.data?.draftPatches || [];
+  const displayPatches = patches.filter((patch) =>
+    ["label", "relation_type", "relation", "kind"].includes(
+      patchPath(patch.path),
+    ),
+  );
+  const updatedPatches = editing
+    ? patches
+        .filter((patch) =>
+          Object.prototype.hasOwnProperty.call(editedValues, patch.path),
+        )
+        .map((patch) => ({
+          ...patch,
+          value: editedValues[patch.path],
+        }))
+    : undefined;
+  return (
+    <article className="story-graph-agent-draft">
+      <div>
+        <span className="eyebrow"><Sparkles size={11} /> Agent 图谱草稿</span>
+        <strong>
+          {source} <ArrowRight size={12} aria-hidden="true" /> {target}
+        </strong>
+        <small>{edge.label || "正在形成关系"} · 虚线预览</small>
+      </div>
+      {editing && displayPatches.length > 0 && (
+        <div className="story-graph-agent-draft-fields">
+          {displayPatches.map((patch) => (
+            <label key={patch.path}>
+              <span>{patch.label || patchPath(patch.path)}</span>
+              <input
+                value={String(
+                  Object.prototype.hasOwnProperty.call(
+                    editedValues,
+                    patch.path,
+                  )
+                    ? editedValues[patch.path]
+                    : patch.value ?? "",
+                )}
+                onChange={(event) =>
+                  setEditedValues((current) => ({
+                    ...current,
+                    [patch.path]: event.target.value,
+                  }))
+                }
+                aria-label={`${patch.label || patchPath(patch.path)} Agent 草稿手动修改`}
+              />
+            </label>
+          ))}
+        </div>
+      )}
+      {edge.data?.proposalId && (
+        <AgentDraftActions
+          proposalId={edge.data.proposalId}
+          status={edge.data.draftStatus}
+          patches={updatedPatches}
+          editing={editing}
+          disabled={edge.data.draftStatus === "building"}
+          onManualEdit={() => setEditing((current) => !current)}
+        />
+      )}
+    </article>
+  );
+}
+
 function StoryGraphView({
   projectId,
   graph,
@@ -1617,8 +2108,7 @@ function StoryGraphView({
   const sourceGraph = graph;
   void fallback;
   useEffect(() => {
-    setNodes(
-      sourceGraph.nodes.map((node) => ({
+    const nextNodes: FlowNode[] = sourceGraph.nodes.map((node) => ({
         id: node.id,
         type: node.type,
         position: node.position,
@@ -1636,10 +2126,8 @@ function StoryGraphView({
           source_refs: node.source_refs || [],
           version: node.version,
         },
-      })),
-    );
-    setEdges(
-      sourceGraph.edges.map((edge) => ({
+      }));
+    const nextEdges: FlowEdge[] = sourceGraph.edges.map((edge) => ({
         id: edge.id,
         source: edge.source,
         target: edge.target,
@@ -1661,10 +2149,27 @@ function StoryGraphView({
           source_refs: edge.source_refs || [],
           version: edge.version,
         },
-      })),
-    );
+      }));
+    setNodes(nextNodes);
+    const hasAgentEdges = nextEdges.some((edge) => edge.data?.agentDraft);
+    if (hasAgentEdges) {
+      // Custom nodes expose their handles after XYFlow's ResizeObserver pass.
+      // A structured proposal can deliver all patches in one event burst; if
+      // its edge is installed in that same commit, XYFlow can miss the first
+      // handle measurement. Keep durable edges visible, then attach drafts
+      // just after the nodes have committed.
+      setEdges(nextEdges.filter((edge) => !edge.data?.agentDraft));
+    } else {
+      setEdges(nextEdges);
+    }
+    const edgeTimer = hasAgentEdges
+      ? window.setTimeout(() => setEdges(nextEdges), 120)
+      : undefined;
     setDirty(false);
     setDeletedEdgeIds([]);
+    return () => {
+      if (edgeTimer !== undefined) window.clearTimeout(edgeTimer);
+    };
   }, [sourceGraph, setEdges, setNodes]);
   const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId);
   useEffect(
@@ -1884,6 +2389,9 @@ function StoryGraphView({
       ) : (
         <div className="story-graph-canvas">
           <ReactFlow
+            key={`${nodes.map((node) => node.id).join("|")}::${edges
+              .map((edge) => edge.id)
+              .join("|")}`}
             nodes={nodes}
             edges={edges}
             nodeTypes={graphNodeTypes}
@@ -1933,6 +2441,15 @@ function StoryGraphView({
               }
             />
           </ReactFlow>
+          {edges.some((edge) => edge.data?.agentDraft) && (
+            <div className="story-graph-agent-drafts" aria-label="Agent 图谱草稿">
+              {edges
+                .filter((edge) => edge.data?.agentDraft)
+                .map((edge) => (
+                  <AgentGraphEdgeDraft key={edge.id} edge={edge} nodes={nodes} />
+                ))}
+            </div>
+          )}
           {selectedEdge && (
             <aside className="story-edge-inspector">
               <div>
@@ -1986,99 +2503,6 @@ function StoryGraphView({
         </span>
       </div>
     </div>
-  );
-}
-
-type ProposalBulkActions = {
-  firstId: string;
-  ids: string[];
-  busy: boolean;
-  apply: () => void;
-  reject: () => void;
-};
-
-function AgentProposalCard({
-  proposal,
-  onApply,
-  onReject,
-  busy,
-  bulk,
-  conflict = false,
-}: {
-  proposal: AssistantProposal;
-  onApply: () => void;
-  onReject: () => void;
-  busy: boolean;
-  bulk?: ProposalBulkActions | null;
-  conflict?: boolean;
-}) {
-  return (
-    <article className={`agent-proposal agent-proposal-${proposal.status}`}>
-      <div className="agent-proposal-head">
-        <span className="agent-proposal-icon">
-          <Sparkles size={13} />
-        </span>
-        <div>
-          <strong>{proposal.summary}</strong>
-          <small>
-            {proposal.patches.length} 个字段变化 ·{" "}
-            {proposal.status === "applied"
-              ? "已应用"
-              : proposal.status === "rejected"
-                ? "已拒绝"
-                : "等待决定"}
-          </small>
-          {conflict && <small className="agent-proposal-conflict">与尚未保存的手动修改冲突，请先处理表单</small>}
-        </div>
-      </div>
-      <div className="agent-patch-list">
-        {proposal.patches.slice(0, 5).map((patch, index) => (
-          <div className="agent-patch-row" key={`${patch.path}-${index}`}>
-            <span>{patch.label || patch.path}</span>
-            <strong>{String(patch.value ?? "—")}</strong>
-          </div>
-        ))}
-      </div>
-      {proposal.status === "proposed" && (
-        <div className="agent-proposal-actions">
-          <button
-            className="button button-primary button-small"
-            onClick={onApply}
-            disabled={busy || conflict}
-          >
-            <Check size={13} /> 应用到表格
-          </button>
-          <button
-            className="button button-secondary button-small"
-            onClick={onReject}
-            disabled={busy}
-          >
-            <X size={13} /> 拒绝
-          </button>
-        </div>
-      )}
-      {bulk?.firstId === proposal.id && bulk.ids.length > 1 && (
-        <div className="agent-proposal-bulk">
-          <span>共 {bulk.ids.length} 条待处理</span>
-          <button
-            type="button"
-            className="text-button"
-            onClick={bulk.apply}
-            disabled={bulk.busy}
-          >
-            <CheckCircle2 size={12} /> 全部接受
-          </button>
-          <button
-            type="button"
-            className="text-button text-danger"
-            onClick={bulk.reject}
-            disabled={bulk.busy}
-          >
-            <X size={12} /> 全部拒绝
-          </button>
-        </div>
-      )}
-    </article>
   );
 }
 
@@ -2344,6 +2768,216 @@ function textHash(value: string) {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
+/**
+ * Keep provider-side structured output out of the conversation transcript.
+ *
+ * Newer workers persist the natural-language reply separately from
+ * proposals, but conversations created by an older worker (or by a gateway
+ * that ignored the two-pass contract) can still contain a JSON/YAML
+ * `proposals` tail. The proposal cards below are the review surface, so
+ * rendering that machine payload in the assistant bubble only adds noise and
+ * can expose implementation details to the author.
+ */
+export function visibleAgentMessage(content: string): string {
+  const raw = String(content || "").trim();
+  if (!raw) return "";
+
+  const fenced = raw.match(/^```(?:json|jsonc)?\s*([\s\S]*?)\s*```$/i);
+  const candidate = fenced?.[1]?.trim() || raw;
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    if (parsed && typeof parsed === "object") {
+      const envelope = parsed as Record<string, unknown>;
+      const reply = envelope.reply ?? envelope.message;
+      if (
+        typeof reply === "string" &&
+        ("proposals" in envelope || "changes" in envelope)
+      ) {
+        return visibleAgentMessage(reply);
+      }
+    }
+  } catch {
+    // Some old provider responses are YAML-like or truncated JSON. The line
+    // based fallback below still removes their proposals section safely.
+  }
+
+  const proposalsStart = raw.search(
+    /(?:^|\r?\n)\s*["']?proposals?["']?\s*:/i,
+  );
+  if (proposalsStart >= 0) {
+    const visibleLines = raw.slice(0, proposalsStart).trim().split(/\r?\n/);
+    const finalLine = visibleLines[visibleLines.length - 1] || "";
+    if (
+      /(?:如果|若|如需|如有|when|if).*(?:提交|返回|提供|生成|结构化|申请|提案|proposal|change)/i.test(
+        finalLine,
+      )
+    ) {
+      visibleLines.pop();
+    }
+    return visibleLines.join("\n").trim();
+  }
+  return raw;
+}
+
+function assistantMessageText(content: string): string {
+  const visible = visibleAgentMessage(content);
+  return visible || (String(content || "").trim() ? "已生成待确认改动。" : "");
+}
+
+type LiveSendState = {
+  conversationId: string;
+  baselineSequence: number;
+  baselineProposalIds: Set<string>;
+  runId: string;
+  followedProposalIds: Set<string>;
+  bufferedProposals: Map<string, AssistantProposal>;
+};
+
+type LiveEventMatch = "current" | "awaiting-run" | "stale";
+
+export function classifyLiveAgentEvent(
+  event: Pick<AssistantEvent, "sequence" | "run_id">,
+  conversationId: string,
+  pending: Pick<LiveSendState, "conversationId" | "baselineSequence" | "runId"> | null,
+  knownRunIds: ReadonlySet<string>,
+): LiveEventMatch {
+  if (!pending || pending.conversationId !== conversationId) return "stale";
+  if (
+    event.sequence > 0 &&
+    event.sequence <= pending.baselineSequence
+  ) {
+    return "stale";
+  }
+  if (pending.runId) {
+    return event.run_id && event.run_id !== pending.runId
+      ? "stale"
+      : "current";
+  }
+  if (event.run_id) {
+    // A reconnect may replay a completed run after a new send started.
+    // Runs loaded before the send are never allowed to move the workspace.
+    return knownRunIds.has(event.run_id) ? "stale" : "current";
+  }
+  // Some older event rows omitted run_id. Hold their proposals until the POST
+  // response supplies the authoritative run id instead of following a
+  // historical replay immediately.
+  return "awaiting-run";
+}
+
+function canFollowAgentProposal(proposal: AssistantProposal) {
+  const operation = String(proposal.operation || "").toLowerCase();
+  const targetType = String(
+    proposal.target_type || proposal.target.type || "",
+  ).toLowerCase();
+  return (
+    targetType.includes("chapter") ||
+    targetType.includes("character") ||
+    targetType.includes("thread") ||
+    targetType.includes("relation") ||
+    targetType.includes("graph") ||
+    operation.includes("chapter") ||
+    operation.includes("character") ||
+    operation.includes("graph") ||
+    operation.includes("relation")
+  );
+}
+
+export const ASSISTANT_PROPOSAL_ACTION_EVENT =
+  "story-studio-agent-proposal-action";
+
+export function dispatchAssistantProposalAction(
+  detail: AssistantProposalActionDetail,
+) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent<AssistantProposalActionDetail>(
+      ASSISTANT_PROPOSAL_ACTION_EVENT,
+      { detail },
+    ),
+  );
+}
+
+function proposalUpdatePatches(
+  proposal: AssistantProposal,
+  overrides?: Record<string, unknown>,
+): AgentDraftPatch[] {
+  return proposal.patches.map((patch) => {
+    const path = patch.path;
+    return {
+      op: "replace",
+      path,
+      label: patch.label,
+      value: overrides && Object.prototype.hasOwnProperty.call(overrides, path)
+        ? overrides[path]
+        : patch.value,
+    };
+  });
+}
+
+function AgentDraftActions({
+  proposalId,
+  patches,
+  editing = false,
+  onManualEdit,
+  disabled = false,
+  status,
+  compact = false,
+  onPointerDown,
+}: {
+  proposalId: string;
+  patches?: AssistantProposalUpdatePatch[];
+  editing?: boolean;
+  onManualEdit?: () => void;
+  disabled?: boolean;
+  status?: AssistantProposalStatus;
+  compact?: boolean;
+  onPointerDown?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+}) {
+  const building = status === "building";
+  const actionsDisabled = disabled || status !== "proposed";
+  return (
+    <div
+      className={`agent-draft-actions${compact ? " agent-draft-actions-compact" : ""}`}
+      aria-label="Agent 草稿操作"
+      onPointerDown={onPointerDown}
+    >
+      <button
+        type="button"
+        className="button button-primary button-small"
+        onClick={() =>
+          dispatchAssistantProposalAction({
+            proposalId,
+            action: "apply",
+            patches: editing ? patches : undefined,
+          })
+        }
+        disabled={actionsDisabled}
+      >
+        <Check size={12} /> {building ? "生成中…" : "接受改动"}
+      </button>
+      <button
+        type="button"
+        className="button button-secondary button-small"
+        onClick={() =>
+          dispatchAssistantProposalAction({ proposalId, action: "reject" })
+        }
+        disabled={actionsDisabled}
+      >
+        <X size={12} /> 拒绝
+      </button>
+      <button
+        type="button"
+        className="text-button"
+        onClick={onManualEdit}
+        disabled={actionsDisabled}
+      >
+        <PencilLine size={12} /> {editing ? "完成手动修改" : "手动修改"}
+      </button>
+      {building && <small className="agent-draft-actions-status">提案生成中</small>}
+    </div>
+  );
+}
+
 function AgentDock({
   project,
   target,
@@ -2355,6 +2989,7 @@ function AgentDock({
   assistantProvider,
   onProposalPreview,
   onProposalDismiss,
+  onFollowProposal,
   conflictedProposalIds,
   onProposalApplied,
   relationNodeCount = 0,
@@ -2372,6 +3007,7 @@ function AgentDock({
   assistantProvider?: ProviderProfile | null;
   onProposalPreview: (proposal: AssistantProposal) => void;
   onProposalDismiss: (proposalId: string) => void;
+  onFollowProposal?: (proposal: AssistantProposal) => void;
   conflictedProposalIds: Set<string>;
   onProposalApplied: (proposal: AssistantProposal) => void | Promise<void>;
   relationNodeCount?: number;
@@ -2405,9 +3041,97 @@ function AgentDock({
   const [failedRunId, setFailedRunId] = useState("");
   const [retrying, setRetrying] = useState(false);
   const sequenceRef = useRef(0);
-  const chapterPreviewRef = useRef<HTMLTextAreaElement>(null);
+  const streamingMessageIdRef = useRef("");
+  const streamingTextRef = useRef("");
+  const lastAssistantReplyRef = useRef("");
+  const knownAssistantMessageIdsRef = useRef<Set<string>>(new Set());
+  const followProposalRef = useRef(onFollowProposal);
+  const activeRunIdRef = useRef("");
+  const knownRunIdsRef = useRef<Set<string>>(new Set());
+  const liveSendRef = useRef<LiveSendState | null>(null);
   const initializedHistory = useRef(false);
   const targetKey = `${target.type}:${target.id}`;
+  useEffect(() => {
+    followProposalRef.current = onFollowProposal;
+  }, [onFollowProposal]);
+  const beginLiveSend = useCallback(
+    (
+      conversationId: string,
+      baselineSequence: number,
+      baselineProposalIds: Iterable<string>,
+    ) => {
+      liveSendRef.current = {
+        conversationId,
+        baselineSequence,
+        baselineProposalIds: new Set(baselineProposalIds),
+        runId: "",
+        followedProposalIds: new Set(),
+        bufferedProposals: new Map(),
+      };
+      activeRunIdRef.current = "";
+    },
+    [],
+  );
+  const activateLiveRun = useCallback((conversationId: string, runId: string) => {
+    if (!runId) return;
+    const pending = liveSendRef.current;
+    if (!pending || pending.conversationId !== conversationId) return;
+    pending.runId = runId;
+    activeRunIdRef.current = runId;
+    knownRunIdsRef.current.add(runId);
+    const buffered = [...pending.bufferedProposals.values()];
+    pending.bufferedProposals.clear();
+    buffered.forEach((proposal) => {
+      if (pending.followedProposalIds.size > 0) return;
+      if (!canFollowAgentProposal(proposal)) return;
+      if (pending.followedProposalIds.has(proposal.id)) return;
+      pending.followedProposalIds.add(proposal.id);
+      followProposalRef.current?.(proposal);
+    });
+  }, []);
+  const matchLiveEvent = useCallback(
+    (event: AssistantEvent, conversationId: string): LiveEventMatch => {
+      const pending = liveSendRef.current;
+      const match = classifyLiveAgentEvent(
+        event,
+        conversationId,
+        pending,
+        knownRunIdsRef.current,
+      );
+      if (match === "current" && pending && !pending.runId && event.run_id) {
+        if (knownRunIdsRef.current.has(event.run_id)) return "stale";
+        pending.runId = event.run_id;
+        activeRunIdRef.current = event.run_id;
+      }
+      return match;
+    },
+    [],
+  );
+  const maybeFollowLiveProposal = useCallback(
+    (
+      proposal: AssistantProposal,
+      event: AssistantEvent,
+      conversationId: string,
+    ) => {
+      if (!canFollowAgentProposal(proposal)) return;
+      const match = matchLiveEvent(event, conversationId);
+      if (match === "stale") return;
+      const pending = liveSendRef.current;
+      if (!pending) return;
+      if (match === "awaiting-run") {
+        pending.bufferedProposals.set(proposal.id, proposal);
+        return;
+      }
+      // A run can create characters, nodes and relationships together. Keep
+      // the first relevant surface steady so the author can watch fields
+      // arrive instead of being bounced between tabs for every proposal.
+      if (pending.followedProposalIds.size > 0) return;
+      if (pending.followedProposalIds.has(proposal.id)) return;
+      pending.followedProposalIds.add(proposal.id);
+      followProposalRef.current?.(proposal);
+    },
+    [matchLiveEvent],
+  );
   useEffect(() => {
     if (!activeChapter) {
       if (scopeMode !== "project") setScopeMode("project");
@@ -2420,11 +3144,6 @@ function AgentDock({
       // accidentally turn an entity conversation into a chapter message.
       if (scopeMode !== "project") setScopeMode("project");
       return;
-    }
-    if (target.type === "project" && scopeMode === "project") {
-      // Returning from a people/graph surface should resume the current
-      // manuscript, while an explicitly locked selection remains untouched.
-      setScopeMode("chapter");
     }
   }, [activeChapter, scopeMode, target.type]);
   useEffect(() => {
@@ -2497,16 +3216,31 @@ function AgentDock({
         setConversation(loaded);
         setConversationTargetKey(`${inferredTarget.type}:${inferredTarget.id}`);
         setMessages(loadedMessages);
+        streamingMessageIdRef.current = "";
+        streamingTextRef.current = "";
+        setStreamingText("");
+        knownAssistantMessageIdsRef.current = new Set(
+          loadedMessages
+            .filter((item) => item.role === "assistant")
+            .map((item) => item.id),
+        );
+        lastAssistantReplyRef.current =
+          [...loadedMessages]
+            .reverse()
+            .find((item) => item.role === "assistant" && item.content.trim())
+            ?.content || "";
         setProposals(loadedProposals);
         loadedProposals
           .filter((proposal) => proposal.status === "proposed")
           .forEach(onProposalPreview);
-        setStreamingText("");
         setStatus("idle");
         const runs = await listAssistantRuns(project.id, conversationId).catch(
           () => [],
         );
         const latestRun = runs.at(-1);
+        knownRunIdsRef.current = new Set(
+          runs.map((run) => run.id).filter(Boolean),
+        );
         setFailedRunId(
           latestRun &&
             (latestRun.status === "failed" ||
@@ -2582,6 +3316,7 @@ function AgentDock({
             ...current.filter((item) => item.id !== selected.id),
           ]);
           onProposalPreview(selected);
+          followProposalRef.current?.(selected);
           setNotice("已定位这条待确认改动；接受前只会显示为 Agent 草稿。");
         })
         .catch((error) =>
@@ -2606,24 +3341,58 @@ function AgentDock({
       (event: AssistantEvent) => {
         if (event.sequence && event.sequence <= sequenceRef.current) return;
         if (event.sequence) sequenceRef.current = event.sequence;
+        const liveEventMatch = matchLiveEvent(event, conversationId);
+        if (liveEventMatch === "current" && event.run_id) {
+          activeRunIdRef.current = event.run_id;
+        }
         if (event.type === "message_delta") {
-          setStreamingText((current) => current + event.delta);
+          // A replay can include deltas for a message that was already loaded
+          // from the durable transcript. Keep the message card as the single
+          // source of truth in that case; otherwise the same reply briefly
+          // appears once as history and once as a streaming bubble.
+          if (
+            event.message_id &&
+            knownAssistantMessageIdsRef.current.has(event.message_id)
+          ) {
+            setStatus("streaming");
+            if (event.run_id) setFailedRunId("");
+            return;
+          }
+          streamingMessageIdRef.current = event.message_id || "";
+          setStreamingText((current) => {
+            const next = current + event.delta;
+            streamingTextRef.current = next;
+            return next;
+          });
           setStatus("streaming");
           if (event.run_id) setFailedRunId("");
         } else if (event.type === "message_replace") {
-          setStreamingText(event.content);
+          const messageId =
+            event.message_id || `assistant-${event.run_id || event.sequence}`;
+          streamingMessageIdRef.current = messageId;
+          streamingTextRef.current = "";
+          setStreamingText("");
+          // An empty replace is the worker's retry/reset frame. Allow the
+          // following deltas through even when this message id was present in
+          // the durable transcript loaded before the retry started.
+          if (event.content.trim()) {
+            knownAssistantMessageIdsRef.current.add(messageId);
+          } else {
+            knownAssistantMessageIdsRef.current.delete(messageId);
+          }
+          lastAssistantReplyRef.current = event.content;
           setMessages((current) => {
-            const exists = current.some((item) => item.id === event.message_id);
+            const exists = current.some((item) => item.id === messageId);
             return exists
               ? current.map((item) =>
-                  item.id === event.message_id
+                  item.id === messageId
                     ? { ...item, content: event.content, status: "completed" }
                     : item,
                 )
               : [
                   ...current,
                   {
-                    id: event.message_id || `assistant-${event.sequence}`,
+                    id: messageId,
                     role: "assistant",
                     content: event.content,
                     status: "completed",
@@ -2631,36 +3400,79 @@ function AgentDock({
                 ];
           });
         } else if (event.type === "message_completed") {
+          streamingMessageIdRef.current = "";
+          streamingTextRef.current = "";
           setStreamingText("");
           setStatus("idle");
           void loadConversation(conversationId);
+          const completedSend =
+            liveEventMatch === "current" ? liveSendRef.current : null;
+          if (completedSend && (event.proposal_count || 0) > 0) {
+            // A fast extractor can persist all proposal frames between two
+            // browser paints. Re-read the durable rows and reveal the first
+            // new surface even if that burst was coalesced during reconnect.
+            void listAssistantProposals(project.id, conversationId)
+              .then((rows) => {
+                if (
+                  liveSendRef.current &&
+                  liveSendRef.current !== completedSend
+                ) {
+                  return;
+                }
+                const fresh = rows.filter(
+                  (proposal) =>
+                    isPreviewProposal(proposal) &&
+                    !completedSend.baselineProposalIds.has(proposal.id),
+                );
+                fresh.forEach((proposal) => onProposalPreview(proposal));
+                const first = fresh.find(canFollowAgentProposal);
+                if (
+                  first &&
+                  completedSend.followedProposalIds.size === 0
+                ) {
+                  completedSend.followedProposalIds.add(first.id);
+                  followProposalRef.current?.(first);
+                }
+              })
+              .catch(() => undefined);
+          }
         } else if (event.type === "proposal_created") {
           setProposals((current) => [
             ...current.filter((item) => item.id !== event.proposal.id),
             event.proposal,
           ]);
           onProposalPreview(event.proposal);
-          void listAssistantProposals(project.id, conversationId)
-            .then((rows) => {
-              const next = rows.find((item) => item.id === event.proposal.id);
-              if (next) {
-                setProposals((current) => [
-                  ...current.filter((item) => item.id !== next.id),
-                  next,
-                ]);
-                onProposalPreview(next);
-              }
-            })
-            .catch(() => undefined);
+          // Global requests can create people and relationships while the
+          // author is still looking at a blank manuscript. Move the central
+          // workspace with the live proposal stream so those pale-teal drafts
+          // are visible without hunting for a secondary action. The matcher
+          // gates this to the current send's run/cursor, not history replay.
+          maybeFollowLiveProposal(event.proposal, event, conversationId);
         } else if (event.type === "proposal_patch") {
-          setProposals((current) =>
-            current.map((proposal) => {
-              if (proposal.id !== event.proposal_id) return proposal;
-              const next = proposalWithPatch(proposal, event.patch);
-              onProposalPreview(next);
-              return next;
-            }),
-          );
+          setProposals((current) => {
+            const existing = current.find(
+              (proposal) => proposal.id === event.proposal_id,
+            );
+            const base =
+              existing ||
+              ({
+                id: event.proposal_id,
+                conversation_id: conversationId,
+                target: event.target || target,
+                summary: "Agent 正在整理提案",
+                patches: [],
+                status: "building",
+                target_type: event.target?.type,
+                target_id: event.target?.id || undefined,
+              } satisfies AssistantProposal);
+            const preview = proposalWithPatch(base, event.patch);
+            onProposalPreview(preview);
+            maybeFollowLiveProposal(preview, event, conversationId);
+            return [
+              ...current.filter((proposal) => proposal.id !== event.proposal_id),
+              preview,
+            ];
+          });
         } else if (event.type === "proposal_completed") {
           setProposals((current) =>
             current.map((proposal) => {
@@ -2670,12 +3482,53 @@ function AgentDock({
               return next;
             }),
           );
-          setStatus("idle");
+          // Patch events are the live draft stream. Once the producer marks a
+          // proposal ready, fetch the durable row once to pick up metadata
+          // that was intentionally omitted from the skeleton/patch frames.
+          void listAssistantProposals(project.id, conversationId)
+            .then((rows) => {
+              const next = rows.find(
+                (proposal) => proposal.id === event.proposal_id,
+              );
+              if (!next) return;
+              setProposals((current) => [
+                ...current.filter((proposal) => proposal.id !== next.id),
+                next,
+              ]);
+              onProposalPreview(next);
+              maybeFollowLiveProposal(next, event, conversationId);
+            })
+            .catch(() => undefined);
+          if (
+            !activeRunIdRef.current ||
+            (event.run_id && event.run_id !== activeRunIdRef.current)
+          ) {
+            setStatus("idle");
+          }
         } else if (event.type === "status") {
           setStatus(event.status);
-          if (event.message) setNotice(event.message);
+          if (event.message) {
+            const noticeText = visibleAgentMessage(event.message);
+            const sameAsReply =
+              Boolean(noticeText) &&
+              (visibleAgentMessage(lastAssistantReplyRef.current) ===
+                noticeText ||
+                visibleAgentMessage(streamingTextRef.current) === noticeText);
+            if (!sameAsReply) setNotice(event.message);
+          }
           if (event.status === "idle") {
+            const pendingLiveSend = liveSendRef.current;
+            if (
+              (!event.run_id && !pendingLiveSend?.runId) ||
+              event.run_id === activeRunIdRef.current
+            ) {
+              activeRunIdRef.current = "";
+              liveSendRef.current = null;
+            }
             setFailedRunId("");
+            streamingMessageIdRef.current = "";
+            streamingTextRef.current = "";
+            setStreamingText("");
             void loadConversation(conversationId);
           }
         } else if (event.type === "error") {
@@ -2712,6 +3565,13 @@ function AgentDock({
     setStreamingText("");
     setStatus("idle");
     setFailedRunId("");
+    streamingMessageIdRef.current = "";
+    streamingTextRef.current = "";
+    lastAssistantReplyRef.current = "";
+    knownAssistantMessageIdsRef.current = new Set();
+    activeRunIdRef.current = "";
+    knownRunIdsRef.current = new Set();
+    liveSendRef.current = null;
     setNotice("新对话已准备好。你可以描述人物、章节或选区需要怎样改变。");
     setHistoryOpen(false);
     sequenceRef.current = 0;
@@ -2726,52 +3586,29 @@ function AgentDock({
       messages: created.messages || [],
       proposals: created.proposals || [],
     };
+    // Event sequences are scoped to a conversation. Reusing the previous
+    // conversation's cursor can discard the beginning of a newly-created
+    // stream (including run.started and the first live draft patches).
+    sequenceRef.current = 0;
     setConversation(loaded);
     setConversationTargetKey(targetKey);
-    setMessages(loaded.messages);
+    setMessages((current) => {
+      // Conversation creation returns before the POST that records the first
+      // user message. Preserve that optimistic bubble while the server starts
+      // the run, then let the durable response replace it on completion.
+      const pending = current.filter((item) => item.id.startsWith("local-"));
+      return [...loaded.messages, ...pending];
+    });
+    knownAssistantMessageIdsRef.current = new Set(
+      loaded.messages
+        .filter((item) => item.role === "assistant")
+        .map((item) => item.id),
+    );
     setProposals(loaded.proposals);
     queryClient.invalidateQueries({
       queryKey: ["assistant-conversations", project.id],
     });
     return loaded;
-  };
-  const captureSelection = () => {
-    const mountedEditor = Array.from(
-      document.querySelectorAll<HTMLTextAreaElement>(
-        "textarea[data-chapter-id]",
-      ),
-    ).find((item) => item.dataset.chapterId === activeChapter?.id);
-    const editor = mountedEditor || chapterPreviewRef.current;
-    const editorStart = editor?.selectionStart ?? 0;
-    const editorEnd = editor?.selectionEnd ?? 0;
-    const selected =
-      editor && editorEnd > editorStart
-        ? activeContent.slice(editorStart, editorEnd)
-        : window.getSelection()?.toString() || "";
-    if (!selected.trim()) {
-      setNotice("请先在正文中选中一段连续文字，再读取选区。");
-      return;
-    }
-    const start =
-      editor && editorEnd > editorStart
-        ? editorStart
-        : activeContent.indexOf(selected);
-    if (start < 0 || !activeChapter) {
-      setNotice("这段文字不在当前章节，已停止发送；请重新读取当前稿纸选区。");
-      return;
-    }
-    const snapshot: AgentSelectionSnapshot = {
-      chapter_id: activeChapter.id,
-      base_revision_id: activeChapter.revision_id || null,
-      start,
-      end: start + selected.length,
-      hash: textHash(selected),
-      quote: selected.slice(0, 240),
-    };
-    setSelectionText(selected);
-    setSelectionSnapshot(snapshot);
-    setScopeMode("selection");
-    setNotice("已锁定当前选区；如果正文发生变化，需要重新读取后再生成。");
   };
   const currentSelection =
     selectionSnapshot &&
@@ -2825,6 +3662,11 @@ function AgentDock({
     setStreamingText("");
     setStatus("streaming");
     setFailedRunId("");
+    beginLiveSend(
+      conversation?.id || "",
+      sequenceRef.current,
+      proposals.map((proposal) => proposal.id),
+    );
     const snapshot = contextSnapshot();
     const messageTarget = resolveAgentMessageTarget(
       target,
@@ -2847,11 +3689,27 @@ function AgentDock({
     setMessages((current) => [...current, localMessage]);
     try {
       const active = await ensureConversation();
+      const pendingLiveSend = liveSendRef.current;
+      if (pendingLiveSend) {
+        const sameConversation = pendingLiveSend.conversationId === active.id;
+        pendingLiveSend.conversationId = active.id;
+        if (!sameConversation) pendingLiveSend.baselineSequence = 0;
+      }
       await sendAssistantMessage(project.id, active.id, content, {
         target: messageTarget,
         context_snapshot: snapshot,
         authorized_asset_ids: authorisedAssets,
         expected_version: active.version,
+      }).then(({ message: savedMessage, run: startedRun }) => {
+        activateLiveRun(
+          active.id,
+          startedRun.id || savedMessage.run_id || "",
+        );
+        setMessages((current) =>
+          current.map((item) =>
+            item.id === localMessage.id ? savedMessage : item,
+          ),
+        );
       });
     } catch (error) {
       setStatus("error");
@@ -2860,27 +3718,63 @@ function AgentDock({
           ? error.message
           : "Agent 暂时不可用，请检查 Provider 配置。\n",
       );
+      liveSendRef.current = null;
+      activeRunIdRef.current = "";
     }
   };
   const decide = async (
     proposal: AssistantProposal,
     action: "apply" | "reject",
+    editedPatches?: AssistantProposalUpdatePatch[],
   ) => {
+    if (busyProposal) return;
+    if (proposal.status !== "proposed") {
+      setNotice(
+        proposal.status === "building"
+          ? "提案仍在生成中，请等它准备好后再确认。"
+          : "这条提案已不能确认，请重新生成最新建议。",
+      );
+      return;
+    }
     if (action === "apply" && conflictedProposalIds.has(proposal.id)) {
       setNotice("这条建议与尚未保存的手动修改冲突。请先保存或撤回手动修改，再重新生成建议。");
       return;
     }
     setBusyProposal(proposal.id);
     try {
+      let actionableProposal = proposal;
+      if (action === "apply" && editedPatches?.length) {
+        const patches = editedPatches.map(({ op, path, value }) => ({
+          op,
+          path,
+          value,
+        }));
+        const updated = await updateAssistantProposal(
+          project.id,
+          proposal.id,
+          patches,
+        );
+        actionableProposal = {
+          ...proposal,
+          ...updated,
+          patches: updated.patches.length ? updated.patches : proposal.patches,
+        };
+        setProposals((current) =>
+          current.map((item) =>
+            item.id === actionableProposal.id ? actionableProposal : item,
+          ),
+        );
+        onProposalPreview(actionableProposal);
+      }
       const next =
         action === "apply"
           ? await applyAssistantProposal(
               project.id,
-              conversation?.id || proposal.conversation_id || "",
-              proposal.id,
+              conversation?.id || actionableProposal.conversation_id || "",
+              actionableProposal.id,
               {
-                expected_version: proposal.base_version,
-                expected_memory_epoch: proposal.base_memory_epoch,
+                expected_version: actionableProposal.base_version,
+                expected_memory_epoch: actionableProposal.base_memory_epoch,
               },
             )
           : await rejectAssistantProposal(
@@ -2932,11 +3826,38 @@ function AgentDock({
       setBusyProposal("");
     }
   };
+  useEffect(() => {
+    const handleProposalAction = (event: Event) => {
+      const detail = (event as CustomEvent<AssistantProposalActionDetail>).detail;
+      if (!detail || (detail.projectId && detail.projectId !== project.id)) {
+        return;
+      }
+      const proposal = proposals.find((item) => item.id === detail.proposalId);
+      if (!proposal) return;
+      void decide(proposal, detail.action, detail.patches);
+    };
+    window.addEventListener(ASSISTANT_PROPOSAL_ACTION_EVENT, handleProposalAction);
+    return () =>
+      window.removeEventListener(
+        ASSISTANT_PROPOSAL_ACTION_EVENT,
+        handleProposalAction,
+      );
+  }, [decide, project.id, proposals]);
   const retryFailedRun = async () => {
     if (!conversation || !failedRunId || retrying) return;
     setRetrying(true);
     try {
-      await retryAssistantRun(project.id, conversation.id, failedRunId);
+      const retried = await retryAssistantRun(
+        project.id,
+        conversation.id,
+        failedRunId,
+      );
+      beginLiveSend(
+        conversation.id,
+        sequenceRef.current,
+        proposals.map((proposal) => proposal.id),
+      );
+      activateLiveRun(conversation.id, retried.id);
       setFailedRunId("");
       setStatus("queued");
       setNotice("已从上次中断处继续，正在重新连接 Agent…");
@@ -2991,122 +3912,6 @@ function AgentDock({
     target,
     relationNodeCount,
   );
-  const bulkProposals = proposals.filter(
-    (proposal) =>
-      proposal.status === "proposed" &&
-      !conflictedProposalIds.has(proposal.id),
-  );
-  const bulkActions: ProposalBulkActions | null =
-    bulkProposals.length > 1
-      ? {
-          firstId: bulkProposals[0].id,
-          ids: bulkProposals.map((proposal) => proposal.id),
-          busy: Boolean(busyProposal),
-          apply: () => void applyAllProposals(),
-          reject: () => void rejectAllProposals(),
-        }
-      : null;
-  const applyAllProposals = async () => {
-    if (!bulkProposals.length) return;
-    setBusyProposal("bulk");
-    try {
-      const next = await applyAssistantProposals(
-        project.id,
-        bulkProposals.map((proposal) => proposal.id),
-        {
-          expected_memory_epoch: bulkProposals[0].base_memory_epoch,
-          expected_versions: Object.fromEntries(
-            bulkProposals
-              .filter((proposal) => proposal.base_version != null)
-              .map((proposal) => [
-                proposal.id,
-                proposal.base_version as number,
-              ]),
-          ),
-        },
-      );
-      const appliedById = new Map(
-        next.map((proposal) => [proposal.id, proposal]),
-      );
-      setProposals((current) =>
-        current.map((proposal) => {
-          const applied = appliedById.get(proposal.id);
-          return applied
-            ? {
-                ...proposal,
-                ...applied,
-                patches: applied.patches.length
-                  ? applied.patches
-                  : proposal.patches,
-              }
-            : proposal;
-        }),
-      );
-      bulkProposals.forEach((proposal) => onProposalDismiss(proposal.id));
-      await Promise.all(next.map((proposal) => onProposalApplied(proposal)));
-      await queryClient.invalidateQueries({
-        queryKey: ["chapters", project.id],
-      });
-      await queryClient.invalidateQueries({
-        queryKey: ["project-attention", project.id],
-      });
-      setNotice(
-        `已接受 ${next.length || bulkProposals.length} 条提案；请复审正文差异。`,
-      );
-    } catch (error) {
-      const code = apiErrorCode(error);
-      notifyFallback(
-        onNotice,
-        "warning",
-        code === "proposal_conflict"
-          ? "部分提案与当前正文或设定冲突，请逐项复审后重试。"
-          : error instanceof Error
-            ? error.message
-            : "批量接受提案失败。",
-      );
-    } finally {
-      setBusyProposal("");
-    }
-  };
-  const rejectAllProposals = async () => {
-    if (!bulkProposals.length) return;
-    setBusyProposal("bulk");
-    try {
-      const next = await rejectAssistantProposals(
-        project.id,
-        bulkProposals.map((proposal) => proposal.id),
-      );
-      const rejectedById = new Map(
-        next.map((proposal) => [proposal.id, proposal]),
-      );
-      setProposals((current) =>
-        current.map((proposal) =>
-          rejectedById.has(proposal.id)
-            ? {
-                ...proposal,
-                ...rejectedById.get(proposal.id),
-                patches: proposal.patches,
-              }
-            : proposal,
-        ),
-      );
-      bulkProposals.forEach((proposal) => onProposalDismiss(proposal.id));
-      await queryClient.invalidateQueries({
-        queryKey: ["project-attention", project.id],
-      });
-      setNotice(
-        `已拒绝 ${next.length || bulkProposals.length} 条提案，正文和设定保持不变。`,
-      );
-    } catch (error) {
-      notifyFallback(
-        onNotice,
-        "warning",
-        error instanceof Error ? error.message : "批量拒绝提案失败。",
-      );
-    } finally {
-      setBusyProposal("");
-    }
-  };
   return (
     <aside
       className={`agent-dock ${mobileVisible ? "" : "mobile-panel-hidden"}`}
@@ -3284,21 +4089,9 @@ function AgentDock({
         )}
         {scopeMode === "selection" && (
           <div className="agent-selection-box">
-            <textarea
-              ref={chapterPreviewRef}
-              className="agent-chapter-preview"
-              value={activeContent}
-              readOnly
-              rows={5}
-              aria-label="在当前章节预览中选择正文"
-            />
-            <button
-              type="button"
-              className="button button-secondary button-small"
-              onClick={captureSelection}
-            >
-              <PencilLine size={12} /> 锁定上方选区
-            </button>
+            <p className="agent-selection-hint">
+              选区由中央稿纸自动锁定；需要更换时，请在正文中重新选择一段文字。
+            </p>
             <textarea
               value={selectionText}
               onChange={(event) => {
@@ -3350,7 +4143,8 @@ function AgentDock({
           </small>
         </div>
       )}
-      <div className="agent-messages" aria-live="polite">
+      <div className="agent-transcript" aria-live="polite">
+        <div className="agent-messages">
         {messages.length === 0 && !streamingText ? (
           <div className="agent-empty">
             <MessageCircle size={18} />
@@ -3387,11 +4181,19 @@ function AgentDock({
           </div>
         ) : (
           <>
-            {messages.map((item) => (
-              item.status === "partial" ? (
-                <details className="agent-message agent-message-partial" key={item.id}>
+            {messages.map((item) => {
+              const content =
+                item.role === "assistant"
+                  ? assistantMessageText(item.content)
+                  : item.content;
+              if (!content) return null;
+              return item.status === "partial" ? (
+                <details
+                  className="agent-message agent-message-partial"
+                  key={item.id}
+                >
                   <summary>上次未完成</summary>
-                  <p>{item.content}</p>
+                  <p>{content}</p>
                 </details>
               ) : (
                 <div
@@ -3405,7 +4207,7 @@ function AgentDock({
                         ? "Agent"
                         : "系统"}
                   </span>
-                  <p>{item.content}</p>
+                  <p>{content}</p>
                   {item.context_snapshot?.selection && (
                     <small className="agent-message-context">
                       选区 {item.context_snapshot.selection.start}–
@@ -3413,13 +4215,17 @@ function AgentDock({
                     </small>
                   )}
                 </div>
-              )
-            ))}
-            {streamingText && (
+              );
+            })}
+            {streamingText &&
+              (!streamingMessageIdRef.current ||
+                !messages.some(
+                  (item) => item.id === streamingMessageIdRef.current,
+                )) && (
               <div className="agent-message agent-message-assistant">
                 <span>Agent</span>
                 <p>
-                  {streamingText}
+                  {visibleAgentMessage(streamingText)}
                   <i className="agent-caret" />
                 </p>
               </div>
@@ -3427,24 +4233,10 @@ function AgentDock({
           </>
         )}
       </div>
-      {proposals.length > 0 && (
-        <div className="agent-proposals">
-          <div className="agent-section-label">
-            <span>实时提案</span>
-            <small>应用前仍可复审 · 一次只处理一个范围</small>
-          </div>
-          {proposals.map((proposal) => (
-            <AgentProposalCard
-              key={proposal.id}
-              proposal={proposal}
-              bulk={bulkActions}
-              busy={busyProposal === proposal.id}
-              conflict={conflictedProposalIds.has(proposal.id)}
-              onApply={() => void decide(proposal, "apply")}
-              onReject={() => void decide(proposal, "reject")}
-            />
-          ))}
-        </div>
+      {proposals.some(isPreviewProposal) && (
+        <p className="agent-change-notice" role="status">
+          改动已显示在当前内容
+        </p>
       )}
       {notice && (
         <div
@@ -3464,6 +4256,7 @@ function AgentDock({
           )}
         </div>
       )}
+      </div>
       <div className="agent-compose">
         <textarea
           value={message}
@@ -3542,11 +4335,15 @@ export default function StoryStudio({
   useEffect(() => {
     setMode(initialMode);
     setEntityView(initialMode === "story-map" ? "graph" : "table");
+  }, [initialMode, project.id]);
+  useEffect(() => {
+    // Project changes are the reset boundary. Internal Agent-driven surface
+    // changes also update `initialMode` in the shell, but must preserve the
+    // draft person/edge that the user just asked to reveal.
     setIsNewCharacter(false);
     setSelectedCharacterId(null);
     setGraphTarget(null);
-    onModeChange(initialMode);
-  }, [initialMode, onModeChange, project.id]);
+  }, [project.id]);
   const charactersQuery = useQuery({
     queryKey: ["characters", project.id],
     queryFn: () => getCharacters(project.id),
@@ -3740,6 +4537,71 @@ export default function StoryStudio({
       return next;
     });
   }, []);
+  const followAgentProposal = (proposal: AssistantProposal) => {
+    const operation = String(proposal.operation || "").toLowerCase();
+    const targetType = String(
+      proposal.target_type || proposal.target.type || "",
+    ).toLowerCase();
+    const patch = chapterPatchValues(proposal);
+    const chapterId = String(
+      (targetType.includes("chapter") ? proposal.target_id || proposal.target.id : "") ||
+        patch.chapter_id ||
+        patch.chapterId ||
+        "",
+    );
+    if (targetType.includes("chapter") || operation.includes("chapter")) {
+      const chapter = chapters.find((item) => item.id === chapterId);
+      if (chapter) onChapter(chapter);
+      changeMode("manuscript");
+      notifyFallback(
+        onNotice,
+        "info",
+        chapter
+          ? `Agent 正文草稿已显示在《${chapter.title}》下方。`
+          : "正文草稿已生成，但对应稿纸暂未找到。",
+      );
+      return;
+    }
+    if (
+      targetType.includes("graph") ||
+      targetType.includes("thread") ||
+      targetType.includes("relation") ||
+      targetType.includes("relationship") ||
+      operation.includes("graph")
+    ) {
+      changeMode("story-map");
+      setEntityView("graph");
+      setGraphTarget(proposal.target);
+      notifyFallback(onNotice, "info", "Agent 草稿已直接显示为图谱中的虚线节点和连线。");
+      return;
+    }
+    if (targetType.includes("character") || operation.includes("character")) {
+      changeMode("characters");
+      setEntityView("table");
+      const targetId = proposal.target_id || proposal.target.id;
+      const current = targetId
+        ? characters.find((item) => item.id === targetId)
+        : undefined;
+      setManualPaths(new Set());
+      if (current) {
+        setIsNewCharacter(false);
+        setSelectedCharacterId(current.id);
+        setEditing({
+          ...current,
+          aliases: [...current.aliases],
+          tags: [...current.tags],
+          custom_fields: { ...current.custom_fields },
+        });
+      } else {
+        setIsNewCharacter(true);
+        setSelectedCharacterId("new-character");
+        // Keep the form's canonical new-character identity. Agent values are
+        // rendered as a non-persistent diff beside each field.
+        setEditing(emptyCharacter(project.id));
+      }
+      notifyFallback(onNotice, "info", "Agent 草稿已直接显示在人物卷宗中，确认后才会生效。");
+    }
+  };
   const handleManualCharacterChange = useCallback(
     (next: CharacterCard, path?: string) => {
       setEditing(next);
@@ -3836,9 +4698,16 @@ export default function StoryStudio({
   const draftCharacters = useMemo(
     () =>
       liveProposals
-        .map((proposal) => proposalDraftCharacter(project.id, proposal))
-        .filter((character): character is CharacterCard => Boolean(character)),
+        .map((proposal) => {
+          const character = proposalDraftCharacter(project.id, proposal);
+          return character ? { proposal, character } : null;
+        })
+        .filter((item): item is AgentCharacterDraft => Boolean(item)),
     [liveProposals, project.id],
+  );
+  const manuscriptAgentDraft = useMemo(
+    () => chapterAgentDraft(activeChapter, activeContent, liveProposals),
+    [activeChapter, activeContent, liveProposals],
   );
   const agentDrafts = useMemo(
     () => characterAgentDrafts(editing, liveProposals, manualPaths),
@@ -3958,6 +4827,7 @@ export default function StoryStudio({
                 project={project}
                 activeChapter={activeChapter}
                 activeContent={activeContent}
+                agentDraft={manuscriptAgentDraft}
                 onContentChange={onContentChange}
                 onCreateChapter={onCreateChapter}
                 onStartCharacter={() => {
@@ -4081,6 +4951,7 @@ export default function StoryStudio({
             assistantProvider={assistantProvider}
             onProposalPreview={handleProposalPreview}
             onProposalDismiss={dismissProposalPreview}
+            onFollowProposal={followAgentProposal}
             conflictedProposalIds={conflictedProposalIds}
             onProposalApplied={async (proposal) => {
               dismissProposalPreview(proposal.id);
@@ -4179,6 +5050,7 @@ function ManuscriptEditor({
   project,
   activeChapter,
   activeContent,
+  agentDraft,
   onContentChange,
   onCreateChapter,
   onStartCharacter,
@@ -4187,11 +5059,31 @@ function ManuscriptEditor({
   project: Project;
   activeChapter: Chapter | null;
   activeContent: string;
+  agentDraft?: ChapterAgentDraft | null;
   onContentChange: (content: string) => void;
   onCreateChapter: () => void;
   onStartCharacter: () => void;
   onImport: () => void;
 }) {
+  const [editingDraftId, setEditingDraftId] = useState("");
+  const [editedDraft, setEditedDraft] = useState("");
+  const draftRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!agentDraft || agentDraft.proposalId !== editingDraftId) {
+      setEditingDraftId("");
+      setEditedDraft(agentDraft?.editValue || "");
+    }
+  }, [agentDraft?.editValue, agentDraft?.proposalId, editingDraftId]);
+  useEffect(() => {
+    if (!agentDraft?.proposalId) return undefined;
+    const timer = window.setTimeout(() => {
+      draftRef.current?.scrollIntoView?.({ block: "nearest", behavior: "auto" });
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [agentDraft?.proposalId]);
+  const editingAgentDraft = Boolean(
+    agentDraft && editingDraftId === agentDraft.proposalId,
+  );
   return (
     <div className="manuscript-editor">
       <div className="manuscript-editor-head">
@@ -4258,6 +5150,76 @@ function ManuscriptEditor({
             </button>
           </div>
         </div>
+      )}
+      {activeChapter && agentDraft && (
+        <section
+          ref={draftRef}
+          className="manuscript-agent-draft"
+          aria-label="Agent 正文草稿（待确认）"
+        >
+          <div className="manuscript-agent-draft-head">
+            <div>
+              <span className="eyebrow"><Sparkles size={12} /> Agent 草稿</span>
+              <h3>{agentDraft.summary || "待确认的正文修改"}</h3>
+            </div>
+            <span className="manuscript-draft-status">
+              {editingAgentDraft ? "正在手动修改 · 尚未写入正文" : "只读预览 · 不会写入正文"}
+            </span>
+          </div>
+          <div className="manuscript-agent-diff" aria-label="Agent 正文差异">
+            <div>
+              <small>原文片段</small>
+              <del>{agentDraft.before.slice(agentDraft.start, agentDraft.end) || "（空白）"}</del>
+            </div>
+            <ArrowRight size={14} aria-hidden="true" />
+            <div>
+              <small>Agent 替换</small>
+              <strong>{agentDraft.replacement || "（删除）"}</strong>
+            </div>
+          </div>
+          <label className="manuscript-agent-preview-label">
+            <span>
+              {editingAgentDraft
+                ? agentDraft.editsWholeChapter
+                  ? "手动修改完整草稿"
+                  : "手动修改替换内容"
+                : "完整草稿"}
+            </span>
+            <textarea
+              className="manuscript-agent-preview"
+              value={editingAgentDraft ? editedDraft : agentDraft.after}
+              readOnly={!editingAgentDraft}
+              onChange={(event) => setEditedDraft(event.target.value)}
+              rows={8}
+              aria-label="Agent 正文草稿预览"
+            />
+          </label>
+          <AgentDraftActions
+            proposalId={agentDraft.proposalId}
+            status={agentDraft.status}
+            editing={editingAgentDraft}
+            disabled={agentDraft.status === "building"}
+            patches={
+              editingAgentDraft
+                ? [
+                    {
+                      op: "replace",
+                      path: agentDraft.editPath,
+                      value: editedDraft,
+                    },
+                  ]
+                : undefined
+            }
+            onManualEdit={() => {
+              if (editingAgentDraft) {
+                setEditingDraftId("");
+                return;
+              }
+              setEditedDraft(agentDraft.editValue);
+              setEditingDraftId(agentDraft.proposalId);
+            }}
+          />
+        </section>
       )}
     </div>
   );
