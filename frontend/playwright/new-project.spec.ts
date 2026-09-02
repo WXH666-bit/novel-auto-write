@@ -40,7 +40,11 @@ test.describe("新建小说向导", () => {
       }
       if (scenario.mode === "setup") {
         await expect(
-          page.getByRole("heading", { name: /林渡|选择一位人物|新增人物卷宗/ }),
+          page
+            .getByRole("heading", {
+              name: /林渡|选择一位人物|新增人物卷宗/,
+            })
+            .first(),
         ).toBeVisible();
         await expect(
           page.getByRole("heading", { name: "和 Agent 一起写" }),

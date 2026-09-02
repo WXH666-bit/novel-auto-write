@@ -283,6 +283,20 @@ ASSISTANT_EXTRACTION_INSTRUCTION = (
     "不要 Markdown、YAML、解释文字，也不要使用 create_setting_entry 或 replace。"
 )
 
+ASSISTANT_LIVE_EXTRACTION_INSTRUCTION = (
+    "把上一条回复中用户明确要求的新建或修改整理成待审核提案，并使用 JSONL 逐行输出。"
+    "不要输出 Markdown 围栏、数组、说明文字或空行。每个提案先输出一行 "
+    '{"event":"proposal_start","key":"p1","operation":"create_character",'
+    '"target_type":"character","target_id":null,"reason":"新增人物"}，'
+    "随后每生成一个字段立即输出一行 "
+    '{"event":"proposal_patch","key":"p1","path":"name","value":"人物名"}，'
+    '完成该提案后输出 {"event":"proposal_end","key":"p1"}。'
+    "人物字段必须先输出 name；人物关系必须作为独立 upsert_graph_edge 提案，"
+    "并依次输出 source_name、target_name、relation_type，可再输出 label。"
+    "章节修改使用 edit_chapter 或 edit_chapter_selection；全局故事设定使用 "
+    "update_project_settings。key 在同一次回复中必须唯一。没有具体变更时不要输出任何内容。"
+)
+
 
 def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -2074,6 +2088,12 @@ def _normalise_proposal_item(
     patch = _item_patch(item)
     target_id = _target_id_from_item(item, target)
     reason = _plain_reply(item.get("reason") or "助手建议")[:2000]
+    scope_chapter_id = (
+        _context_value(context, "chapter_id")
+        or (target or {}).get("chapter_id")
+        or ((target or {}).get("id") if (target or {}).get("type") == "chapter" else None)
+    )
+    scope_chapter_id = str(scope_chapter_id) if scope_chapter_id else None
 
     def result(operation: str, target_type: str, value: dict[str, Any], identifier: str | None = target_id) -> dict[str, Any] | None:
         if operation not in ALLOWED_OPERATIONS or not value:
@@ -2082,6 +2102,7 @@ def _normalise_proposal_item(
             "operation": operation,
             "target_type": target_type[:80] or "general",
             "target_id": identifier,
+            "scope_chapter_id": scope_chapter_id,
             "patch": value,
             "reason": reason,
         }
@@ -2258,6 +2279,373 @@ def _normalise_provider_output(
     return reply[:100_000], proposals
 
 
+def _proposal_scope_chapter_id(
+    db: Session,
+    project: Project,
+    item: dict[str, Any],
+) -> str | None:
+    value = item.get("scope_chapter_id") or project.current_chapter_id
+    if not value:
+        return None
+    chapter_id = str(value)
+    if db.scalar(
+        select(Chapter.id).where(
+            Chapter.id == chapter_id,
+            Chapter.project_id == project.id,
+        )
+    ) is None:
+        raise ValueError("提案关联的章节不存在或不属于当前项目")
+    return chapter_id
+
+
+def _proposal_base_version(
+    db: Session,
+    project: Project,
+    item: dict[str, Any],
+) -> int | None:
+    target_id = item.get("target_id")
+    if not target_id:
+        return None
+    model: type[Character] | type[StoryGraphNode] | type[StoryGraphEdge] | None
+    if item["operation"] in {"update_character", "upsert_character"}:
+        model = Character
+    elif item["operation"] in {"update_graph_node", "upsert_graph_node"}:
+        model = StoryGraphNode
+    elif item["operation"] in {"update_graph_edge", "upsert_graph_edge"}:
+        model = StoryGraphEdge
+    else:
+        model = None
+    if model is None:
+        return None
+    target = db.scalar(
+        select(model).where(model.id == target_id, model.project_id == project.id)
+    )
+    return int(target.version) if target is not None else None
+
+
+def _proposal_target_payload(proposal: Proposal) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": proposal.target_type,
+        "id": proposal.target_id or "",
+    }
+    if proposal.scope_chapter_id:
+        payload["chapter_id"] = proposal.scope_chapter_id
+    return payload
+
+
+def _proposal_preview_payload(
+    proposal: Proposal,
+    conversation: AgentConversation,
+    *,
+    include_patches: bool,
+) -> dict[str, Any]:
+    return {
+        "id": proposal.id,
+        "conversation_id": conversation.id,
+        "target": _proposal_target_payload(proposal),
+        "target_type": proposal.target_type,
+        "target_id": proposal.target_id,
+        "scope_chapter_id": proposal.scope_chapter_id,
+        "operation": proposal.operation,
+        "base_version": proposal.base_version,
+        "summary": proposal.reason or "待应用的设定提案",
+        "patches": (
+            [
+                {"path": key, "value": value, "label": key}
+                for key, value in (proposal.patch_json or {}).items()
+            ]
+            if include_patches
+            else []
+        ),
+        "status": proposal.status,
+        "created_at": proposal.created_at.isoformat()
+        if proposal.created_at
+        else None,
+    }
+
+
+def _live_proposal_is_complete(item: dict[str, Any]) -> bool:
+    operation = str(item.get("operation") or "")
+    patch = item.get("patch") if isinstance(item.get("patch"), dict) else {}
+    if operation in {"create_character", "update_character", "upsert_character"}:
+        return bool(patch.get("name") or item.get("target_id"))
+    if operation in {"upsert_graph_edge", "update_graph_edge"}:
+        source = any(
+            patch.get(key)
+            for key in (
+                "source_node_id",
+                "source_character_id",
+                "source_character",
+                "source_name",
+                "source",
+                "from",
+            )
+        )
+        target = any(
+            patch.get(key)
+            for key in (
+                "target_node_id",
+                "target_character_id",
+                "target_character",
+                "target_name",
+                "target",
+                "to",
+            )
+        )
+        return bool(source and target)
+    if operation in {"edit_chapter", "edit_chapter_selection"}:
+        return any(key in patch for key in ("replacement", "new_text", "content"))
+    return bool(patch)
+
+
+class _LiveProposalWriter:
+    """Persist extractor JSONL as durable preview events field by field."""
+
+    def __init__(
+        self,
+        db: Session,
+        conversation: AgentConversation,
+        run: AgentRun,
+        project: Project,
+        user: User,
+        *,
+        target: dict[str, Any] | None,
+        context: dict[str, Any] | None,
+    ) -> None:
+        self.db = db
+        self.conversation = conversation
+        self.run = run
+        self.project = project
+        self.user = user
+        self.target = target
+        self.context = context
+        self.change_set: ChangeSet | None = None
+        self.drafts: dict[str, dict[str, Any]] = {}
+        self.rows: dict[str, Proposal] = {}
+        self.normalised: dict[str, dict[str, Any]] = {}
+
+    def accept(self, value: dict[str, Any]) -> None:
+        event_name = str(value.get("event") or value.get("type") or "").strip().lower()
+        key = str(value.get("key") or value.get("proposal_key") or "").strip()[:120]
+        if not key:
+            return
+        if event_name == "proposal_start":
+            self.drafts[key] = {
+                "operation": value.get("operation"),
+                "target_type": value.get("target_type"),
+                "target_id": value.get("target_id"),
+                "reason": value.get("reason"),
+                "patch": {},
+            }
+            return
+        if event_name == "proposal_patch":
+            draft = self.drafts.get(key)
+            path = str(value.get("path") or "").strip()
+            if draft is None or not path or "value" not in value:
+                return
+            draft["patch"] = {**draft.get("patch", {}), path: value["value"]}
+            self._sync(key, draft)
+            return
+        if event_name in {"proposal", "proposal_complete"}:
+            patch = value.get("patch")
+            if not isinstance(patch, dict):
+                return
+            draft = {
+                "operation": value.get("operation"),
+                "target_type": value.get("target_type"),
+                "target_id": value.get("target_id"),
+                "reason": value.get("reason"),
+                "patch": dict(patch),
+            }
+            self.drafts[key] = draft
+            self._sync(key, draft)
+
+    def _ensure_change_set(self) -> ChangeSet:
+        if self.change_set is None:
+            self.change_set = ChangeSet(
+                project_id=self.project.id,
+                source_type="assistant",
+                source_id=self.run.id,
+                base_memory_epoch=self.project.memory_epoch,
+                status="building",
+                summary="助手根据对话提出的故事设定变更",
+                changes_json=[],
+                created_by_user_id=self.user.id,
+            )
+            self.db.add(self.change_set)
+            self.db.flush()
+        return self.change_set
+
+    def _sync(self, key: str, draft: dict[str, Any]) -> None:
+        normalised = _normalise_proposal_item(
+            draft,
+            target=self.target,
+            context=self.context,
+        )
+        if not normalised or not _live_proposal_is_complete(normalised[0]):
+            return
+        item = normalised[0]
+        proposal = self.rows.get(key)
+        if proposal is None:
+            change_set = self._ensure_change_set()
+            proposal = Proposal(
+                project_id=self.project.id,
+                change_set_id=change_set.id,
+                operation=item["operation"],
+                target_type=item["target_type"],
+                target_id=item.get("target_id"),
+                scope_chapter_id=_proposal_scope_chapter_id(
+                    self.db,
+                    self.project,
+                    item,
+                ),
+                patch_json={},
+                base_version=_proposal_base_version(self.db, self.project, item),
+                base_memory_epoch=self.project.memory_epoch,
+                status="building",
+                reason=item.get("reason"),
+                created_by_user_id=self.user.id,
+            )
+            self.db.add(proposal)
+            self.db.flush()
+            self.rows[key] = proposal
+            proposal_payload = _proposal_preview_payload(
+                proposal,
+                self.conversation,
+                include_patches=False,
+            )
+            add_event(
+                self.db,
+                self.conversation,
+                "proposal.created",
+                {
+                    "proposal_id": proposal.id,
+                    "operation": proposal.operation,
+                    "proposal": proposal_payload,
+                    "attempt": _run_attempt(self.run),
+                    "target": proposal_payload["target"],
+                    "base_version": proposal.base_version,
+                    "scope_chapter_id": proposal.scope_chapter_id,
+                },
+                run_id=self.run.id,
+            )
+            self.db.commit()
+
+        old_patch = dict(proposal.patch_json or {})
+        next_patch = dict(item["patch"])
+        changed = [
+            (path, patch_value)
+            for path, patch_value in next_patch.items()
+            if path not in old_patch or old_patch[path] != patch_value
+        ]
+        self.normalised[key] = item
+        for path, patch_value in changed:
+            old_patch[path] = patch_value
+            proposal.patch_json = dict(old_patch)
+            add_event(
+                self.db,
+                self.conversation,
+                "proposal.patch",
+                {
+                    "proposal_id": proposal.id,
+                    "patch": {"path": path, "value": patch_value, "label": path},
+                    "attempt": _run_attempt(self.run),
+                    "target": _proposal_target_payload(proposal),
+                    "base_version": proposal.base_version,
+                    "scope_chapter_id": proposal.scope_chapter_id,
+                },
+                run_id=self.run.id,
+            )
+            self.db.commit()
+
+    def finish(self) -> list[Proposal]:
+        result = list(self.rows.values())
+        if not result or self.change_set is None:
+            return []
+        self.change_set.changes_json = [
+            self.normalised[key]
+            for key in self.rows
+            if key in self.normalised
+        ]
+        self.change_set.status = "proposed"
+        for proposal in result:
+            proposal.status = "proposed"
+            self.db.add(
+                AgentToolCall(
+                    project_id=self.project.id,
+                    conversation_id=self.conversation.id,
+                    run_id=self.run.id,
+                    tool_name=proposal.operation,
+                    arguments_json={
+                        "target_type": proposal.target_type,
+                        "target_id": proposal.target_id,
+                        "scope_chapter_id": proposal.scope_chapter_id,
+                        "patch": proposal.patch_json,
+                    },
+                    result_json={"proposal_id": proposal.id, "status": "proposed"},
+                    status="completed",
+                )
+            )
+        self.db.flush()
+        for proposal in result:
+            proposal_payload = _proposal_preview_payload(
+                proposal,
+                self.conversation,
+                include_patches=True,
+            )
+            add_event(
+                self.db,
+                self.conversation,
+                "proposal.ready",
+                {
+                    "proposal_id": proposal.id,
+                    "change_set_id": self.change_set.id,
+                    "status": proposal.status,
+                    "proposal": proposal_payload,
+                    "attempt": _run_attempt(self.run),
+                    "target": proposal_payload["target"],
+                    "base_version": proposal.base_version,
+                    "scope_chapter_id": proposal.scope_chapter_id,
+                },
+                run_id=self.run.id,
+            )
+        self.db.commit()
+        return result
+
+
+async def _stream_proposal_events(
+    provider: Any,
+    messages: list[dict[str, Any]],
+    on_event: Any,
+) -> int:
+    buffer = ""
+    count = 0
+
+    def consume(line: str) -> None:
+        nonlocal count
+        cleaned = line.strip()
+        if not cleaned or cleaned in {"```", "```json", "```jsonl", "```ndjson"}:
+            return
+        try:
+            value = json.loads(cleaned)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if isinstance(value, dict):
+            count += 1
+            on_event(value)
+
+    async for chunk in provider.stream(messages, role="assistant", temperature=0.1):
+        if not chunk:
+            continue
+        buffer += str(chunk)
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            consume(line)
+    if buffer.strip():
+        consume(buffer)
+    return count
+
+
 def _make_proposals(
     db: Session,
     conversation: AgentConversation,
@@ -2285,36 +2673,15 @@ def _make_proposals(
     db.flush()
     result: list[Proposal] = []
     for item in proposals:
-        base_version: int | None = None
         target_id = item.get("target_id")
-        if target_id and item["operation"] in {"update_character", "upsert_character"}:
-            target = db.scalar(
-                select(Character).where(Character.id == target_id, Character.project_id == project.id)
-            )
-            if target is not None:
-                base_version = target.version
-        if target_id and item["operation"] in {"update_graph_node", "upsert_graph_node"}:
-            target = db.scalar(
-                select(StoryGraphNode).where(
-                    StoryGraphNode.id == target_id, StoryGraphNode.project_id == project.id
-                )
-            )
-            if target is not None:
-                base_version = target.version
-        if target_id and item["operation"] in {"update_graph_edge", "upsert_graph_edge"}:
-            target = db.scalar(
-                select(StoryGraphEdge).where(
-                    StoryGraphEdge.id == target_id, StoryGraphEdge.project_id == project.id
-                )
-            )
-            if target is not None:
-                base_version = target.version
+        base_version = _proposal_base_version(db, project, item)
         proposal = Proposal(
             project_id=project.id,
             change_set_id=change_set.id,
             operation=item["operation"],
             target_type=item["target_type"],
             target_id=target_id,
+            scope_chapter_id=_proposal_scope_chapter_id(db, project, item),
             patch_json=item["patch"],
             base_version=base_version,
             base_memory_epoch=project.memory_epoch,
@@ -2331,29 +2698,23 @@ def _make_proposals(
                 conversation_id=conversation.id,
                 run_id=run.id,
                 tool_name=item["operation"],
-                arguments_json={"target_type": item["target_type"], "target_id": target_id, "patch": item["patch"]},
+                arguments_json={
+                    "target_type": item["target_type"],
+                    "target_id": target_id,
+                    "scope_chapter_id": proposal.scope_chapter_id,
+                    "patch": item["patch"],
+                },
                 result_json={"proposal_id": proposal.id, "status": "proposed"},
                 status="completed",
             )
         )
-        proposal_payload = {
-            "id": proposal.id,
-            "conversation_id": conversation.id,
-            "target": {
-                "type": proposal.target_type,
-                "id": proposal.target_id or "",
-            },
-            "base_version": base_version,
-            "summary": proposal.reason or "待应用的设定提案",
-            # The created event is the preview skeleton.  Sending the full
-            # patch here made clients render the final state only after the
-            # transaction committed and made the event stream look atomic.
-            "patches": [],
-            "status": proposal.status,
-            "created_at": proposal.created_at.isoformat()
-            if proposal.created_at
-            else None,
-        }
+        # The created event is the preview skeleton. Sending the full patch
+        # here would make clients render the final state atomically.
+        proposal_payload = _proposal_preview_payload(
+            proposal,
+            conversation,
+            include_patches=False,
+        )
         add_event(
             db,
             conversation,
@@ -2365,6 +2726,7 @@ def _make_proposals(
                 "attempt": _run_attempt(run),
                 "target": proposal_payload["target"],
                 "base_version": base_version,
+                "scope_chapter_id": proposal.scope_chapter_id,
             },
             run_id=run.id,
         )
@@ -2383,6 +2745,7 @@ def _make_proposals(
                     "attempt": _run_attempt(run),
                     "target": proposal_payload["target"],
                     "base_version": base_version,
+                    "scope_chapter_id": proposal.scope_chapter_id,
                 },
                 run_id=run.id,
             )
@@ -2396,24 +2759,11 @@ def _make_proposals(
         proposal.status = "proposed"
     db.flush()
     for proposal in result:
-        proposal_payload = {
-            "id": proposal.id,
-            "conversation_id": conversation.id,
-            "target": {
-                "type": proposal.target_type,
-                "id": proposal.target_id or "",
-            },
-            "base_version": proposal.base_version,
-            "summary": proposal.reason or "待应用的设定提案",
-            "patches": [
-                {"path": key, "value": value, "label": key}
-                for key, value in (proposal.patch_json or {}).items()
-            ],
-            "status": proposal.status,
-            "created_at": proposal.created_at.isoformat()
-            if proposal.created_at
-            else None,
-        }
+        proposal_payload = _proposal_preview_payload(
+            proposal,
+            conversation,
+            include_patches=True,
+        )
         add_event(
             db,
             conversation,
@@ -2426,6 +2776,7 @@ def _make_proposals(
                 "attempt": _run_attempt(run),
                 "target": proposal_payload["target"],
                 "base_version": proposal.base_version,
+                "scope_chapter_id": proposal.scope_chapter_id,
             },
             run_id=run.id,
         )
@@ -2715,27 +3066,7 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
 
         _set_agent_stage(db, conversation, run, "extracting_proposals", status="running")
         db.commit()
-        if streamed:
-            # The natural-language response is already durable.  A second,
-            # structured pass extracts reviewable changes without replacing
-            # the visible stream with JSON.
-            proposal_messages = [
-                *messages,
-                {"role": "assistant", "content": reply},
-                {
-                    "role": "user",
-                    "content": ASSISTANT_EXTRACTION_INSTRUCTION,
-                },
-            ]
-            try:
-                structured, response = _run_async(
-                    provider.structured(proposal_messages, ASSISTANT_SCHEMA, role="assistant")
-                )
-            except Exception:
-                # A streamed reply remains useful even when the optional
-                # proposal extraction pass is unavailable.
-                structured = None
-        else:
+        if not streamed:
             # Non-streaming providers still use two distinct model calls:
             # first produce the user-facing natural-language answer, then
             # extract reviewable proposals from that answer.  Sending the
@@ -2747,6 +3078,37 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 response if isinstance(response, str) else getattr(response, "content", "")
             )
             reply = _plain_reply(completion_content)
+
+        # The extraction call has its own transport. Its JSONL protocol is
+        # persisted field by field, so character cards and chapter graph
+        # drafts change while the model is still producing them. Providers
+        # without a usable stream fall back to the original structured call.
+        live_messages = [
+            *messages,
+            {"role": "assistant", "content": reply},
+            {
+                "role": "user",
+                "content": ASSISTANT_LIVE_EXTRACTION_INSTRUCTION,
+            },
+        ]
+        live_writer = _LiveProposalWriter(
+            db,
+            conversation,
+            run,
+            project,
+            user,
+            target=target_context,
+            context=authoritative_context,
+        )
+        try:
+            _run_async(_stream_proposal_events(provider, live_messages, live_writer.accept))
+        except (AttributeError, NotImplementedError, ProviderError):
+            # Optional capability: the validated structured extractor below
+            # remains the compatibility path.
+            pass
+        live_proposals = live_writer.finish()
+
+        if not live_proposals:
             proposal_messages = [
                 *messages,
                 {"role": "assistant", "content": reply},
@@ -2756,9 +3118,11 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 },
             ]
             try:
-                structured, _structured_response = _run_async(
+                structured, structured_response = _run_async(
                     provider.structured(proposal_messages, ASSISTANT_SCHEMA, role="assistant")
                 )
+                if streamed:
+                    response = structured_response
             except Exception:
                 # The ordinary reply is already available and remains valid
                 # even when the optional proposal extraction call fails.
@@ -2805,6 +3169,11 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
             reply = natural_reply
             if not proposal_values:
                 proposal_values = natural_proposals
+        if live_proposals:
+            # The live writer already persisted these proposals and their
+            # preview events. Never duplicate them through legacy parsing of
+            # the visible assistant reply.
+            proposal_values = []
         reply = reply[:100_000]
         previous_content = assistant_message.content
         assistant_message.content = reply
@@ -2832,7 +3201,14 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 },
                 run_id=run.id,
             )
-        _make_proposals(db, conversation, run, project, user, proposal_values)
+        persisted_proposals = live_proposals or _make_proposals(
+            db,
+            conversation,
+            run,
+            project,
+            user,
+            proposal_values,
+        )
         _assert_agent_lease(db, run.id, lease_owner)
         _stop_agent_lease_heartbeat(heartbeat)
         heartbeat = None
@@ -2850,7 +3226,7 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 "message_id": assistant_message.id,
                 "run_id": run.id,
                 "reply": reply,
-                "proposal_count": len(proposal_values),
+                "proposal_count": len(persisted_proposals),
             },
             run_id=run.id,
         )
@@ -2864,7 +3240,7 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 "status": run.status,
                 "stage": run.stage,
                 "reply": reply,
-                "proposal_count": len(proposal_values),
+                "proposal_count": len(persisted_proposals),
             },
             run_id=run.id,
         )
@@ -2876,7 +3252,10 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 action="assistant.run_completed",
                 entity_type="agent_run",
                 entity_id=run.id,
-                after_json={"message_id": assistant_message.id, "proposal_count": len(proposal_values)},
+                after_json={
+                    "message_id": assistant_message.id,
+                    "proposal_count": len(persisted_proposals),
+                },
             )
         )
         job = db.scalar(
@@ -3032,9 +3411,11 @@ def _apply_character(
         _character_revision(db, target, user, "assistant")
     # Keep a character card visible in the graph even when the assistant was
     # used from the table view only.
+    graph_scope = proposal.scope_chapter_id or project.current_chapter_id
     node = db.scalar(
         select(StoryGraphNode).where(
             StoryGraphNode.project_id == project.id,
+            StoryGraphNode.scope_chapter_id == graph_scope,
             StoryGraphNode.node_type == "character",
             StoryGraphNode.ref_id == target.id,
         )
@@ -3043,6 +3424,7 @@ def _apply_character(
         db.add(
             StoryGraphNode(
                 project_id=project.id,
+                scope_chapter_id=graph_scope,
                 node_type="character",
                 ref_id=target.id,
                 character_id=target.id,
@@ -3150,14 +3532,23 @@ def _apply_graph_node(db: Session, project: Project, proposal: Proposal) -> tupl
     ):
         patch = _validate_graph_node_refs(db, project, patch)
     target = None
+    graph_scope = proposal.scope_chapter_id or project.current_chapter_id
     if proposal.target_id:
         target = db.scalar(
             select(StoryGraphNode)
-            .where(StoryGraphNode.id == proposal.target_id, StoryGraphNode.project_id == project.id)
+            .where(
+                StoryGraphNode.id == proposal.target_id,
+                StoryGraphNode.project_id == project.id,
+                StoryGraphNode.scope_chapter_id == graph_scope,
+            )
             .with_for_update()
         )
     if target is None and proposal.operation in {"upsert_graph_node"}:
-        target = StoryGraphNode(project_id=project.id, **patch)
+        target = StoryGraphNode(
+            project_id=project.id,
+            scope_chapter_id=graph_scope,
+            **patch,
+        )
         db.add(target)
         db.flush()
     elif target is None:
@@ -3179,10 +3570,15 @@ def _apply_graph_edge(db: Session, project: Project, proposal: Proposal) -> tupl
     if "data" not in patch:
         patch["data"] = raw_patch
     target = None
+    graph_scope = proposal.scope_chapter_id or project.current_chapter_id
     if proposal.target_id:
         target = db.scalar(
             select(StoryGraphEdge)
-            .where(StoryGraphEdge.id == proposal.target_id, StoryGraphEdge.project_id == project.id)
+            .where(
+                StoryGraphEdge.id == proposal.target_id,
+                StoryGraphEdge.project_id == project.id,
+                StoryGraphEdge.scope_chapter_id == graph_scope,
+            )
             .with_for_update()
         )
     if target is None and proposal.operation == "upsert_graph_edge":
@@ -3202,7 +3598,9 @@ def _apply_graph_edge(db: Session, project: Project, proposal: Proposal) -> tupl
             value = str(value)
             node = db.scalar(
                 select(StoryGraphNode).where(
-                    StoryGraphNode.id == value, StoryGraphNode.project_id == project.id
+                    StoryGraphNode.id == value,
+                    StoryGraphNode.project_id == project.id,
+                    StoryGraphNode.scope_chapter_id == graph_scope,
                 )
             )
             if node is not None:
@@ -3210,6 +3608,7 @@ def _apply_graph_edge(db: Session, project: Project, proposal: Proposal) -> tupl
             node = db.scalar(
                 select(StoryGraphNode).where(
                     StoryGraphNode.project_id == project.id,
+                    StoryGraphNode.scope_chapter_id == graph_scope,
                     StoryGraphNode.character_id == value,
                 )
             )
@@ -3223,13 +3622,28 @@ def _apply_graph_edge(db: Session, project: Project, proposal: Proposal) -> tupl
             )
             if character is None:
                 return None
-            return db.scalar(
+            node = db.scalar(
                 select(StoryGraphNode).where(
                     StoryGraphNode.project_id == project.id,
+                    StoryGraphNode.scope_chapter_id == graph_scope,
                     StoryGraphNode.node_type == "character",
                     StoryGraphNode.ref_id == character.id,
                 )
             )
+            if node is not None:
+                return node
+            node = StoryGraphNode(
+                project_id=project.id,
+                scope_chapter_id=graph_scope,
+                node_type="character",
+                ref_id=character.id,
+                character_id=character.id,
+                label=character.name,
+                data={"source": "assistant_relation"},
+            )
+            db.add(node)
+            db.flush()
+            return node
 
         source = resolve_node(
             "source_node_id",
@@ -3251,6 +3665,7 @@ def _apply_graph_edge(db: Session, project: Project, proposal: Proposal) -> tupl
             raise LookupError("图谱连线的节点必须属于当前项目且不能是自身")
         target = StoryGraphEdge(
             project_id=project.id,
+            scope_chapter_id=graph_scope,
             source_node_id=source.id,
             target_node_id=destination.id,
             **patch,

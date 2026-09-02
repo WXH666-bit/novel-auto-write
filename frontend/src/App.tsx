@@ -70,11 +70,11 @@ import {
   createProject,
   createChapter,
   completeChapter,
+  deleteProject,
   downloadExport,
   editReviewDraft,
   getCanon,
   getChapters,
-  getProjectAttention,
   getProviders,
   getCurrentUser,
   getAccountPreferences,
@@ -100,7 +100,6 @@ import {
   onAuthEvent,
   rebuildProjectMemory,
   reviewAction,
-  retryAssistantRun,
   retryGeneration,
   retryMemoryRun,
   testProvider,
@@ -134,8 +133,6 @@ import type {
   PlotThread,
   Project,
   ProviderProfile,
-  ProjectAttention,
-  ProjectAttentionItem,
   ReviewBundle,
   SourceRef,
   TimelineEvent,
@@ -338,13 +335,15 @@ function Workspace({
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() =>
     typeof window !== "undefined" && window.innerWidth <= 1024 && window.innerWidth > 880,
   );
-  const [attentionOpen, setAttentionOpen] = useState(false);
-  const [attentionBusyId, setAttentionBusyId] = useState("");
   const [showNewProject, setShowNewProject] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [showGeneration, setShowGeneration] = useState(false);
   const [showReview, setShowReview] = useState(false);
   const [showCommand, setShowCommand] = useState(false);
+  const [projectPendingDeletion, setProjectPendingDeletion] =
+    useState<Project | null>(null);
+  const [deleteProjectConfirmation, setDeleteProjectConfirmation] =
+    useState("");
   const [studioMode, setStudioMode] = useState<StudioMode>("characters");
   const [studioAutoOpenAgent, setStudioAutoOpenAgent] = useState(false);
   const [newProjectStartMode, setNewProjectStartMode] = useState<StartMode>("blank");
@@ -439,8 +438,8 @@ function Workspace({
       setShowGeneration(false);
       setShowReview(false);
       setShowCommand(false);
-      setAttentionOpen(false);
-      setAttentionBusyId("");
+      setProjectPendingDeletion(null);
+      setDeleteProjectConfirmation("");
       setSidebarCollapsed(false);
       setStudioMode("characters");
       setStudioAutoOpenAgent(false);
@@ -498,13 +497,6 @@ function Workspace({
     queryFn: () => getStoryMap(activeProjectId),
     enabled: Boolean(activeProjectId),
   });
-  const attentionQuery = useQuery({
-    queryKey: ["project-attention", activeProjectId],
-    queryFn: () => getProjectAttention(activeProjectId),
-    enabled: Boolean(activeProjectId),
-    staleTime: 8_000,
-    refetchInterval: 15_000,
-  });
   const storyMap = storyMapQuery.data ?? {
     threads: [],
     timeline: [],
@@ -527,10 +519,6 @@ function Workspace({
     (review
       ? chapters.find((chapter) => chapter.id === review.chapter_id)
       : activeChapter) ?? null;
-  // The attention endpoint is authoritative. During its initial request keep
-  // the slot quiet instead of inferring work from stale local queries.
-  const attentionCount = attentionQuery.data?.total ?? 0;
-
   const saveGenerationSettings = useCallback(
     (projectId: string, payload: Partial<Project>) => {
       const workspaceEpoch = workspaceEpochRef.current;
@@ -699,6 +687,8 @@ function Workspace({
         setShowImport(false);
         setShowGeneration(false);
         setShowReview(false);
+        setProjectPendingDeletion(null);
+        setDeleteProjectConfirmation("");
         setForceAcceptOpen(false);
         setMobileSidebar(false);
         setMobileLedger(false);
@@ -1145,6 +1135,49 @@ function Workspace({
     },
   });
 
+  const deleteProjectMutation = useMutation({
+    mutationFn: async (project: Project) => {
+      await queryClient.cancelQueries({
+        predicate: (query) =>
+          query.queryKey.some((key) => key === project.id),
+      });
+      await deleteProject(project.id);
+    },
+    onSuccess: (_result, project) => {
+      queryClient.setQueryData<Project[]>(["projects"], (current) =>
+        (current || []).filter((item) => item.id !== project.id),
+      );
+      queryClient.removeQueries({
+        predicate: (query) =>
+          query.queryKey.some((key) => key === project.id),
+      });
+      if (activeProjectId === project.id) {
+        setActiveProjectId("");
+        setActiveChapterId("");
+        setJob(null);
+        setReview(null);
+        setMemoryRun(null);
+        setDraftById({});
+      }
+      setView("library");
+      setProjectPendingDeletion(null);
+      setDeleteProjectConfirmation("");
+      setToast({
+        tone: "success",
+        message: `《${project.title}》已删除。`,
+      });
+    },
+    onError: (error) => {
+      setToast({
+        tone: "error",
+        message:
+          error instanceof Error
+            ? error.message
+            : "小说删除失败，请稍后重试。",
+      });
+    },
+  });
+
   const startGeneration = async () => {
     if (!activeProject) return;
     const selectedProvider =
@@ -1268,122 +1301,6 @@ function Workspace({
       return;
     }
     setShowReview(true);
-  };
-
-  const revealAgentConversation = (
-    conversationId: string | null | undefined,
-    proposalId?: string | null,
-  ) => {
-    setStudioAutoOpenAgent(true);
-    setView("studio");
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
-        if (conversationId) {
-          window.dispatchEvent(
-            new CustomEvent("story-studio-open-conversation", {
-              detail: {
-                projectId: activeProjectId,
-                conversationId,
-              },
-            }),
-          );
-        } else if (proposalId) {
-          window.dispatchEvent(
-            new CustomEvent("story-studio-open-proposal", {
-              detail: {
-                projectId: activeProjectId,
-                proposalId,
-              },
-            }),
-          );
-        }
-        window.dispatchEvent(
-          new CustomEvent("story-studio-mobile-panel", { detail: "agent" }),
-        );
-      });
-    });
-  };
-
-  const openAttentionItem = async (item: ProjectAttentionItem) => {
-    if (!activeProject || attentionBusyId) return;
-    setAttentionBusyId(item.id);
-    try {
-      if (item.kind === "review" || item.kind === "recheck") {
-        const next = await getReview(item.id);
-        setReview(next);
-        setActiveChapterId(item.chapter_id || next.chapter_id);
-        setShowReview(true);
-        setAttentionOpen(false);
-        return;
-      }
-
-      if (item.kind === "proposal") {
-        const targetType = String(item.target_type || "").toLowerCase();
-        if (targetType.includes("chapter")) {
-          setStudioMode("manuscript");
-          if (item.chapter_id) setActiveChapterId(item.chapter_id);
-        } else if (
-          targetType.includes("graph") ||
-          targetType.includes("edge") ||
-          targetType.includes("relation") ||
-          targetType.includes("thread") ||
-          targetType.includes("event")
-        ) {
-          setStudioMode("story-map");
-        } else {
-          setStudioMode("characters");
-        }
-        setAttentionOpen(false);
-        revealAgentConversation(item.conversation_id, item.id);
-        return;
-      }
-
-      const runId = item.run_id || item.id;
-      const taskType =
-        item.task_type ||
-        (item.title.includes("助手")
-          ? "assistant"
-          : item.title.includes("记忆")
-            ? "memory"
-            : "generation");
-      if (taskType === "assistant") {
-        if (!item.conversation_id || !runId) {
-          throw new Error("这条 Agent 任务缺少可恢复的会话，请重新发起一次对话。");
-        }
-        await retryAssistantRun(
-          activeProject.id,
-          item.conversation_id,
-          runId,
-        );
-        setAttentionOpen(false);
-        revealAgentConversation(item.conversation_id);
-        setToast({ tone: "info", message: "Agent 已从上次中断处继续。" });
-      } else if (taskType === "memory") {
-        const next = await retryMemoryRun(runId);
-        setMemoryRun(next);
-        setAttentionOpen(false);
-        setToast({ tone: "info", message: "故事记忆已重新排队整理。" });
-      } else {
-        const next = await retryGeneration(runId);
-        setJob(next);
-        if (next.chapter_id) setActiveChapterId(next.chapter_id);
-        setStudioMode("manuscript");
-        setView("studio");
-        setAttentionOpen(false);
-        setToast({ tone: "info", message: "正文任务已从上次进度继续。" });
-      }
-      await queryClient.invalidateQueries({
-        queryKey: ["project-attention", activeProject.id],
-      });
-    } catch (error) {
-      setToast({
-        tone: "error",
-        message:
-          error instanceof Error ? error.message : "待处理事项暂时无法打开。",
-      });
-    } finally {
-      setAttentionBusyId("");
-    }
   };
 
   const openGeneration = () => {
@@ -1647,7 +1564,8 @@ function Workspace({
     showImport ||
     showGeneration ||
     showReview ||
-    showCommand;
+    showCommand ||
+    Boolean(projectPendingDeletion);
   const workspaceView = view === "desk" || view === "studio";
   const showChapterActions =
     view === "desk" || (view === "studio" && studioMode === "manuscript");
@@ -1725,16 +1643,6 @@ function Workspace({
                         : "已保存"}
                 </span>
               )}
-              <button
-                className={`topbar-attention ${attentionCount ? "has-items" : ""}`}
-                onClick={() => setAttentionOpen((open) => !open)}
-                aria-haspopup="dialog"
-                aria-expanded={attentionOpen}
-              >
-                <CircleAlert size={14} />
-                <span>待处理</span>
-                {attentionCount > 0 && <b>{attentionCount}</b>}
-              </button>
               {showChapterActions && (
                 <button
                   className="button button-primary button-compact topbar-complete"
@@ -1843,19 +1751,6 @@ function Workspace({
             </div>
           )}
         </div>
-        {workspaceView && attentionOpen && (
-          <AttentionPopover
-            count={attentionCount}
-            attention={attentionQuery.data}
-            onClose={() => setAttentionOpen(false)}
-            onItem={(item) => void openAttentionItem(item)}
-            busyId={attentionBusyId}
-            onReview={() => {
-              setAttentionOpen(false);
-              openReview();
-            }}
-          />
-        )}
       </header>
 
       {job && (
@@ -1877,6 +1772,10 @@ function Workspace({
             onImport={() => {
               setNewProjectStartMode("import");
               setShowNewProject(true);
+            }}
+            onDelete={(project) => {
+              setDeleteProjectConfirmation("");
+              setProjectPendingDeletion(project);
             }}
             onSettings={() => setView("settings")}
           />
@@ -1961,8 +1860,6 @@ function Workspace({
           <MobileWorkshopTabs
             key={`${activeProject.id}-${studioMode}-${studioAutoOpenAgent ? "agent" : "content"}`}
             initialPanel={studioAutoOpenAgent ? "agent" : "content"}
-            attentionCount={attentionCount}
-            onAttention={() => setAttentionOpen(true)}
           />
           <StoryStudio
             project={activeProject}
@@ -2120,6 +2017,22 @@ function Workspace({
           }}
         />
       )}
+      {projectPendingDeletion && (
+        <DeleteProjectModal
+          project={projectPendingDeletion}
+          confirmation={deleteProjectConfirmation}
+          busy={deleteProjectMutation.isPending}
+          onConfirmation={setDeleteProjectConfirmation}
+          onClose={() => {
+            if (deleteProjectMutation.isPending) return;
+            setProjectPendingDeletion(null);
+            setDeleteProjectConfirmation("");
+          }}
+          onDelete={() =>
+            deleteProjectMutation.mutate(projectPendingDeletion)
+          }
+        />
+      )}
       {toast && (
         <Toast
           tone={toast.tone}
@@ -2205,6 +2118,7 @@ function LibraryView({
   onSelect,
   onCreate,
   onImport,
+  onDelete,
   onSettings,
 }: {
   projects: Project[];
@@ -2212,6 +2126,7 @@ function LibraryView({
   onSelect: (project: Project) => void;
   onCreate: () => void;
   onImport: () => void;
+  onDelete: (project: Project) => void;
   onSettings: () => void;
 }) {
   return (
@@ -2267,6 +2182,7 @@ function LibraryView({
             active={project.id === activeProjectId}
             onOpen={() => onSelect(project)}
             onImport={onImport}
+            onDelete={() => onDelete(project)}
           />
         ))}
       </section>
@@ -2294,11 +2210,13 @@ function ProjectCard({
   active,
   onOpen,
   onImport,
+  onDelete,
 }: {
   project: Project;
   active: boolean;
   onOpen: () => void;
   onImport: () => void;
+  onDelete: () => void;
 }) {
   return (
     <article className={`project-card ${active ? "is-active" : ""}`}>
@@ -2340,8 +2258,21 @@ function ProjectCard({
         </button>
       </div>
       <div className="project-card-menu">
-        <button className="quiet-icon" onClick={onImport} aria-label="导入旧稿">
+        <button
+          className="quiet-icon"
+          onClick={onImport}
+          aria-label={`向《${project.title}》导入旧稿`}
+          title="导入旧稿"
+        >
           <Upload size={14} />
+        </button>
+        <button
+          className="quiet-icon project-delete-trigger"
+          onClick={onDelete}
+          aria-label={`删除小说《${project.title}》`}
+          title="删除小说"
+        >
+          <Trash2 size={14} />
         </button>
       </div>
     </article>
@@ -4912,85 +4843,6 @@ function CommandPalette({
   );
 }
 
-function AttentionPopover({
-  count,
-  attention,
-  onClose,
-  onItem,
-  busyId,
-  onReview,
-}: {
-  count: number;
-  attention?: ProjectAttention;
-  onClose: () => void;
-  onItem: (item: ProjectAttentionItem) => void;
-  busyId: string;
-  onReview: () => void;
-}) {
-  const items = attention?.items || [];
-  const reviewCount = attention
-    ? attention.reviews + attention.rechecks
-    : 0;
-  const firstReview = items.find(
-    (item) => item.kind === "review" || item.kind === "recheck",
-  );
-  return (
-    <div className="attention-popover" role="dialog" aria-label="待处理事项">
-      <div className="attention-popover-head">
-        <div>
-          <span className="eyebrow">当前工作</span>
-          <strong>{count ? `${count} 项待处理` : "暂时没有待处理事项"}</strong>
-        </div>
-        <button className="quiet-icon" onClick={onClose} aria-label="关闭待处理事项">
-          <X size={15} />
-        </button>
-      </div>
-      {items.length ? (
-        <div className="attention-list">
-          {items.slice(0, 5).map((item) => (
-            <button
-              className="attention-item"
-              key={`${item.kind}-${item.id}`}
-              onClick={() => onItem(item)}
-              disabled={Boolean(busyId)}
-            >
-              <span className={`attention-item-mark attention-${item.kind}`}>
-                {item.kind === "review" || item.kind === "recheck" ? <CircleAlert size={13} /> : <Clock3 size={13} />}
-              </span>
-              <span>
-                <strong>{item.title}</strong>
-                {item.detail && <small>{item.detail}</small>}
-              </span>
-              {busyId === item.id ? (
-                <Loader2 size={13} className="spin" />
-              ) : (
-                <ArrowRight size={13} />
-              )}
-            </button>
-          ))}
-        </div>
-      ) : (
-        <p className="attention-empty">
-          {count
-            ? reviewCount > 0
-              ? "待处理数据正在同步，打开审核包查看当前详情。"
-              : "待处理数据正在同步，稍后可从对应工作区继续处理。"
-            : "可以继续写作；新的审核或 Agent 提案会出现在这里。"}
-        </p>
-      )}
-      {reviewCount > 0 && (
-        <button
-          className="attention-review-link"
-          onClick={() => (firstReview ? onItem(firstReview) : onReview())}
-          disabled={Boolean(busyId)}
-        >
-          查看审核包 <ArrowRight size={13} />
-        </button>
-      )}
-    </div>
-  );
-}
-
 function Toast({
   tone,
   message,
@@ -5016,6 +4868,81 @@ function Toast({
         <X size={14} />
       </button>
     </div>
+  );
+}
+
+function DeleteProjectModal({
+  project,
+  confirmation,
+  busy,
+  onConfirmation,
+  onClose,
+  onDelete,
+}: {
+  project: Project;
+  confirmation: string;
+  busy: boolean;
+  onConfirmation: (value: string) => void;
+  onClose: () => void;
+  onDelete: () => void;
+}) {
+  const confirmed = confirmation === project.title;
+  return (
+    <Modal title="删除小说" kicker="不可撤销" onClose={onClose} size="small">
+      <form
+        className="delete-project-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (confirmed && !busy) onDelete();
+        }}
+      >
+        <div className="delete-project-warning">
+          <span className="delete-project-seal" aria-hidden="true">
+            <Trash2 size={19} />
+          </span>
+          <div>
+            <strong>将永久删除《{project.title}》</strong>
+            <p>
+              正文、人物卡、故事图谱、Agent 对话和历史版本都会一并移除，且无法恢复。
+            </p>
+          </div>
+        </div>
+        <label className="field delete-confirmation-field">
+          <span>
+            输入小说名称以确认
+            <small>请输入：{project.title}</small>
+          </span>
+          <input
+            autoFocus
+            autoComplete="off"
+            spellCheck={false}
+            value={confirmation}
+            onChange={(event) => onConfirmation(event.target.value)}
+            aria-label="输入小说名称确认删除"
+            placeholder={project.title}
+            disabled={busy}
+          />
+        </label>
+        <div className="modal-actions delete-project-actions">
+          <button
+            type="button"
+            className="button button-secondary"
+            onClick={onClose}
+            disabled={busy}
+          >
+            保留小说
+          </button>
+          <button
+            type="submit"
+            className="button button-danger"
+            disabled={!confirmed || busy}
+          >
+            {busy ? <Loader2 size={14} className="spin" /> : <Trash2 size={14} />}
+            {busy ? "正在删除…" : "永久删除小说"}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 

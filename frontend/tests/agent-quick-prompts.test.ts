@@ -4,6 +4,7 @@ import {
   getAgentQuickPromptVisibility,
   graphWithAgentDrafts,
   resolveAgentMessageTarget,
+  summarizeAgentBuild,
   visibleAgentMessage,
 } from "../src/StoryStudio";
 import type { AssistantProposal, StoryGraph } from "../src/types";
@@ -216,5 +217,50 @@ describe("Agent graph preview", () => {
     ).toBe(true);
     expect(graph.edges).toHaveLength(1);
     expect(graph.edges[0].data?.proposalId).toBe("relation-orphaned");
+  });
+
+  it("summarizes a live multi-character build across cards and graph", () => {
+    const proposals: AssistantProposal[] = [
+      ...["季衡", "阿芜"].map(
+        (name, index): AssistantProposal => ({
+          id: `live-character-${index}`,
+          conversation_id: "conversation-1",
+          target: { type: "character", id: "" },
+          target_type: "character",
+          operation: "create_character",
+          summary: `新增${name}`,
+          patches: [{ path: "name", value: name }],
+          status: index === 0 ? "building" : "proposed",
+        }),
+      ),
+      {
+        id: "live-relation",
+        conversation_id: "conversation-1",
+        target: { type: "relationship", id: "" },
+        target_type: "relationship",
+        operation: "upsert_graph_edge",
+        summary: "建立关系",
+        patches: [
+          { path: "source_name", value: "季衡" },
+          { path: "target_name", value: "阿芜" },
+          { path: "relation_type", value: "互相试探" },
+        ],
+        status: "building",
+      },
+    ];
+    const graph = graphWithAgentDrafts(
+      { nodes: [], edges: [] } satisfies StoryGraph,
+      proposals,
+    );
+
+    expect(summarizeAgentBuild(proposals, graph)).toEqual({
+      total: 3,
+      building: true,
+      characterCount: 2,
+      graphProposalCount: 1,
+      nodeCount: 2,
+      edgeCount: 1,
+      patchCount: 5,
+    });
   });
 });

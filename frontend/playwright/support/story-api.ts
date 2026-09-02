@@ -13,6 +13,10 @@ export interface MockStoryApiOptions {
   initialProjects?: Array<JsonRecord>;
   /** Optional proposal emitted by the mocked Agent after the next message. */
   assistantProposal?: JsonRecord;
+  /** Optional proposal sequence emitted as one live Agent build. */
+  assistantProposals?: JsonRecord[];
+  /** Optional wait before the first live Agent event, used to assert thinking UI. */
+  assistantEventDelayMs?: number;
 }
 
 export interface MockStoryApiState {
@@ -131,14 +135,16 @@ function makeCharacters(projectId: string) {
   ] satisfies JsonRecord[];
 }
 
-function makeGraph(projectId: string): JsonRecord {
+function makeGraph(projectId: string, chapterId?: string): JsonRecord {
   return {
     project_id: projectId,
+    chapter_id: chapterId || null,
     version: 1,
     updated_at: now,
     nodes: [
       {
         id: "node-char-1",
+        scope_chapter_id: chapterId || null,
         node_type: "character",
         character_id: "char-1",
         ref_id: "char-1",
@@ -149,6 +155,7 @@ function makeGraph(projectId: string): JsonRecord {
       },
       {
         id: "node-thread-1",
+        scope_chapter_id: chapterId || null,
         node_type: "plot",
         plot_thread_id: "thread-1",
         ref_id: "thread-1",
@@ -161,6 +168,7 @@ function makeGraph(projectId: string): JsonRecord {
     edges: [
       {
         id: "edge-1",
+        scope_chapter_id: chapterId || null,
         source_node_id: "node-char-1",
         target_node_id: "node-thread-1",
         source: "node-char-1",
@@ -196,7 +204,7 @@ function makeProjectData(project: JsonRecord): ProjectData {
     chapters,
     characters: makeCharacters(projectId),
     canon: [],
-    graph: makeGraph(projectId),
+    graph: makeGraph(projectId, chapterId || undefined),
     threads,
     conversation: null,
     messages: [],
@@ -265,25 +273,66 @@ function sseEvent(sequence: number, eventType: string, payload: JsonRecord) {
   return `id: ${sequence}\ndata: ${JSON.stringify({ sequence, event_type: eventType, payload_json: payload })}\n\n`;
 }
 
-async function assistantEvents(route: Route, data: ProjectData) {
-  const proposal = data.proposals[0];
-  const proposalPatches = Array.isArray(proposal?.patches)
-    ? (proposal.patches as JsonRecord[])
-    : [];
-  const patch = proposalPatches[0] || {
-    path: "motivation",
-    value: "守护灯塔",
-    label: "深层动机",
-  };
-  const proposalId = String(proposal?.id || "proposal-1");
+async function assistantEvents(
+  route: Route,
+  data: ProjectData,
+  delayMs = 0,
+) {
+  if (delayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
   const messageId = "assistant-message-1";
-  const body = [
-    sseEvent(1, "message.delta", { message_id: messageId, delta: "已记录。" }),
-    sseEvent(2, "proposal.created", { proposal: proposal || { id: proposalId, conversation_id: "assistant-1", target: { type: "character", id: "char-1" }, summary: "补充人物动机", patches: [patch], status: "proposed" } }),
-    sseEvent(3, "proposal.patch", { proposal_id: proposalId, patch }),
-    sseEvent(4, "proposal.completed", { proposal_id: proposalId }),
-    sseEvent(5, "message.completed", { message_id: messageId, reply: "已整理人物设定。", proposal_count: 1 }),
-  ].join("");
+  const proposals = data.proposals.length
+    ? data.proposals
+    : [
+        {
+          id: "proposal-1",
+          conversation_id: "assistant-1",
+          target: { type: "character", id: "char-1" },
+          summary: "补充人物动机",
+          patches: [
+            { path: "motivation", value: "守护灯塔", label: "深层动机" },
+          ],
+          status: "proposed",
+        },
+      ];
+  let sequence = 1;
+  const frames = [
+    sseEvent(sequence++, "message.delta", {
+      message_id: messageId,
+      delta: "已记录。",
+    }),
+  ];
+  for (const proposal of proposals) {
+    const proposalId = String(proposal.id || `proposal-${sequence}`);
+    const proposalPatches = Array.isArray(proposal.patches)
+      ? (proposal.patches as JsonRecord[])
+      : [];
+    frames.push(
+      sseEvent(sequence++, "proposal.created", {
+        proposal: { ...clone(proposal), patches: [], status: "building" },
+      }),
+    );
+    for (const patch of proposalPatches) {
+      frames.push(
+        sseEvent(sequence++, "proposal.patch", {
+          proposal_id: proposalId,
+          patch,
+        }),
+      );
+    }
+    frames.push(
+      sseEvent(sequence++, "proposal.completed", { proposal_id: proposalId }),
+    );
+  }
+  frames.push(
+    sseEvent(sequence, "message.completed", {
+      message_id: messageId,
+      reply: "已整理人物设定。",
+      proposal_count: proposals.length,
+    }),
+  );
+  const body = frames.join("");
   await route.fulfill({
     status: 200,
     contentType: "text/event-stream",
@@ -411,6 +460,17 @@ export async function mockStoryApi(
 
     if (parts[0] === "projects" && parts.length >= 2) {
       const projectId = parts[1];
+      if (parts.length === 2 && method === "DELETE") {
+        const exists = state.projects.some((project) => project.id === projectId);
+        if (!exists) {
+          await json(route, { detail: "project not found" }, 404);
+          return;
+        }
+        state.projects = state.projects.filter((project) => project.id !== projectId);
+        dataByProject.delete(projectId);
+        await route.fulfill({ status: 204 });
+        return;
+      }
       const data = getData(projectId);
       if (parts.length === 2 && method === "GET") {
         await json(route, data.project);
@@ -474,7 +534,9 @@ export async function mockStoryApi(
       }
       if (parts[2] === "story-graph") {
         if (parts.length === 3 && method === "GET") {
-          await json(route, clone(data.graph));
+          const graph = clone(data.graph);
+          graph.chapter_id = url.searchParams.get("chapter_id") || null;
+          await json(route, graph);
           return;
         }
         if (parts[3] === "nodes" && method === "POST") {
@@ -555,33 +617,35 @@ export async function mockStoryApi(
             const input = bodyRecord(body);
             const content = String(input.content || "");
             const target = input.target || data.conversation?.target || { type: "project", id: projectId };
-            const userMessage = { id: "user-message-1", role: "user", content, target, context_snapshot: input.context_snapshot || {}, authorized_asset_ids: input.authorized_asset_ids || [], proposal_ids: ["proposal-1"], created_at: now };
-            const assistantMessage = { id: "assistant-message-1", role: "assistant", content: "已整理人物设定。", proposal_ids: ["proposal-1"], created_at: now };
+            const configuredProposals = options.assistantProposals?.length
+              ? options.assistantProposals
+              : options.assistantProposal
+                ? [options.assistantProposal]
+                : [
+                    {
+                      id: "proposal-1",
+                      target,
+                      summary: "补充人物动机",
+                      patches: [
+                        { path: "motivation", value: "守护灯塔", label: "深层动机" },
+                      ],
+                      status: "proposed",
+                    },
+                  ];
+            data.proposals = configuredProposals.map((proposal) => ({
+              ...clone(proposal),
+              conversation_id: conversationId,
+              created_at: now,
+            }));
+            const proposalIds = data.proposals.map((proposal) => String(proposal.id));
+            const userMessage = { id: "user-message-1", role: "user", content, target, context_snapshot: input.context_snapshot || {}, authorized_asset_ids: input.authorized_asset_ids || [], proposal_ids: proposalIds, created_at: now };
+            const assistantMessage = { id: "assistant-message-1", role: "assistant", content: "已整理人物设定。", proposal_ids: proposalIds, created_at: now };
             data.messages = [userMessage, assistantMessage];
-            data.proposals = [
-              options.assistantProposal
-                ? {
-                    ...clone(options.assistantProposal),
-                    conversation_id: conversationId,
-                    created_at: now,
-                  }
-                : {
-                    id: "proposal-1",
-                    conversation_id: conversationId,
-                    target,
-                    summary: "补充人物动机",
-                    patches: [
-                      { path: "motivation", value: "守护灯塔", label: "深层动机" },
-                    ],
-                    status: "proposed",
-                    created_at: now,
-                  },
-            ];
             await json(route, { message: userMessage, run: { id: "assistant-run-1", status: "running" } }, 202);
             return;
           }
           if (parts[5] === "events" && parts[6] === "stream" && method === "GET") {
-            await assistantEvents(route, data);
+            await assistantEvents(route, data, options.assistantEventDelayMs);
             return;
           }
         }

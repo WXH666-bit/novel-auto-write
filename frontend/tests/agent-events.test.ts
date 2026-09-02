@@ -40,6 +40,8 @@ describe("assistant event protocol", () => {
     });
 
     expect(event).toMatchObject({ type: "status", status: "idle" });
+    expect(event.type).toBe("status");
+    if (event.type !== "status") throw new Error("expected status event");
     expect(event.message).toBeUndefined();
   });
 

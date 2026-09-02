@@ -149,6 +149,26 @@ def test_project_start_modes_are_atomic_and_import_is_explicit(api) -> None:
     assert {entry.after_json["start_mode"] for entry in audits} >= {"blank", "setup", "import"}
 
 
+def test_project_delete_removes_only_the_owned_project(api) -> None:
+    client, _factory, _owner_id = api
+    first = _new_project(client, title="待删除小说", start_mode="blank")
+    second = _new_project(client, title="保留小说", start_mode="setup")
+    other, _other_id = _second_client(api, "delete-other@example.test")
+    try:
+        denied = other.delete(f"/api/projects/{first['id']}")
+        assert denied.status_code == 404
+        assert client.get(f"/api/projects/{first['id']}").status_code == 200
+
+        deleted = client.delete(f"/api/projects/{first['id']}")
+        assert deleted.status_code == 204
+        assert client.get(f"/api/projects/{first['id']}").status_code == 404
+        remaining = client.get("/api/projects")
+        assert remaining.status_code == 200
+        assert [project["id"] for project in remaining.json()] == [second["id"]]
+    finally:
+        other.close()
+
+
 def test_account_summary_preference_is_cas_and_tenant_scoped(api) -> None:
     client, factory, owner_id = api
     other, other_id = _second_client(api, "preference-other@example.test")
@@ -236,6 +256,7 @@ def test_characters_graph_and_layout_are_project_isolated_and_epoched(api) -> No
     assert edge.status_code == 201, edge.text
     assert client.get(f"/api/projects/{first_id}").json()["memory_epoch"] == 3
     assert client.get(f"/api/projects/{second_id}/story-graph").json() == {
+        "chapter_id": None,
         "nodes": [],
         "edges": [],
         "layout": None,
@@ -270,6 +291,72 @@ def test_characters_graph_and_layout_are_project_isolated_and_epoched(api) -> No
     assert layout.status_code == 200, layout.text
     assert client.get(f"/api/projects/{second_id}/story-graph/layout").status_code == 404
     assert client.get(f"/api/projects/{first_id}/story-graph/layout").json()["version"] == 1
+
+
+def test_story_graph_nodes_edges_and_layout_are_isolated_by_chapter(api) -> None:
+    client, _factory, _owner_id = api
+    project = _new_project(client, title="章节图谱", start_mode="setup")
+    project_id = project["id"]
+    chapter_one = _create_chapter(client, project_id, content="第一章正文")
+    chapter_two_response = client.post(
+        f"/api/projects/{project_id}/chapters",
+        json={"chapter_number": 2, "title": "第二章", "content": "第二章正文"},
+    )
+    assert chapter_two_response.status_code == 201, chapter_two_response.text
+    chapter_two = chapter_two_response.json()
+
+    first_node = client.post(
+        f"/api/projects/{project_id}/story-graph/nodes",
+        json={"scope_chapter_id": chapter_one["id"], "node_type": "custom", "label": "第一章线索"},
+    )
+    second_node = client.post(
+        f"/api/projects/{project_id}/story-graph/nodes",
+        json={"scope_chapter_id": chapter_two["id"], "node_type": "custom", "label": "第二章线索"},
+    )
+    assert first_node.status_code == 201, first_node.text
+    assert second_node.status_code == 201, second_node.text
+
+    first_graph = client.get(
+        f"/api/projects/{project_id}/story-graph",
+        params={"chapter_id": chapter_one["id"]},
+    )
+    second_graph = client.get(
+        f"/api/projects/{project_id}/story-graph",
+        params={"chapter_id": chapter_two["id"]},
+    )
+    assert first_graph.json()["chapter_id"] == chapter_one["id"]
+    assert [node["label"] for node in first_graph.json()["nodes"]] == ["第一章线索"]
+    assert second_graph.json()["chapter_id"] == chapter_two["id"]
+    assert [node["label"] for node in second_graph.json()["nodes"]] == ["第二章线索"]
+
+    cross_chapter_edge = client.post(
+        f"/api/projects/{project_id}/story-graph/edges",
+        json={
+            "scope_chapter_id": chapter_one["id"],
+            "source_node_id": first_node.json()["id"],
+            "target_node_id": second_node.json()["id"],
+            "relation_type": "should_fail",
+        },
+    )
+    assert cross_chapter_edge.status_code == 422
+
+    for chapter, marker in ((chapter_one, "one"), (chapter_two, "two")):
+        saved = client.put(
+            f"/api/projects/{project_id}/story-graph/layout",
+            json={
+                "scope_chapter_id": chapter["id"],
+                "layout_json": {"marker": marker},
+            },
+        )
+        assert saved.status_code == 200, saved.text
+    assert client.get(
+        f"/api/projects/{project_id}/story-graph/layout",
+        params={"chapter_id": chapter_one["id"]},
+    ).json()["layout_json"]["marker"] == "one"
+    assert client.get(
+        f"/api/projects/{project_id}/story-graph/layout",
+        params={"chapter_id": chapter_two["id"]},
+    ).json()["layout_json"]["marker"] == "two"
 
 
 def test_media_sniffs_content_strips_exif_limits_size_and_enforces_tenants(api) -> None:

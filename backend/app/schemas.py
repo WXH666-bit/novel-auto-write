@@ -606,6 +606,7 @@ class CharacterRead(CharacterFields, ORMModel):
 
 
 class StoryGraphNodeCreate(BaseModel):
+    scope_chapter_id: str | None = None
     node_type: str = Field(default="custom", min_length=1, max_length=40)
     ref_id: str | None = None
     character_id: str | None = None
@@ -621,6 +622,7 @@ class StoryGraphNodeCreate(BaseModel):
 
 
 class StoryGraphNodeUpdate(BaseModel):
+    scope_chapter_id: str | None = None
     node_type: str | None = Field(default=None, min_length=1, max_length=40)
     ref_id: str | None = None
     character_id: str | None = None
@@ -639,6 +641,7 @@ class StoryGraphNodeUpdate(BaseModel):
 class StoryGraphNodeRead(ORMModel):
     id: str
     project_id: str
+    scope_chapter_id: str | None = None
     node_type: str
     ref_id: str | None = None
     character_id: str | None = None
@@ -657,6 +660,7 @@ class StoryGraphNodeRead(ORMModel):
 
 
 class StoryGraphEdgeCreate(BaseModel):
+    scope_chapter_id: str | None = None
     source_node_id: str
     target_node_id: str
     relation_type: str = Field(default="related", min_length=1, max_length=80)
@@ -668,6 +672,7 @@ class StoryGraphEdgeCreate(BaseModel):
 
 
 class StoryGraphEdgeUpdate(BaseModel):
+    scope_chapter_id: str | None = None
     source_node_id: str | None = None
     target_node_id: str | None = None
     relation_type: str | None = Field(default=None, min_length=1, max_length=80)
@@ -682,6 +687,7 @@ class StoryGraphEdgeUpdate(BaseModel):
 class StoryGraphEdgeRead(ORMModel):
     id: str
     project_id: str
+    scope_chapter_id: str | None = None
     source_node_id: str
     target_node_id: str
     relation_type: str
@@ -696,6 +702,7 @@ class StoryGraphEdgeRead(ORMModel):
 
 
 class StoryGraphLayoutUpdate(BaseModel):
+    scope_chapter_id: str | None = None
     layout_json: dict[str, Any] = Field(default_factory=dict)
     expected_version: int | None = Field(default=None, ge=1)
 
@@ -703,6 +710,7 @@ class StoryGraphLayoutUpdate(BaseModel):
 class StoryGraphLayoutRead(ORMModel):
     id: str
     project_id: str
+    scope_chapter_id: str | None = None
     layout_json: dict[str, Any] = Field(default_factory=dict)
     version: int
     created_at: datetime
@@ -710,6 +718,7 @@ class StoryGraphLayoutRead(ORMModel):
 
 
 class StoryGraphRead(BaseModel):
+    chapter_id: str | None = None
     nodes: list[StoryGraphNodeRead] = Field(default_factory=list)
     edges: list[StoryGraphEdgeRead] = Field(default_factory=list)
     layout: StoryGraphLayoutRead | None = None
@@ -752,6 +761,7 @@ class ProposalRead(ORMModel):
     operation: str
     target_type: str
     target_id: str | None = None
+    scope_chapter_id: str | None = None
     patch_json: dict[str, Any] = Field(default_factory=dict)
     base_version: int | None = None
     base_memory_epoch: int | None = None

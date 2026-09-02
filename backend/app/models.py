@@ -141,8 +141,8 @@ class Project(Base):
     graph_edges: Mapped[list[StoryGraphEdge]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
-    graph_layout: Mapped[StoryGraphLayout | None] = relationship(
-        back_populates="project", cascade="all, delete-orphan", uselist=False
+    graph_layouts: Mapped[list[StoryGraphLayout]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
     )
     media_assets: Mapped[list[MediaAsset]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
@@ -989,6 +989,9 @@ class Proposal(Base):
     operation: Mapped[str] = mapped_column(String(80), nullable=False)
     target_type: Mapped[str] = mapped_column(String(80), nullable=False)
     target_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    scope_chapter_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("chapters.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     patch_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     base_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     base_memory_epoch: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1006,17 +1009,31 @@ class Proposal(Base):
 
 
 class StoryGraphNode(Base):
-    """A project-scoped graph node, optionally backed by a story entity."""
+    """A chapter-scoped graph node, optionally backed by a story entity."""
 
     __tablename__ = "story_graph_nodes"
     __table_args__ = (
-        Index("ix_story_graph_nodes_project_type", "project_id", "node_type"),
-        UniqueConstraint("project_id", "node_type", "ref_id", name="uq_story_graph_node_ref"),
+        Index(
+            "ix_story_graph_nodes_project_chapter_type",
+            "project_id",
+            "scope_chapter_id",
+            "node_type",
+        ),
+        UniqueConstraint(
+            "project_id",
+            "scope_chapter_id",
+            "node_type",
+            "ref_id",
+            name="uq_story_graph_node_chapter_ref",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scope_chapter_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True, index=True
     )
     node_type: Mapped[str] = mapped_column(String(40), default="custom", nullable=False)
     ref_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
@@ -1052,23 +1069,32 @@ class StoryGraphNode(Base):
 
 
 class StoryGraphEdge(Base):
-    """A directed/undirected relationship between two same-project nodes."""
+    """A relationship between two nodes in the same project chapter."""
 
     __tablename__ = "story_graph_edges"
     __table_args__ = (
-        Index("ix_story_graph_edges_project", "project_id", "relation_type"),
+        Index(
+            "ix_story_graph_edges_project_chapter",
+            "project_id",
+            "scope_chapter_id",
+            "relation_type",
+        ),
         UniqueConstraint(
             "project_id",
+            "scope_chapter_id",
             "source_node_id",
             "target_node_id",
             "relation_type",
-            name="uq_story_graph_edge_relation",
+            name="uq_story_graph_edge_chapter_relation",
         ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scope_chapter_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True, index=True
     )
     source_node_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("story_graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True
@@ -1100,14 +1126,23 @@ class StoryGraphEdge(Base):
 
 
 class StoryGraphLayout(Base):
-    """Saved viewport/layout state for the graph view."""
+    """Saved viewport/layout state for one chapter graph view."""
 
     __tablename__ = "story_graph_layouts"
-    __table_args__ = (UniqueConstraint("project_id", name="uq_story_graph_layout_project"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "scope_chapter_id",
+            name="uq_story_graph_layout_project_chapter",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scope_chapter_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=True, index=True
     )
     layout_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
@@ -1118,7 +1153,7 @@ class StoryGraphLayout(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )
 
-    project: Mapped[Project] = relationship(back_populates="graph_layout")
+    project: Mapped[Project] = relationship(back_populates="graph_layouts")
 
 
 class MediaAsset(Base):

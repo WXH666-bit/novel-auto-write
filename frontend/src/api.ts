@@ -447,6 +447,12 @@ export async function updateProject(
   return normalizeProject(payload);
 }
 
+export async function deleteProject(projectId: string): Promise<void> {
+  await apiRequest<void>(`/projects/${projectId}`, {
+    method: "DELETE",
+  });
+}
+
 export async function getChapters(projectId: string): Promise<Chapter[]> {
   const payload = await apiRequest<unknown>(`/projects/${projectId}/chapters`);
   const result = unwrap<unknown>(payload, ["chapters", "items"]);
@@ -796,14 +802,21 @@ export async function deleteCharacterPortrait(
   void mediaId;
 }
 
-export async function getStoryGraph(projectId: string): Promise<StoryGraph> {
+export async function getStoryGraph(
+  projectId: string,
+  chapterId?: string | null,
+): Promise<StoryGraph> {
+  const query = chapterId
+    ? `?chapter_id=${encodeURIComponent(chapterId)}`
+    : "";
   return normalizeStoryGraph(
-    await apiRequest<unknown>(`/projects/${projectId}/story-graph`),
+    await apiRequest<unknown>(`/projects/${projectId}/story-graph${query}`),
   );
 }
 
 export async function saveStoryGraph(
   projectId: string,
+  chapterId: string,
   graph: StoryGraph,
   options: {
     deletedEdgeIds?: string[];
@@ -832,6 +845,7 @@ export async function saveStoryGraph(
       ...(node.source_refs?.length ? { source_refs: node.source_refs } : {}),
     };
     const payload = {
+      scope_chapter_id: chapterId,
       node_type: node.type === "thread" ? "plot" : node.type,
       ref_id:
         node.ref_id ??
@@ -872,6 +886,7 @@ export async function saveStoryGraph(
     const source = nodeIds.get(edge.source) ?? edge.source;
     const target = nodeIds.get(edge.target) ?? edge.target;
     const payload = {
+      scope_chapter_id: chapterId,
       source_node_id: source,
       target_node_id: target,
       relation_type: edge.relation_type ?? edge.kind ?? "related",
@@ -911,6 +926,7 @@ export async function saveStoryGraph(
   }
   await saveStoryGraphLayout(
     projectId,
+    chapterId,
     {
       nodes: graph.nodes.map((node) => ({
         id: nodeIds.get(node.id) ?? node.id,
@@ -920,11 +936,12 @@ export async function saveStoryGraph(
     },
     options.expectedLayoutVersion ?? graph.layout_version ?? graph.version,
   );
-  return getStoryGraph(projectId);
+  return getStoryGraph(projectId, chapterId);
 }
 
 export async function saveStoryGraphLayout(
   projectId: string,
+  chapterId: string,
   layout: Record<string, unknown>,
   expectedVersion?: number,
 ): Promise<unknown> {
@@ -932,6 +949,7 @@ export async function saveStoryGraphLayout(
     method: "PATCH",
     body: JSON.stringify({
       layout_json: layout,
+      scope_chapter_id: chapterId,
       ...(expectedVersion !== undefined
         ? { expected_version: expectedVersion }
         : {}),
@@ -2257,6 +2275,14 @@ function normalizeStoryGraphNode(value: unknown): StoryGraphNode | null {
       y: Number(position.y ?? raw.position_y ?? raw.y ?? 0),
     },
     data,
+    scope_chapter_id:
+      String(
+        raw.scope_chapter_id ??
+          raw.scopeChapterId ??
+          data.scope_chapter_id ??
+          data.scopeChapterId ??
+          "",
+      ) || undefined,
     ref_id:
       String(raw.ref_id ?? raw.refId ?? data.ref_id ?? data.refId ?? "") ||
       undefined,
@@ -2348,6 +2374,14 @@ function normalizeStoryGraphEdge(value: unknown): StoryGraphEdge {
       raw.data && typeof raw.data === "object"
         ? (raw.data as Record<string, unknown>)
         : {},
+    scope_chapter_id:
+      String(
+        raw.scope_chapter_id ??
+          raw.scopeChapterId ??
+          rawData.scope_chapter_id ??
+          rawData.scopeChapterId ??
+          "",
+      ) || undefined,
     source_node_id: String(raw.source_node_id ?? raw.source ?? "") || undefined,
     target_node_id: String(raw.target_node_id ?? raw.target ?? "") || undefined,
     version: numberOrUndefined(raw.version),
@@ -2412,6 +2446,8 @@ export function normalizeStoryGraph(value: unknown): StoryGraph {
     Array.isArray(raw.edges) ? raw.edges.map(normalizeStoryGraphEdge) : []
   ).filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
   return {
+    chapter_id:
+      String(raw.chapter_id ?? raw.chapterId ?? "") || undefined,
     nodes,
     edges,
     version: numberOrUndefined(raw.version ?? raw.revision ?? layout.version),
@@ -2547,6 +2583,10 @@ function normalizeAssistantProposal(value: unknown): AssistantProposal {
       raw.target_id === null
         ? null
         : String(raw.target_id ?? raw.targetId ?? "") || undefined,
+    scope_chapter_id:
+      raw.scope_chapter_id === null
+        ? null
+        : String(raw.scope_chapter_id ?? raw.scopeChapterId ?? "") || undefined,
     change_set_id:
       String(raw.change_set_id ?? raw.changeSetId ?? "") || undefined,
     base_version:

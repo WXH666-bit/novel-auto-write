@@ -449,6 +449,140 @@ proposals:
         assert replace_events[-1].payload_json["content"] == "普通回复"
 
 
+def test_live_jsonl_extractor_persists_chapter_drafts_field_by_field(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.stream_calls = 0
+            self.structured_calls = 0
+
+        async def stream(self, _messages: list[dict[str, Any]], **_kwargs: Any):
+            self.stream_calls += 1
+            if self.stream_calls == 1:
+                yield "正在为本章整理两个人物和他们的关系。"
+                return
+            for chunk in (
+                '{"event":"proposal_start","key":"p1","operation":"create_character","target_type":"character","target_id":null,"reason":"新增侦探"}\n',
+                '{"event":"proposal_patch","key":"p1","path":"name","value":"林渡"}\n',
+                '{"event":"proposal_patch","key":"p1","path":"motivation","value":"查明灯塔真相"}\n',
+                '{"event":"proposal_end","key":"p1"}\n',
+                '{"event":"proposal_start","key":"p2","operation":"create_character","target_type":"character","target_id":null,"reason":"新增守塔人"}\n',
+                '{"event":"proposal_patch","key":"p2","path":"name","value":"周遥"}\n',
+                '{"event":"proposal_end","key":"p2"}\n',
+                '{"event":"proposal_start","key":"p3","operation":"upsert_graph_edge","target_type":"character_relation","target_id":null,"reason":"建立本章关系"}\n',
+                '{"event":"proposal_patch","key":"p3","path":"source_name","value":"林渡"}\n',
+                '{"event":"proposal_patch","key":"p3","path":"target_name","value":"周遥"}\n',
+                '{"event":"proposal_patch","key":"p3","path":"relation_type","value":"互相试探"}\n',
+                '{"event":"proposal_end","key":"p3"}\n',
+            ):
+                yield chunk
+
+        async def structured(self, *_args: Any, **_kwargs: Any):
+            self.structured_calls += 1
+            raise AssertionError("live JSONL should avoid structured fallback")
+
+    provider = Provider()
+    monkeypatch.setattr(assistant_service, "provider_for", lambda _profile: provider)
+    with store() as db:
+        user, profile = seed_tenant(db)
+        assert profile is not None
+        project = models.Project(owner_id=user.id, name="章节实时提案")
+        chapter = models.Chapter(
+            project=project,
+            volume_number=1,
+            chapter_number=1,
+            sort_order=0,
+            title="第一章",
+            status="draft",
+        )
+        db.add_all([project, chapter])
+        db.flush()
+        project.current_chapter_id = chapter.id
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            provider_profile_id=profile.id,
+        )
+        db.add(conversation)
+        db.commit()
+        _message, run, _created = assistant_service.create_message_run(
+            db,
+            conversation,
+            user,
+            "为本章制作人物卡和关系图",
+            idempotency_key="live-jsonl-chapter-drafts",
+            target={"type": "project", "id": project.id, "chapter_id": chapter.id},
+        )
+
+        assistant_service.execute_agent_run(db, run.id)
+
+        proposals = db.scalars(
+            select(models.Proposal)
+            .where(models.Proposal.project_id == project.id)
+            .order_by(models.Proposal.created_at)
+        ).all()
+        assert provider.stream_calls == 2
+        assert provider.structured_calls == 0
+        assert [proposal.operation for proposal in proposals] == [
+            "create_character",
+            "create_character",
+            "upsert_graph_edge",
+        ]
+        assert {proposal.scope_chapter_id for proposal in proposals} == {chapter.id}
+        assert proposals[0].patch_json == {
+            "name": "林渡",
+            "motivation": "查明灯塔真相",
+        }
+        assert proposals[2].patch_json == {
+            "source_name": "林渡",
+            "target_name": "周遥",
+            "relation_type": "互相试探",
+        }
+        events = db.scalars(
+            select(models.AgentEvent)
+            .where(models.AgentEvent.run_id == run.id)
+            .order_by(models.AgentEvent.sequence)
+        ).all()
+        proposal_events = [event for event in events if event.event_type.startswith("proposal.")]
+        for proposal in proposals:
+            related = [
+                event
+                for event in proposal_events
+                if event.payload_json.get("proposal_id") == proposal.id
+            ]
+            assert related[0].event_type == "proposal.created"
+            assert related[-1].event_type == "proposal.ready"
+            assert all(
+                event.payload_json.get("scope_chapter_id") == chapter.id
+                for event in related
+            )
+        assert [
+            event.payload_json["patch"]["path"]
+            for event in proposal_events
+            if event.event_type == "proposal.patch"
+            and event.payload_json["proposal_id"] == proposals[0].id
+        ] == ["name", "motivation"]
+
+        for proposal in proposals:
+            assistant_service.apply_proposal(db, proposal, user)
+        graph_nodes = db.scalars(
+            select(models.StoryGraphNode).where(
+                models.StoryGraphNode.project_id == project.id,
+                models.StoryGraphNode.scope_chapter_id == chapter.id,
+            )
+        ).all()
+        graph_edges = db.scalars(
+            select(models.StoryGraphEdge).where(
+                models.StoryGraphEdge.project_id == project.id,
+                models.StoryGraphEdge.scope_chapter_id == chapter.id,
+            )
+        ).all()
+        assert {node.label for node in graph_nodes} == {"林渡", "周遥"}
+        assert len(graph_edges) == 1
+        assert graph_edges[0].relation_type == "互相试探"
+
+
 def test_empty_chapter_proposal_creates_first_revision_and_review_bundle(store: Any) -> None:
     with store() as db:
         user, _profile = seed_tenant(db, with_provider=False)

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CircleAlert, FileText, MessageCircle } from "lucide-react";
+import { FileText, MessageCircle } from "lucide-react";
 
 /**
  * The narrow workspace only needs two readable surfaces.  Keep the former
@@ -12,8 +12,6 @@ type ActiveMobileWorkshopPanel = "agent" | "content";
 
 interface MobileWorkshopTabsProps {
   initialPanel?: MobileWorkshopPanel;
-  attentionCount?: number;
-  onAttention?: () => void;
 }
 
 function normalizePanel(panel: MobileWorkshopPanel): ActiveMobileWorkshopPanel {
@@ -28,8 +26,6 @@ function normalizePanel(panel: MobileWorkshopPanel): ActiveMobileWorkshopPanel {
  */
 export default function MobileWorkshopTabs({
   initialPanel = "dossier",
-  attentionCount = 0,
-  onAttention,
 }: MobileWorkshopTabsProps) {
   const [panel, setPanel] = useState<ActiveMobileWorkshopPanel>(() =>
     normalizePanel(initialPanel),
@@ -93,17 +89,6 @@ export default function MobileWorkshopTabs({
       >
         <MessageCircle size={14} aria-hidden="true" />
         Agent
-      </button>
-      <button
-        type="button"
-        className={`mobile-attention-tab ${attentionCount > 0 ? "has-items" : ""}`}
-        onClick={onAttention}
-        aria-haspopup="dialog"
-        aria-label={attentionCount > 0 ? `打开待处理事项，${attentionCount} 项` : "打开待处理事项"}
-      >
-        <CircleAlert size={14} aria-hidden="true" />
-        <span>待处理</span>
-        {attentionCount > 0 && <b>{attentionCount}</b>}
       </button>
     </nav>
   );

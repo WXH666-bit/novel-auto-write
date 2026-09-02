@@ -396,6 +396,22 @@ function isCharacterProposal(proposal: AssistantProposal) {
   );
 }
 
+function isGraphProposal(proposal: AssistantProposal) {
+  const operation = String(proposal.operation || "").toLowerCase();
+  const targetType = String(
+    proposal.target_type || proposal.target.type || "",
+  ).toLowerCase();
+  return (
+    targetType.includes("graph") ||
+    targetType.includes("thread") ||
+    targetType.includes("relation") ||
+    targetType.includes("relationship") ||
+    operation.includes("graph") ||
+    operation.includes("edge") ||
+    operation.includes("relation")
+  );
+}
+
 function targetsCharacter(
   proposal: AssistantProposal,
   character: CharacterCard,
@@ -618,7 +634,7 @@ export function graphWithAgentDrafts(
       type: "character",
       label,
       subtitle: "关系草稿端点",
-      status: "Agent 草稿",
+      status: proposal.status === "building" ? "Agent 制作中" : "Agent 草稿",
       position: {
         x: 90 + (endpointIndex % 3) * 245,
         y: 90 + Math.floor(endpointIndex / 3) * 145,
@@ -627,6 +643,7 @@ export function graphWithAgentDrafts(
         agentDraft: true,
         agentEndpointDraft: true,
         sourceProposalId: proposal.id,
+        draftStatus: proposal.status,
       },
     };
     working.nodes.push(endpoint);
@@ -670,14 +687,16 @@ export function graphWithAgentDrafts(
             draftPatches: proposalUpdatePatches(proposal),
             draftStatus: proposal.status,
           };
-          existing.status = "Agent 草稿";
+          existing.status =
+            proposal.status === "building" ? "Agent 制作中" : "Agent 草稿";
         } else {
           working.nodes.push({
             id: `agent-draft-node-${proposal.id}`,
             type: "character",
             label: String(patch.name || "Agent 建议人物"),
             subtitle: String(patch.role || patch.motivation || "待你确认"),
-            status: "Agent 草稿",
+            status:
+              proposal.status === "building" ? "Agent 制作中" : "Agent 草稿",
             position: {
               x: 90 + (index % 3) * 245,
               y: 90 + Math.floor(index / 3) * 145,
@@ -708,7 +727,8 @@ export function graphWithAgentDrafts(
             draftPatches: proposalUpdatePatches(proposal),
             draftStatus: proposal.status,
           };
-          existing.status = "Agent 草稿";
+          existing.status =
+            proposal.status === "building" ? "Agent 制作中" : "Agent 草稿";
         } else {
           const rawType = String(patch.node_type || patch.type || "event");
           const type: StoryGraphNode["type"] =
@@ -718,7 +738,8 @@ export function graphWithAgentDrafts(
             type,
             label: String(patch.label || patch.name || "Agent 建议节点"),
             subtitle: String(patch.subtitle || "待你确认"),
-            status: "Agent 草稿",
+            status:
+              proposal.status === "building" ? "Agent 制作中" : "Agent 草稿",
             position: {
               x: 120 + (index % 3) * 245,
               y: 120 + Math.floor(index / 3) * 145,
@@ -785,6 +806,41 @@ export function graphWithAgentDrafts(
       }
     });
   return working;
+}
+
+export type AgentBuildSummary = {
+  total: number;
+  building: boolean;
+  characterCount: number;
+  graphProposalCount: number;
+  nodeCount: number;
+  edgeCount: number;
+  patchCount: number;
+};
+
+export function summarizeAgentBuild(
+  proposals: AssistantProposal[],
+  graph: StoryGraph,
+): AgentBuildSummary {
+  const structureProposals = proposals.filter(
+    (proposal) => isCharacterProposal(proposal) || isGraphProposal(proposal),
+  );
+  return {
+    total: structureProposals.length,
+    building: structureProposals.some(
+      (proposal) => proposal.status === "building",
+    ),
+    characterCount: structureProposals.filter(
+      (proposal) => isCharacterProposal(proposal) && !isGraphProposal(proposal),
+    ).length,
+    graphProposalCount: structureProposals.filter(isGraphProposal).length,
+    nodeCount: graph.nodes.filter((node) => node.data?.agentDraft).length,
+    edgeCount: graph.edges.filter((edge) => edge.data?.agentDraft).length,
+    patchCount: structureProposals.reduce(
+      (total, proposal) => total + proposal.patches.length,
+      0,
+    ),
+  };
 }
 
 function notifyFallback(
@@ -1349,54 +1405,75 @@ function AgentCharacterDraftCard({
     {},
   );
   const patches = proposal.patches.slice(0, 6);
+  const building = proposal.status === "building";
   return (
     <article
-      className="character-card character-card-agent-draft"
+      className={`character-card character-card-agent-draft${building ? " is-agent-building" : ""}`}
       aria-label={`${character.name || "未命名人物"} Agent 草稿`}
     >
       <div className="character-card-image">
         <CharacterPortrait character={character} />
-        <span className="character-card-status status-pending">Agent 草稿</span>
+        <span className="character-card-status status-pending">
+          {building ? "制卡中" : "Agent 草稿"}
+        </span>
       </div>
       <div className="character-card-copy">
         <h3>{character.name || "未命名人物"}</h3>
         <p>
           {character.role || character.motivation || "正在形成的人物建议"}
         </p>
-        <dl className="character-draft-fields">
-          {patches.map((patch) => {
-            const path = patch.path;
-            const value = Object.prototype.hasOwnProperty.call(
-              editedValues,
-              path,
-            )
-              ? editedValues[path]
-              : Array.isArray(patch.value)
-                ? patch.value.join("、")
-                : String(patch.value ?? "");
-            return (
-              <div key={path}>
-                <dt>{patch.label || patchPath(path)}</dt>
-                <dd>
-                  {editing ? (
-                    <input
-                      value={value}
-                      onChange={(event) =>
-                        setEditedValues((current) => ({
-                          ...current,
-                          [path]: event.target.value,
-                        }))
-                      }
-                      aria-label={`${patch.label || patchPath(path)} Agent 草稿手动修改`}
-                    />
-                  ) : (
-                    value || "空白"
-                  )}
-                </dd>
-              </div>
-            );
-          })}
-        </dl>
+        {patches.length ? (
+          <dl className="character-draft-fields">
+            {patches.map((patch) => {
+              const path = patch.path;
+              const value = Object.prototype.hasOwnProperty.call(
+                editedValues,
+                path,
+              )
+                ? editedValues[path]
+                : Array.isArray(patch.value)
+                  ? patch.value.join("、")
+                  : String(patch.value ?? "");
+              return (
+                <div key={path}>
+                  <dt>{patch.label || patchPath(path)}</dt>
+                  <dd>
+                    {editing ? (
+                      <input
+                        value={value}
+                        onChange={(event) =>
+                          setEditedValues((current) => ({
+                            ...current,
+                            [path]: event.target.value,
+                          }))
+                        }
+                        aria-label={`${patch.label || patchPath(path)} Agent 草稿手动修改`}
+                      />
+                    ) : (
+                      value || "空白"
+                    )}
+                  </dd>
+                </div>
+              );
+            })}
+          </dl>
+        ) : (
+          <div
+            className="character-draft-writing"
+            aria-label="Agent 正在填写人物字段"
+          >
+            <span />
+            <span />
+            <span />
+          </div>
+        )}
+        <span className="character-draft-progress" role="status">
+          {building
+            ? patches.length
+              ? `正在写入第 ${patches.length + 1} 项资料…`
+              : "正在起草第一项资料…"
+            : `${proposal.patches.length} 项资料等待确认`}
+        </span>
         <AgentDraftActions
           proposalId={proposal.id}
           status={proposal.status}
@@ -1411,7 +1488,11 @@ function AgentCharacterDraftCard({
           }
           onManualEdit={() => setEditing((current) => !current)}
         />
-        <small>草稿只在此处预览，不会写入卷宗</small>
+        <small>
+          {building
+            ? "字段到达时会自动填入，完成后再确认"
+            : "草稿只在此处预览，不会写入卷宗"}
+        </small>
       </div>
     </article>
   );
@@ -1538,7 +1619,7 @@ function GraphNode({ data }: NodeProps<FlowNode>) {
     }));
   return (
     <div
-      className={`story-flow-node node-${data.type} ${data.agentDraft ? "is-agent-draft" : ""} ${data.agentEndpointDraft ? "is-agent-endpoint-draft" : ""}`}
+      className={`story-flow-node node-${data.type} ${data.agentDraft ? "is-agent-draft" : ""} ${data.draftStatus === "building" ? "is-agent-building" : ""} ${data.agentEndpointDraft ? "is-agent-endpoint-draft" : ""}`}
     >
       <Handle type="target" position={Position.Left} />
       <div className="story-flow-node-icon">
@@ -1619,6 +1700,7 @@ function fallbackGraph(
   project: Project,
   characters: CharacterCard[],
   storyMap: StoryMap,
+  activeChapter: Chapter | null,
 ): StoryGraph {
   const nodes: StoryGraphNode[] = characters.map((character, index) => ({
     id: `character-${character.id}`,
@@ -1640,8 +1722,18 @@ function fallbackGraph(
       character_id: character.id,
       source_refs: character.source_refs,
     },
+    scope_chapter_id: activeChapter?.id,
   }));
-  (storyMap.threads || []).slice(0, 6).forEach((thread, index) =>
+  (storyMap.threads || [])
+    .filter(
+      (thread) =>
+        !activeChapter ||
+        thread.points?.some(
+          (point) => point.chapter_number === activeChapter.number,
+        ),
+    )
+    .slice(0, 6)
+    .forEach((thread, index) =>
     nodes.push({
       id: `thread-${thread.id}`,
       type: "thread",
@@ -1660,9 +1752,15 @@ function fallbackGraph(
         thread_id: thread.id,
         plot_thread_id: thread.id,
       },
+      scope_chapter_id: activeChapter?.id,
     }),
   );
-  (storyMap.timeline || []).slice(0, 8).forEach((event, index) =>
+  (storyMap.timeline || [])
+    .filter(
+      (event) => !activeChapter || event.chapter_id === activeChapter.id,
+    )
+    .slice(0, 8)
+    .forEach((event, index) =>
     nodes.push({
       id: `event-${event.id}`,
       type: "event",
@@ -1683,9 +1781,10 @@ function fallbackGraph(
         source_refs: event.source_ref ? [event.source_ref] : [],
         event_id: event.id,
       },
+      scope_chapter_id: activeChapter?.id,
     }),
   );
-  return { nodes, edges: [] };
+  return { chapter_id: activeChapter?.id, nodes, edges: [] };
 }
 
 function graphNodeIdentity(node: StoryGraphNode) {
@@ -1694,24 +1793,29 @@ function graphNodeIdentity(node: StoryGraphNode) {
   return `${node.type}:${ref || node.id}`;
 }
 
-function graphNodeTarget(node: FlowNode, projectId: string): AgentTarget {
+function graphNodeTarget(
+  node: FlowNode,
+  chapterId: string,
+): AgentTarget {
   const data = node.data;
   if (data.type === "character") {
     return {
       type: "character",
       id: data.character_id || data.ref_id || node.id,
+      chapter_id: chapterId,
     };
   }
   if (data.type === "thread") {
     return {
       type: "thread",
       id: data.plot_thread_id || data.ref_id || node.id,
+      chapter_id: chapterId,
     };
   }
   if (data.chapter_id) {
     return { type: "chapter", id: data.chapter_id };
   }
-  return { type: "project", id: projectId };
+  return { type: "chapter", id: chapterId, chapter_id: chapterId };
 }
 
 function mergeStoryGraphs(
@@ -2035,7 +2139,11 @@ function AgentGraphEdgeDraft({
         <strong>
           {source} <ArrowRight size={12} aria-hidden="true" /> {target}
         </strong>
-        <small>{edge.label || "正在形成关系"} · 虚线预览</small>
+        <small>
+          {edge.data?.draftStatus === "building"
+            ? "正在连接人物与情节…"
+            : `${edge.label || "建议关系"} · 虚线预览`}
+        </small>
       </div>
       {editing && displayPatches.length > 0 && (
         <div className="story-graph-agent-draft-fields">
@@ -2079,12 +2187,16 @@ function AgentGraphEdgeDraft({
 
 function StoryGraphView({
   projectId,
+  chapterId,
+  chapterTitle,
   graph,
   fallback,
   onNotice,
   onTargetChange,
 }: {
   projectId: string;
+  chapterId: string;
+  chapterTitle: string;
   graph: StoryGraph;
   fallback: StoryGraph;
   onNotice?: StoryStudioProps["onNotice"];
@@ -2180,6 +2292,7 @@ function StoryGraphView({
     mutationFn: () =>
       saveStoryGraph(
         projectId,
+        chapterId,
         {
           nodes: nodes
             .filter((node) => !node.data.agentDraft)
@@ -2201,6 +2314,7 @@ function StoryGraphView({
                   : undefined,
               position: node.position,
               data: node.data,
+              scope_chapter_id: chapterId,
               ref_id:
                 typeof node.data.ref_id === "string"
                   ? node.data.ref_id
@@ -2236,6 +2350,7 @@ function StoryGraphView({
               weight: edge.data?.weight,
               source_refs: edge.data?.source_refs,
               data: edge.data,
+              scope_chapter_id: chapterId,
               status:
                 (edge.data?.status as StoryGraphEdge["status"]) || "pending",
               version: edge.data?.version,
@@ -2246,7 +2361,7 @@ function StoryGraphView({
         { deletedEdgeIds, expectedLayoutVersion: graph.layout_version },
       ),
     onSuccess: (saved) => {
-      queryClient.setQueryData(["story-graph", projectId], saved);
+      queryClient.setQueryData(["story-graph", projectId, chapterId], saved);
       setDirty(false);
       setDeletedEdgeIds([]);
     },
@@ -2345,6 +2460,7 @@ function StoryGraphView({
         <div>
           <span className="eyebrow">故事图谱</span>
           <h2>把人物和情节线牵在一起</h2>
+          <small className="story-graph-chapter-scope">当前章节 · {chapterTitle}</small>
         </div>
         <div className="story-graph-actions">
           <div className="view-switch" role="group" aria-label="图谱观察方式">
@@ -2417,13 +2533,23 @@ function StoryGraphView({
             }}
             onConnect={connect}
             onNodeClick={(_, node) =>
-              onTargetChange?.(graphNodeTarget(node, projectId))
+              onTargetChange?.(graphNodeTarget(node, chapterId))
             }
             onEdgeClick={(_, edge) => {
               setSelectedEdgeId(edge.id);
-              onTargetChange?.({ type: "relationship", id: edge.id });
+              onTargetChange?.({
+                type: "relationship",
+                id: edge.id,
+                chapter_id: chapterId,
+              });
             }}
-            onPaneClick={() => onTargetChange?.({ type: "project", id: projectId })}
+            onPaneClick={() =>
+              onTargetChange?.({
+                type: "chapter",
+                id: chapterId,
+                chapter_id: chapterId,
+              })
+            }
             fitView
             minZoom={0.25}
             maxZoom={1.7}
@@ -2432,6 +2558,14 @@ function StoryGraphView({
             <Background color="rgba(74,84,78,.13)" gap={28} size={1} />
             <Controls showInteractive={false} />
             <MiniMap
+              ariaLabel="当前章节图谱缩略图"
+              pannable
+              zoomable
+              maskColor="rgba(79, 117, 107, .12)"
+              bgColor="#F7F5EC"
+              nodeStrokeColor="#FCFBF5"
+              nodeBorderRadius={2}
+              style={{ width: 148, height: 96 }}
               nodeColor={(node) =>
                 node.type === "character"
                   ? "#A9463B"
@@ -2441,6 +2575,14 @@ function StoryGraphView({
               }
             />
           </ReactFlow>
+          <span className="story-graph-minimap-label" aria-hidden="true">
+            章节缩略图
+          </span>
+          {nodes.length === 0 && (
+            <span className="story-graph-minimap-empty" aria-hidden="true">
+              本章暂无节点
+            </span>
+          )}
           {edges.some((edge) => edge.data?.agentDraft) && (
             <div className="story-graph-agent-drafts" aria-label="Agent 图谱草稿">
               {edges
@@ -2922,6 +3064,8 @@ function AgentDraftActions({
   disabled = false,
   status,
   compact = false,
+  primaryLabel = "接受改动",
+  showManualEdit = true,
   onPointerDown,
 }: {
   proposalId: string;
@@ -2931,6 +3075,8 @@ function AgentDraftActions({
   disabled?: boolean;
   status?: AssistantProposalStatus;
   compact?: boolean;
+  primaryLabel?: string;
+  showManualEdit?: boolean;
   onPointerDown?: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }) {
   const building = status === "building";
@@ -2953,7 +3099,7 @@ function AgentDraftActions({
         }
         disabled={actionsDisabled}
       >
-        <Check size={12} /> {building ? "生成中…" : "接受改动"}
+        <Check size={12} /> {building ? "生成中…" : primaryLabel}
       </button>
       <button
         type="button"
@@ -2965,16 +3111,74 @@ function AgentDraftActions({
       >
         <X size={12} /> 拒绝
       </button>
-      <button
-        type="button"
-        className="text-button"
-        onClick={onManualEdit}
-        disabled={actionsDisabled}
-      >
-        <PencilLine size={12} /> {editing ? "完成手动修改" : "手动修改"}
-      </button>
+      {showManualEdit && (
+        <button
+          type="button"
+          className="text-button"
+          onClick={onManualEdit}
+          disabled={actionsDisabled}
+        >
+          <PencilLine size={12} /> {editing ? "完成手动修改" : "手动修改"}
+        </button>
+      )}
       {building && <small className="agent-draft-actions-status">提案生成中</small>}
     </div>
+  );
+}
+
+function AgentLiveBuildRail({
+  summary,
+  activeSurface,
+  onShowCharacters,
+  onShowGraph,
+}: {
+  summary: AgentBuildSummary;
+  activeSurface: "characters" | "graph" | null;
+  onShowCharacters: () => void;
+  onShowGraph: () => void;
+}) {
+  if (!summary.total) return null;
+  const graphCount = summary.nodeCount + summary.edgeCount;
+  return (
+    <section
+      className={`agent-live-build${summary.building ? " is-building" : " is-ready"}`}
+      aria-label="Agent 实时制作进度"
+      aria-live="polite"
+    >
+      <span className="agent-live-build-mark" aria-hidden="true">
+        <Sparkles size={15} />
+      </span>
+      <div className="agent-live-build-copy">
+        <span>{summary.building ? "实时制作中" : "草稿已成形"}</span>
+        <strong>
+          {summary.building
+            ? "Agent 正在铺开人物与关系"
+            : "人物卡与故事图谱等待确认"}
+        </strong>
+        <small>
+          人物 {summary.characterCount} · 节点 {summary.nodeCount} · 关系 {summary.edgeCount} · 已写入 {summary.patchCount} 项
+        </small>
+      </div>
+      <div className="agent-live-build-switch" role="group" aria-label="查看 Agent 制作内容">
+        <button
+          type="button"
+          className={activeSurface === "characters" ? "is-active" : ""}
+          onClick={onShowCharacters}
+          disabled={!summary.characterCount}
+        >
+          <UserRound size={13} /> 人物卡 <b>{summary.characterCount}</b>
+        </button>
+        <button
+          type="button"
+          className={activeSurface === "graph" ? "is-active" : ""}
+          onClick={onShowGraph}
+          disabled={!graphCount && !summary.graphProposalCount}
+        >
+          <Network size={13} /> 故事图谱 <b>{graphCount}</b>
+        </button>
+      </div>
+      {summary.building && <span className="agent-live-build-ink" aria-hidden="true" />}
+    </section>
   );
 }
 
@@ -3026,6 +3230,7 @@ function AgentDock({
   const [message, setMessage] = useState("");
   const [streamingText, setStreamingText] = useState("");
   const [status, setStatus] = useState<AssistantConversation["status"]>("idle");
+  const [liveOutputStarted, setLiveOutputStarted] = useState(false);
   const [busyProposal, setBusyProposal] = useState("");
   const [notice, setNotice] = useState(
     autoOpen ? "Agent 已就位，可以从右侧开始描述你的想法。" : "",
@@ -3219,6 +3424,7 @@ function AgentDock({
         streamingMessageIdRef.current = "";
         streamingTextRef.current = "";
         setStreamingText("");
+        setLiveOutputStarted(false);
         knownAssistantMessageIdsRef.current = new Set(
           loadedMessages
             .filter((item) => item.role === "assistant")
@@ -3354,11 +3560,13 @@ function AgentDock({
             event.message_id &&
             knownAssistantMessageIdsRef.current.has(event.message_id)
           ) {
+            setLiveOutputStarted(true);
             setStatus("streaming");
             if (event.run_id) setFailedRunId("");
             return;
           }
           streamingMessageIdRef.current = event.message_id || "";
+          if (event.delta) setLiveOutputStarted(true);
           setStreamingText((current) => {
             const next = current + event.delta;
             streamingTextRef.current = next;
@@ -3372,6 +3580,7 @@ function AgentDock({
           streamingMessageIdRef.current = messageId;
           streamingTextRef.current = "";
           setStreamingText("");
+          setLiveOutputStarted(Boolean(event.content.trim()));
           // An empty replace is the worker's retry/reset frame. Allow the
           // following deltas through even when this message id was present in
           // the durable transcript loaded before the retry started.
@@ -3403,6 +3612,7 @@ function AgentDock({
           streamingMessageIdRef.current = "";
           streamingTextRef.current = "";
           setStreamingText("");
+          setLiveOutputStarted(false);
           setStatus("idle");
           void loadConversation(conversationId);
           const completedSend =
@@ -3437,6 +3647,7 @@ function AgentDock({
               .catch(() => undefined);
           }
         } else if (event.type === "proposal_created") {
+          setLiveOutputStarted(true);
           setProposals((current) => [
             ...current.filter((item) => item.id !== event.proposal.id),
             event.proposal,
@@ -3449,6 +3660,7 @@ function AgentDock({
           // gates this to the current send's run/cursor, not history replay.
           maybeFollowLiveProposal(event.proposal, event, conversationId);
         } else if (event.type === "proposal_patch") {
+          setLiveOutputStarted(true);
           setProposals((current) => {
             const existing = current.find(
               (proposal) => proposal.id === event.proposal_id,
@@ -3529,6 +3741,7 @@ function AgentDock({
             streamingMessageIdRef.current = "";
             streamingTextRef.current = "";
             setStreamingText("");
+            setLiveOutputStarted(false);
             void loadConversation(conversationId);
           }
         } else if (event.type === "error") {
@@ -3563,6 +3776,7 @@ function AgentDock({
     setMessages([]);
     setProposals([]);
     setStreamingText("");
+    setLiveOutputStarted(false);
     setStatus("idle");
     setFailedRunId("");
     streamingMessageIdRef.current = "";
@@ -3660,6 +3874,7 @@ function AgentDock({
     setMessage("");
     setNotice("");
     setStreamingText("");
+    setLiveOutputStarted(false);
     setStatus("streaming");
     setFailedRunId("");
     beginLiveSend(
@@ -3859,6 +4074,7 @@ function AgentDock({
       );
       activateLiveRun(conversation.id, retried.id);
       setFailedRunId("");
+      setLiveOutputStarted(false);
       setStatus("queued");
       setNotice("已从上次中断处继续，正在重新连接 Agent…");
       await queryClient.invalidateQueries({
@@ -3912,20 +4128,29 @@ function AgentDock({
     target,
     relationNodeCount,
   );
+  const reduceMotion = useReducedMotion();
+  const showThinkingTransition =
+    !liveOutputStarted &&
+    (status === "queued" || status === "running" || status === "streaming");
+  const thinkingTitle =
+    status === "queued" ? "Agent 正在准备这次协作" : "Agent 正在思考";
+  const thinkingDetail =
+    status === "queued"
+      ? "正在恢复上下文与未完成内容"
+      : `正在梳理${targetScopeLabel}与当前上下文`;
   return (
     <aside
       className={`agent-dock ${mobileVisible ? "" : "mobile-panel-hidden"}`}
     >
       <div className="agent-dock-head">
         <div>
-          <span className="agent-dock-kicker">协作助手</span>
           <h2>
             <Bot size={17} /> 和 Agent 一起写
           </h2>
           <small className="agent-provider-state">
             <span className={`status-dot ${canSeeImage ? "green" : ""}`} />
             {effectiveProviderName}
-            {canSeeImage ? " · 可看图" : " · 文字"}
+            {canSeeImage ? " · 可看图" : ""}
           </small>
         </div>
         <div className="agent-dock-head-actions">
@@ -3935,7 +4160,18 @@ function AgentDock({
           />
           <button
             type="button"
-            className="quiet-icon"
+            className="agent-head-action"
+            onClick={() => setHistoryOpen((open) => !open)}
+            aria-label={historyOpen ? "收起历史对话" : "查看历史对话"}
+            aria-expanded={historyOpen}
+            title="历史对话"
+          >
+            <MessageCircle size={14} />
+            {conversationRows.length > 0 && <small>{conversationRows.length}</small>}
+          </button>
+          <button
+            type="button"
+            className="agent-head-action"
             onClick={startNewConversation}
             aria-label="新建 Agent 对话"
             title="新对话"
@@ -3943,29 +4179,6 @@ function AgentDock({
             <Plus size={15} />
           </button>
         </div>
-      </div>
-      <div className="agent-session-bar">
-        <button
-          type="button"
-          className="text-button"
-          onClick={() => setHistoryOpen((open) => !open)}
-          aria-expanded={historyOpen}
-        >
-          <MessageCircle size={13} />{" "}
-          {conversation ? "当前会话" : "恢复最近会话"}{" "}
-          <small>
-            {conversationRows.length
-              ? `${conversationRows.length} 个历史`
-              : "暂无历史"}
-          </small>
-        </button>
-        <button
-          type="button"
-          className="text-button"
-          onClick={startNewConversation}
-        >
-          <Plus size={13} /> 新对话
-        </button>
       </div>
       {historyOpen && (
         <div
@@ -3996,38 +4209,19 @@ function AgentDock({
           )}
         </div>
       )}
-      <div className="agent-target">
-        <span>
-          <UserRound size={13} /> 当前目标
-        </span>
-        <strong>{targetLabel}</strong>
-        <small>{targetScopeLabel}</small>
-      </div>
-      <details className="agent-scope" aria-label="Agent 作用范围">
+      <details className="agent-scope agent-context" aria-label="Agent 作用范围">
         <summary>
           <span>
-            <PencilLine size={13} /> 作用范围
+            <PencilLine size={13} /> <strong>{targetLabel}</strong>
           </span>
           <small>
-            {scopeMode === "project"
+            {targetScopeLabel} · {scopeMode === "project"
               ? "整本故事"
               : scopeMode === "selection"
                 ? "当前选区"
                 : "当前稿纸"}
           </small>
         </summary>
-        <div className="agent-scope-head">
-          <span>
-            <PencilLine size={13} /> 正文范围
-          </span>
-          <small>
-            {scopeMode === "project"
-              ? "整本故事设定"
-              : activeChapter
-                ? activeChapter.title
-                : "尚未选择章节"}
-          </small>
-        </div>
         <div
           className="agent-scope-tabs"
           role="group"
@@ -4217,12 +4411,42 @@ function AgentDock({
                 </div>
               );
             })}
+            <AnimatePresence initial={false}>
+              {showThinkingTransition && (
+                <motion.div
+                  key="agent-thinking"
+                  className="agent-thinking"
+                  role="status"
+                  aria-label={thinkingTitle}
+                  initial={reduceMotion ? false : { opacity: 0, y: 5 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -4 }}
+                  transition={{ duration: reduceMotion ? 0 : 0.2 }}
+                >
+                  <span className="agent-thinking-mark" aria-hidden="true">
+                    <PencilLine size={13} />
+                  </span>
+                  <span className="agent-thinking-copy">
+                    <strong>{thinkingTitle}</strong>
+                    <small>{thinkingDetail}</small>
+                  </span>
+                  <span className="agent-thinking-ink" aria-hidden="true">
+                    <span className="agent-thinking-dots">
+                      <i />
+                      <i />
+                      <i />
+                    </span>
+                    <span className="agent-thinking-stroke" />
+                  </span>
+                </motion.div>
+              )}
+            </AnimatePresence>
             {streamingText &&
               (!streamingMessageIdRef.current ||
                 !messages.some(
                   (item) => item.id === streamingMessageIdRef.current,
                 )) && (
-              <div className="agent-message agent-message-assistant">
+              <div className="agent-message agent-message-assistant agent-message-live">
                 <span>Agent</span>
                 <p>
                   {visibleAgentMessage(streamingText)}
@@ -4350,10 +4574,12 @@ export default function StoryStudio({
     enabled: mode === "characters" || mode === "story-map",
   });
   const graphQuery = useQuery({
-    queryKey: ["story-graph", project.id],
-    queryFn: () => getStoryGraph(project.id),
+    queryKey: ["story-graph", project.id, activeChapter?.id],
+    queryFn: () => getStoryGraph(project.id, activeChapter?.id),
     enabled:
-      mode === "story-map" || (mode === "characters" && entityView === "graph"),
+      Boolean(activeChapter) &&
+      (mode === "story-map" ||
+        (mode === "characters" && entityView === "graph")),
     retry: false,
   });
   const characters = charactersQuery.data || [];
@@ -4486,13 +4712,16 @@ export default function StoryStudio({
           getCharacters(project.id),
           getChapters(project.id),
           getStoryMap(project.id),
-          getStoryGraph(project.id),
+          getStoryGraph(project.id, activeChapter?.id),
         ]);
         queryClient.setQueryData(["projects"], latestProjects);
         queryClient.setQueryData(["characters", project.id], latestCharacters);
         queryClient.setQueryData(["chapters", project.id], latestChapters);
         queryClient.setQueryData(["story-map", project.id], latestStoryMap);
-        queryClient.setQueryData(["story-graph", project.id], latestGraph);
+        queryClient.setQueryData(
+          ["story-graph", project.id, activeChapter?.id],
+          latestGraph,
+        );
         const targetProposal =
           appliedProposals.find(
             (proposal) => proposal.target.type === "character",
@@ -4524,7 +4753,7 @@ export default function StoryStudio({
         );
       }
     },
-    [editing, onNotice, project.id, queryClient],
+    [activeChapter?.id, editing, onNotice, project.id, queryClient],
   );
   const handleProposalPreview = useCallback((proposal: AssistantProposal) => {
     setPreviewProposals((current) => ({ ...current, [proposal.id]: proposal }));
@@ -4557,8 +4786,8 @@ export default function StoryStudio({
         onNotice,
         "info",
         chapter
-          ? `Agent 正文草稿已显示在《${chapter.title}》下方。`
-          : "正文草稿已生成，但对应稿纸暂未找到。",
+          ? `Agent 正文改动已显示在《${chapter.title}》标题旁。`
+          : "正文改动已生成，但对应稿纸暂未找到。",
       );
       return;
     }
@@ -4678,8 +4907,8 @@ export default function StoryStudio({
     setManualPaths(new Set());
   };
   const storyGraphFallback = useMemo(
-    () => fallbackGraph(project, characters, storyMap),
-    [characters, project, storyMap],
+    () => fallbackGraph(project, characters, storyMap, activeChapter),
+    [activeChapter, characters, project, storyMap],
   );
   const persistedGraph = graphQuery.data ||
     storyMap.graph || { nodes: [], edges: [] };
@@ -4688,12 +4917,21 @@ export default function StoryStudio({
     [persistedGraph, storyGraphFallback],
   );
   const liveProposals = useMemo(
-    () => Object.values(previewProposals),
-    [previewProposals],
+    () =>
+      Object.values(previewProposals).filter(
+        (proposal) =>
+          !proposal.scope_chapter_id ||
+          proposal.scope_chapter_id === activeChapter?.id,
+      ),
+    [activeChapter?.id, previewProposals],
   );
   const visibleGraph = useMemo(
     () => graphWithAgentDrafts(graph, liveProposals),
     [graph, liveProposals],
+  );
+  const agentBuild = useMemo(
+    () => summarizeAgentBuild(liveProposals, visibleGraph),
+    [liveProposals, visibleGraph],
   );
   const draftCharacters = useMemo(
     () =>
@@ -4822,6 +5060,25 @@ export default function StoryStudio({
             )}
           </aside>
           <main className="studio-main">
+            <AgentLiveBuildRail
+              summary={agentBuild}
+              activeSurface={
+                mode === "story-map" ||
+                (mode === "characters" && entityView === "graph")
+                  ? "graph"
+                  : mode === "characters"
+                    ? "characters"
+                    : null
+              }
+              onShowCharacters={() => {
+                changeMode("characters");
+                setEntityView("table");
+              }}
+              onShowGraph={() => {
+                changeMode("story-map");
+                setEntityView("graph");
+              }}
+            />
             {mode === "manuscript" ? (
               <ManuscriptEditor
                 project={project}
@@ -4847,17 +5104,21 @@ export default function StoryStudio({
                 }}
                 onImport={onImport}
               />
-            ) : mode === "story-map" ? (
+            ) : mode === "story-map" && activeChapter ? (
               <StoryGraphView
                 projectId={project.id}
+                chapterId={activeChapter.id}
+                chapterTitle={activeChapter.title}
                 graph={visibleGraph}
                 fallback={storyGraphFallback}
                 onNotice={onNotice}
                 onTargetChange={setGraphTarget}
               />
-            ) : entityView === "graph" ? (
+            ) : entityView === "graph" && activeChapter ? (
               <StoryGraphView
                 projectId={project.id}
+                chapterId={activeChapter.id}
+                chapterTitle={activeChapter.title}
                 graph={visibleGraph}
                 fallback={storyGraphFallback}
                 onNotice={onNotice}
@@ -5067,7 +5328,8 @@ function ManuscriptEditor({
 }) {
   const [editingDraftId, setEditingDraftId] = useState("");
   const [editedDraft, setEditedDraft] = useState("");
-  const draftRef = useRef<HTMLElement | null>(null);
+  const [draftExpanded, setDraftExpanded] = useState(false);
+  const draftRef = useRef<HTMLElement>(null);
   useEffect(() => {
     if (!agentDraft || agentDraft.proposalId !== editingDraftId) {
       setEditingDraftId("");
@@ -5075,12 +5337,13 @@ function ManuscriptEditor({
     }
   }, [agentDraft?.editValue, agentDraft?.proposalId, editingDraftId]);
   useEffect(() => {
-    if (!agentDraft?.proposalId) return undefined;
-    const timer = window.setTimeout(() => {
-      draftRef.current?.scrollIntoView?.({ block: "nearest", behavior: "auto" });
-    }, 0);
-    return () => window.clearTimeout(timer);
+    setDraftExpanded(false);
   }, [agentDraft?.proposalId]);
+  useEffect(() => {
+    if (draftExpanded) {
+      draftRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [draftExpanded]);
   const editingAgentDraft = Boolean(
     agentDraft && editingDraftId === agentDraft.proposalId,
   );
@@ -5098,7 +5361,94 @@ function ManuscriptEditor({
               : `${project.title} 还没有稿纸，先新建一张或导入旧稿。`}
           </p>
         </div>
+        {activeChapter && agentDraft && (
+          <section className="manuscript-review-callout" aria-label="Agent 正文改动操作">
+            <div className="manuscript-review-copy">
+              <span><Sparkles size={13} /> Agent 已准备一处改动</span>
+              <button
+                type="button"
+                className="text-button"
+                onClick={() => setDraftExpanded((expanded) => !expanded)}
+                aria-expanded={draftExpanded}
+              >
+                {draftExpanded ? "收起对比" : "查看改动"}
+              </button>
+            </div>
+            <AgentDraftActions
+              proposalId={agentDraft.proposalId}
+              status={agentDraft.status}
+              editing={editingAgentDraft}
+              disabled={agentDraft.status === "building"}
+              primaryLabel="同意改变"
+              showManualEdit={false}
+              patches={
+                editingAgentDraft
+                  ? [
+                      {
+                        op: "replace",
+                        path: agentDraft.editPath,
+                        value: editedDraft,
+                      },
+                    ]
+                  : undefined
+              }
+            />
+          </section>
+        )}
       </div>
+      {activeChapter && agentDraft && draftExpanded && (
+        <section
+          ref={draftRef}
+          className="manuscript-agent-draft"
+          aria-label="Agent 正文草稿对比"
+        >
+          <div className="manuscript-agent-draft-head">
+            <div>
+              <span className="eyebrow"><Sparkles size={12} /> 改动对比</span>
+              <h3>{agentDraft.summary || "待确认的正文修改"}</h3>
+            </div>
+            <button
+              type="button"
+              className="text-button manuscript-draft-edit"
+              onClick={() => {
+                if (editingAgentDraft) {
+                  setEditedDraft(agentDraft.editValue);
+                  setEditingDraftId("");
+                  return;
+                }
+                setEditedDraft(agentDraft.editValue);
+                setEditingDraftId(agentDraft.proposalId);
+              }}
+              disabled={agentDraft.status !== "proposed"}
+            >
+              <PencilLine size={12} />
+              {editingAgentDraft ? "放弃调整" : "手动调整"}
+            </button>
+          </div>
+          <div className="manuscript-agent-diff" aria-label="Agent 正文差异">
+            <div>
+              <small>原文片段</small>
+              <del>{agentDraft.before.slice(agentDraft.start, agentDraft.end) || "（空白）"}</del>
+            </div>
+            <ArrowRight size={14} aria-hidden="true" />
+            <div>
+              <small>Agent 替换</small>
+              <strong>{agentDraft.replacement || "（删除）"}</strong>
+            </div>
+          </div>
+          <label className="manuscript-agent-preview-label">
+            <span>{editingAgentDraft ? "调整后的内容" : "完整草稿"}</span>
+            <textarea
+              className="manuscript-agent-preview"
+              value={editingAgentDraft ? editedDraft : agentDraft.after}
+              readOnly={!editingAgentDraft}
+              onChange={(event) => setEditedDraft(event.target.value)}
+              rows={8}
+              aria-label="Agent 正文草稿预览"
+            />
+          </label>
+        </section>
+      )}
       {activeChapter ? (
         <section className="manuscript-paper" aria-label="正文稿纸">
           <div className="manuscript-paper-meta">
@@ -5150,76 +5500,6 @@ function ManuscriptEditor({
             </button>
           </div>
         </div>
-      )}
-      {activeChapter && agentDraft && (
-        <section
-          ref={draftRef}
-          className="manuscript-agent-draft"
-          aria-label="Agent 正文草稿（待确认）"
-        >
-          <div className="manuscript-agent-draft-head">
-            <div>
-              <span className="eyebrow"><Sparkles size={12} /> Agent 草稿</span>
-              <h3>{agentDraft.summary || "待确认的正文修改"}</h3>
-            </div>
-            <span className="manuscript-draft-status">
-              {editingAgentDraft ? "正在手动修改 · 尚未写入正文" : "只读预览 · 不会写入正文"}
-            </span>
-          </div>
-          <div className="manuscript-agent-diff" aria-label="Agent 正文差异">
-            <div>
-              <small>原文片段</small>
-              <del>{agentDraft.before.slice(agentDraft.start, agentDraft.end) || "（空白）"}</del>
-            </div>
-            <ArrowRight size={14} aria-hidden="true" />
-            <div>
-              <small>Agent 替换</small>
-              <strong>{agentDraft.replacement || "（删除）"}</strong>
-            </div>
-          </div>
-          <label className="manuscript-agent-preview-label">
-            <span>
-              {editingAgentDraft
-                ? agentDraft.editsWholeChapter
-                  ? "手动修改完整草稿"
-                  : "手动修改替换内容"
-                : "完整草稿"}
-            </span>
-            <textarea
-              className="manuscript-agent-preview"
-              value={editingAgentDraft ? editedDraft : agentDraft.after}
-              readOnly={!editingAgentDraft}
-              onChange={(event) => setEditedDraft(event.target.value)}
-              rows={8}
-              aria-label="Agent 正文草稿预览"
-            />
-          </label>
-          <AgentDraftActions
-            proposalId={agentDraft.proposalId}
-            status={agentDraft.status}
-            editing={editingAgentDraft}
-            disabled={agentDraft.status === "building"}
-            patches={
-              editingAgentDraft
-                ? [
-                    {
-                      op: "replace",
-                      path: agentDraft.editPath,
-                      value: editedDraft,
-                    },
-                  ]
-                : undefined
-            }
-            onManualEdit={() => {
-              if (editingAgentDraft) {
-                setEditingDraftId("");
-                return;
-              }
-              setEditedDraft(agentDraft.editValue);
-              setEditingDraftId(agentDraft.proposalId);
-            }}
-          />
-        </section>
       )}
     </div>
   );

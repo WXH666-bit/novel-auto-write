@@ -209,6 +209,7 @@ export interface StoryGraphNode {
   status?: string;
   position: { x: number; y: number };
   data?: Record<string, unknown>;
+  scope_chapter_id?: string | null;
   ref_id?: string | null;
   character_id?: string | null;
   chapter_id?: string | null;
@@ -231,12 +232,14 @@ export interface StoryGraphEdge {
   directed?: boolean;
   weight?: number;
   data?: Record<string, unknown>;
+  scope_chapter_id?: string | null;
   source_node_id?: string;
   target_node_id?: string;
   version?: number;
 }
 
 export interface StoryGraph {
+  chapter_id?: string | null;
   nodes: StoryGraphNode[];
   edges: StoryGraphEdge[];
   version?: number;
@@ -392,6 +395,7 @@ export interface AssistantProposal {
   operation?: string;
   target_type?: string;
   target_id?: string | null;
+  scope_chapter_id?: string | null;
   change_set_id?: string;
   base_version?: number | null;
   base_memory_epoch?: number | null;

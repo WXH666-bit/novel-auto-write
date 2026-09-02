@@ -1878,8 +1878,140 @@ def test_minimal_0002_sqlite_migrates_to_story_workspace_head(tmp_path: Path) ->
         }
         with engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                "20260902_0005"
+                "20260902_0006"
             )
+    finally:
+        engine.dispose()
+
+
+def test_0005_story_graph_rows_are_backfilled_into_current_chapter(tmp_path: Path) -> None:
+    database = tmp_path / "chapter-scope-0005.sqlite3"
+    engine = create_engine_for_url(f"sqlite:///{database.as_posix()}")
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE projects (id VARCHAR(36) PRIMARY KEY, current_chapter_id VARCHAR(36))"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE chapters (id VARCHAR(36) PRIMARY KEY, project_id VARCHAR(36) NOT NULL)"
+            )
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE story_graph_nodes (
+                    id VARCHAR(36) PRIMARY KEY,
+                    project_id VARCHAR(36) NOT NULL,
+                    node_type VARCHAR(40) NOT NULL,
+                    ref_id VARCHAR(36),
+                    chapter_id VARCHAR(36),
+                    CONSTRAINT uq_story_graph_node_ref UNIQUE (project_id, node_type, ref_id)
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE story_graph_edges (
+                    id VARCHAR(36) PRIMARY KEY,
+                    project_id VARCHAR(36) NOT NULL,
+                    source_node_id VARCHAR(36) NOT NULL,
+                    target_node_id VARCHAR(36) NOT NULL,
+                    relation_type VARCHAR(80) NOT NULL,
+                    CONSTRAINT uq_story_graph_edge_relation UNIQUE
+                    (project_id, source_node_id, target_node_id, relation_type)
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE story_graph_layouts (
+                    id VARCHAR(36) PRIMARY KEY,
+                    project_id VARCHAR(36) NOT NULL,
+                    CONSTRAINT uq_story_graph_layout_project UNIQUE (project_id)
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE proposals (id VARCHAR(36) PRIMARY KEY, project_id VARCHAR(36) NOT NULL)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO alembic_version VALUES ('20260902_0005')"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO projects VALUES ('project-1', 'chapter-1')"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO chapters VALUES ('chapter-1', 'project-1'), ('chapter-2', 'project-1')"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO story_graph_nodes VALUES "
+                "('node-1', 'project-1', 'chapter', 'chapter-2', 'chapter-2'), "
+                "('node-2', 'project-1', 'custom', 'clue-1', NULL)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO story_graph_edges VALUES "
+                "('edge-1', 'project-1', 'node-1', 'node-2', 'related')"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO story_graph_layouts VALUES ('layout-1', 'project-1')"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO proposals VALUES ('proposal-1', 'project-1')"
+            )
+
+        run_migrations(engine)
+
+        schema = inspect(engine)
+        for table in (
+            "story_graph_nodes",
+            "story_graph_edges",
+            "story_graph_layouts",
+            "proposals",
+        ):
+            assert "scope_chapter_id" in {
+                column["name"] for column in schema.get_columns(table)
+            }
+            assert any(
+                foreign_key.get("referred_table") == "chapters"
+                and foreign_key.get("constrained_columns") == ["scope_chapter_id"]
+                for foreign_key in schema.get_foreign_keys(table)
+            )
+        assert {
+            constraint["name"]
+            for constraint in schema.get_unique_constraints("story_graph_nodes")
+        } == {"uq_story_graph_node_chapter_ref"}
+        assert {
+            constraint["name"]
+            for constraint in schema.get_unique_constraints("story_graph_edges")
+        } == {"uq_story_graph_edge_chapter_relation"}
+        assert {
+            constraint["name"]
+            for constraint in schema.get_unique_constraints("story_graph_layouts")
+        } == {"uq_story_graph_layout_project_chapter"}
+        with engine.begin() as connection:
+            for table in (
+                "story_graph_nodes",
+                "story_graph_edges",
+                "story_graph_layouts",
+                "proposals",
+            ):
+                scopes = connection.execute(
+                    text(f"SELECT DISTINCT scope_chapter_id FROM {table}")
+                ).scalars().all()
+                assert scopes == ["chapter-1"]
+            connection.exec_driver_sql(
+                "INSERT INTO story_graph_nodes "
+                "(id, project_id, scope_chapter_id, node_type, ref_id, chapter_id) "
+                "VALUES ('node-3', 'project-1', 'chapter-2', 'custom', 'clue-1', NULL)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO story_graph_layouts (id, project_id, scope_chapter_id) "
+                "VALUES ('layout-2', 'project-1', 'chapter-2')"
+            )
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == "20260902_0006"
     finally:
         engine.dispose()
 

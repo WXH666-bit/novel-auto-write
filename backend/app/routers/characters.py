@@ -172,16 +172,29 @@ def _audit(
 
 
 def _character_node(db: Session, project: Project, character: Character) -> StoryGraphNode:
-    node = db.scalar(
+    nodes = db.scalars(
         select(StoryGraphNode).where(
             StoryGraphNode.project_id == project.id,
             StoryGraphNode.node_type == "character",
             StoryGraphNode.ref_id == character.id,
         )
+    ).all()
+    for existing in nodes:
+        if existing.label != character.name:
+            existing.label = character.name
+            existing.version += 1
+    node = next(
+        (
+            existing
+            for existing in nodes
+            if existing.scope_chapter_id == project.current_chapter_id
+        ),
+        None,
     )
     if node is None:
         node = StoryGraphNode(
             project_id=project.id,
+            scope_chapter_id=project.current_chapter_id,
             node_type="character",
             ref_id=character.id,
             character_id=character.id,
@@ -189,9 +202,6 @@ def _character_node(db: Session, project: Project, character: Character) -> Stor
             data={"source": "character_card"},
         )
         db.add(node)
-    elif node.label != character.name:
-        node.label = character.name
-        node.version += 1
     return node
 
 
@@ -321,14 +331,14 @@ def delete_character(
             before_json={"name": character.name, "version": character.version},
         )
     )
-    node = db.scalar(
+    nodes = db.scalars(
         select(StoryGraphNode).where(
             StoryGraphNode.project_id == project.id,
             StoryGraphNode.node_type == "character",
             StoryGraphNode.ref_id == character.id,
         )
-    )
-    if node is not None:
+    ).all()
+    for node in nodes:
         db.query(StoryGraphEdge).filter(
             (StoryGraphEdge.source_node_id == node.id)
             | (StoryGraphEdge.target_node_id == node.id)
