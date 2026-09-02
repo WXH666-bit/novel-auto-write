@@ -11,12 +11,17 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
+import re
 import threading
+import time
+from contextlib import nullcontext
 from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import event as sa_event
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .. import db as db_module
@@ -47,14 +52,123 @@ from ..models import (
 from ..schemas import AgentConversationCreate
 from .providers import ProviderError, provider_config_snapshot, provider_for
 
+logger = logging.getLogger(__name__)
+
 ASSISTANT_PROMPT_VERSION = "assistant-setup-v1"
 MAX_CONTEXT_MESSAGES = 30
 AGENT_LEASE_TTL = timedelta(minutes=10)
 AGENT_LEASE_HEARTBEAT_SECONDS = 30.0
+# Provider chunks are intentionally coalesced before they become durable
+# events.  The live response still accumulates every chunk in memory, while
+# persistence is bounded to roughly one event per 220 characters or 200 ms.
+AGENT_DELTA_BATCH_CHARS = 220
+AGENT_DELTA_BATCH_SECONDS = 0.2
+
+# SQLite does not implement SELECT ... FOR UPDATE.  The desktop deployment is
+# intentionally a single application process, so keep each conversation's
+# message/event allocation locked through the service commit.  MySQL continues
+# to use its database row lock and is never serialized by this local guard.
+_SQLITE_CONVERSATION_LOCKS: dict[str, threading.RLock] = {}
+_SQLITE_CONVERSATION_LOCKS_GUARD = threading.Lock()
+_SQLITE_SESSION_GUARDS_KEY = "assistant.sqlite_conversation_write_guards"
+
+
+def _conversation_write_guard(db: Session, conversation_id: str):
+    bind = db.get_bind()
+    if bind.dialect.name != "sqlite":
+        return nullcontext()
+    with _SQLITE_CONVERSATION_LOCKS_GUARD:
+        return _SQLITE_CONVERSATION_LOCKS.setdefault(
+            conversation_id,
+            threading.RLock(),
+        )
+
+
+def _hold_conversation_write_guard(db: Session, conversation_id: str) -> None:
+    """Keep SQLite's process lock until the allocating transaction ends.
+
+    SQLite ignores ``SELECT ... FOR UPDATE``.  Acquiring only around
+    ``MAX(sequence) + 1`` is still racy because another session cannot see the
+    first allocation until commit.  Store the acquired lock on the SQLAlchemy
+    session so its outer commit/rollback releases it automatically.
+    """
+
+    bind = db.get_bind()
+    if bind.dialect.name != "sqlite":
+        return
+    held = db.info.setdefault(_SQLITE_SESSION_GUARDS_KEY, {})
+    if conversation_id in held:
+        return
+    with _SQLITE_CONVERSATION_LOCKS_GUARD:
+        lock = _SQLITE_CONVERSATION_LOCKS.setdefault(
+            conversation_id,
+            threading.RLock(),
+        )
+    lock.acquire()
+    held[conversation_id] = lock
+
+
+@sa_event.listens_for(Session, "after_transaction_end")
+def _release_conversation_write_guards(db: Session, transaction: Any) -> None:
+    """Release process guards after the outermost transaction is complete."""
+
+    if transaction.parent is not None:
+        return
+    held = db.info.pop(_SQLITE_SESSION_GUARDS_KEY, {})
+    for lock in reversed(tuple(held.values())):
+        lock.release()
+
+
+def _run_attempt(run: AgentRun | None) -> int:
+    if run is None:
+        return 1
+    try:
+        return max(1, int((run.input_snapshot or {}).get("attempt", 1)))
+    except (TypeError, ValueError):
+        return 1
 
 
 class AgentLeaseLost(RuntimeError):
     """Raised when a worker no longer owns the durable assistant lease."""
+
+
+def _log_storage_failure(operation: str, exc: BaseException) -> None:
+    """Log only stable diagnostics; never include SQL, parameters, or secrets."""
+
+    logger.warning(
+        "assistant storage failure",
+        extra={
+            "operation": operation,
+            "error_type": type(exc).__name__,
+            "pool_timeout": type(exc).__name__ in {"TimeoutError", "QueuePoolTimeout"},
+        },
+    )
+
+
+def _safe_agent_error(exc: BaseException | Any) -> str:
+    """Return an actionable error without leaking SQLAlchemy internals."""
+
+    text_value = str(exc or "助手运行失败")
+    lowered = text_value.lower()
+    if isinstance(exc, SQLAlchemyError) or any(
+        marker in lowered
+        for marker in (
+            "sqlalchemy",
+            "integrityerror",
+            "operationalerror",
+            "databaseerror",
+            "statementerror",
+            "(sqlite3.",
+            "pymysql",
+            "queuepool",
+            "pool timeout",
+            "pooltimeout",
+        )
+    ):
+        return "助手事件保存失败，请稍后重试。"
+    return text_value[:4000]
+
+
 ALLOWED_OPERATIONS = {
     "create_character",
     "update_character",
@@ -228,6 +342,7 @@ def next_message_sequence(db: Session, conversation_id: str) -> int:
     # The conversation row is the per-thread sequence allocator.  The API
     # already locks it while accepting a user message; the lock here also
     # protects assistant responses created by durable workers.
+    _hold_conversation_write_guard(db, conversation_id)
     db.scalar(
         select(AgentConversation.id)
         .where(AgentConversation.id == conversation_id)
@@ -256,6 +371,7 @@ def next_event_sequence(db: Session, conversation_id: str) -> int:
     # ``max(sequence) + 1`` is safe only while the conversation row is locked.
     # This is a real row lock on MySQL and, together with the single SQLite
     # durable worker, prevents duplicate SSE ids across concurrent runs.
+    _hold_conversation_write_guard(db, conversation_id)
     db.scalar(
         select(AgentConversation.id)
         .where(AgentConversation.id == conversation_id)
@@ -290,16 +406,46 @@ def add_event(
     *,
     run_id: str | None = None,
 ) -> AgentEvent:
+    event_payload = dict(payload or {})
+    if "attempt" not in event_payload:
+        event_payload["attempt"] = _run_attempt(db.get(AgentRun, run_id)) if run_id else 1
     event = AgentEvent(
         project_id=conversation.project_id,
         conversation_id=conversation.id,
         run_id=run_id,
         sequence=next_event_sequence(db, conversation.id),
         event_type=event_type,
-        payload_json=payload or {},
+        payload_json=event_payload,
     )
     db.add(event)
     return event
+
+
+def _set_agent_stage(
+    db: Session,
+    conversation: AgentConversation,
+    run: AgentRun,
+    stage: str,
+    *,
+    status: str | None = None,
+) -> AgentEvent:
+    """Persist a stage transition using the dotted Agent event protocol."""
+
+    run.stage = stage
+    if status is not None:
+        run.status = status
+    return add_event(
+        db,
+        conversation,
+        "run.stage",
+        {
+            "run_id": run.id,
+            "stage": stage,
+            "status": run.status,
+            "attempt": _run_attempt(run),
+        },
+        run_id=run.id,
+    )
 
 
 def _claim_agent_run(
@@ -340,32 +486,49 @@ def _claim_agent_run(
         .where(Job.resource_id == run.id, Job.kind == "assistant")
         .with_for_update()
     )
+    if job is None:
+        # Older assistant runs predate the durable Job row.  Repair that
+        # invariant while the project lock is held; otherwise the claim would
+        # become permanently running because lease fencing has no Job to own.
+        job = Job(
+            project_id=project.id,
+            idempotency_key=f"assistant:{conversation.id}:{run.id}",
+            kind="assistant",
+            resource_id=run.id,
+            state="queued",
+            current_stage="queued",
+            attempts=0,
+            max_attempts=3,
+            payload={"conversation_id": conversation.id, "run_id": run.id},
+        )
+        db.add(job)
+        db.flush()
+        run.job_id = job.id
     now = utcnow()
-    if job is not None:
-        if job.state not in {"queued", "needs_retry"}:
-            db.rollback()
-            return None
-        if job.lease_owner is not None and (
-            job.lease_expires_at is None or job.lease_expires_at > now
-        ):
-            db.rollback()
-            return None
-        sibling = db.scalar(
-            select(Job.id).where(
-                and_(
-                    Job.project_id == project.id,
-                    Job.id != job.id,
-                    Job.lease_owner.is_not(None),
-                    Job.lease_expires_at > now,
-                    Job.state.notin_(
-                        ("completed", "failed", "cancelled", "awaiting_review")
-                    ),
-                )
+    if job.state not in {"queued", "needs_retry"}:
+        db.rollback()
+        return None
+    if job.lease_owner is not None and (
+        job.lease_expires_at is None or job.lease_expires_at > now
+    ):
+        db.rollback()
+        return None
+    sibling = db.scalar(
+        select(Job.id).where(
+            and_(
+                Job.project_id == project.id,
+                Job.id != job.id,
+                Job.lease_owner.is_not(None),
+                Job.lease_expires_at > now,
+                Job.state.notin_(
+                    ("completed", "failed", "cancelled", "awaiting_review")
+                ),
             )
         )
-        if sibling is not None:
-            db.rollback()
-            return None
+    )
+    if sibling is not None:
+        db.rollback()
+        return None
 
     claimed_at = now
     claim = db.execute(
@@ -384,37 +547,47 @@ def _claim_agent_run(
         return None
 
     lease_owner = f"assistant-{new_id()}"
-    if job is not None:
-        job_claim = db.execute(
-            update(Job)
-            .where(
-                Job.id == job.id,
-                Job.state.in_(
-                    ("queued", "needs_retry")
-                ),
-                or_(
-                    Job.lease_owner.is_(None),
-                    Job.lease_expires_at.is_(None),
-                    Job.lease_expires_at < claimed_at,
-                ),
-            )
-            .values(
-                state="running",
-                current_stage="calling_model",
-                lease_owner=lease_owner,
-                lease_expires_at=claimed_at + AGENT_LEASE_TTL,
-                updated_at=claimed_at,
-            )
-            .execution_options(synchronize_session=False)
+    job_claim = db.execute(
+        update(Job)
+        .where(
+            Job.id == job.id,
+            Job.state.in_(("queued", "needs_retry")),
+            or_(
+                Job.lease_owner.is_(None),
+                Job.lease_expires_at.is_(None),
+                Job.lease_expires_at < claimed_at,
+            ),
         )
-        if job_claim.rowcount != 1:
-            db.rollback()
-            return None
+        .values(
+            state="running",
+            current_stage="calling_model",
+            lease_owner=lease_owner,
+            lease_expires_at=claimed_at + AGENT_LEASE_TTL,
+            updated_at=claimed_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if job_claim.rowcount != 1:
+        db.rollback()
+        return None
 
     db.refresh(run)
-    if job is not None:
-        db.refresh(job)
-    add_event(db, conversation, "run_started", {"run_id": run.id}, run_id=run.id)
+    db.refresh(job)
+    attempt = int(job.attempts or 0) + 1
+    run.input_snapshot = {**(run.input_snapshot or {}), "attempt": attempt}
+    add_event(
+        db,
+        conversation,
+        "run.started",
+        {
+            "run_id": run.id,
+            "status": run.status,
+            "stage": run.stage,
+            "attempt": attempt,
+        },
+        run_id=run.id,
+    )
+    _set_agent_stage(db, conversation, run, run.stage, status=run.status)
     db.commit()
     return run, conversation, project, user, job, lease_owner
 
@@ -492,6 +665,30 @@ def _stop_agent_lease_heartbeat(
 
 
 def create_message_run(
+    db: Session,
+    conversation: AgentConversation,
+    user: User,
+    content: str,
+    *,
+    idempotency_key: str | None,
+    target: dict[str, Any] | None = None,
+    context_snapshot: dict[str, Any] | None = None,
+    authorized_asset_ids: list[str] | None = None,
+) -> tuple[AgentMessage, AgentRun, bool]:
+    with _conversation_write_guard(db, conversation.id):
+        return _create_message_run(
+            db,
+            conversation,
+            user,
+            content,
+            idempotency_key=idempotency_key,
+            target=target,
+            context_snapshot=context_snapshot,
+            authorized_asset_ids=authorized_asset_ids,
+        )
+
+
+def _create_message_run(
     db: Session,
     conversation: AgentConversation,
     user: User,
@@ -601,7 +798,10 @@ def create_message_run(
 def _assistant_messages(db: Session, conversation_id: str) -> list[dict[str, Any]]:
     rows = db.scalars(
         select(AgentMessage)
-        .where(AgentMessage.conversation_id == conversation_id)
+        .where(
+            AgentMessage.conversation_id == conversation_id,
+            AgentMessage.status == "completed",
+        )
         .order_by(AgentMessage.sequence.desc())
         .limit(MAX_CONTEXT_MESSAGES)
     ).all()
@@ -621,12 +821,11 @@ def _authorised_image_urls(
     if not asset_ids:
         return []
     capabilities = profile.capabilities if isinstance(profile.capabilities, dict) else {}
-    if not (
-        capabilities.get("vision")
-        or capabilities.get("image_input")
-        or capabilities.get("supports_vision")
-    ):
-        raise ProviderError("当前 Provider 未声明 vision/image_input 能力，无法发送图片")
+    # ``vision`` is the canonical, migration-normalised flag.  Do not fall
+    # back to legacy aliases here: an explicit ``vision: false`` must be able
+    # to revoke image access even when a stale alias still says ``true``.
+    if capabilities.get("vision") is not True:
+        raise ProviderError("当前 Provider 未声明 vision 能力，无法发送图片")
     unique_ids = list(dict.fromkeys(str(item) for item in asset_ids))
     if len(unique_ids) > 5:
         raise ProviderError("一次助手消息最多授权 5 张图片")
@@ -672,7 +871,10 @@ def _provider_messages(
 
     rows = db.scalars(
         select(AgentMessage)
-        .where(AgentMessage.conversation_id == conversation.id)
+        .where(
+            AgentMessage.conversation_id == conversation.id,
+            AgentMessage.status == "completed",
+        )
         .order_by(AgentMessage.sequence.desc())
         .limit(MAX_CONTEXT_MESSAGES)
     ).all()
@@ -759,15 +961,23 @@ def _provider_messages(
             "token_count": server_context.get("token_count", 0),
         },
     }
+    turn_prompt = (
+        "这是本次对话的首轮回复：请先用普通、自然的中文回答用户，"
+        "禁止输出 JSON、Markdown 代码围栏、XML 标签或工具调用格式；"
+        "如需变更，只在独立的结构化提取步骤中返回 proposals。"
+        if not any(row.role == "assistant" for row in rows)
+        else "回复仍应以清晰的普通中文为主，不要把结构化 JSON 或代码围栏直接展示给用户。"
+    )
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
             "content": (
                 "你是小说设定助手。请理解用户意图，并只提出可审核的结构化变更。"
                 "不要声称已经写入数据库。保持回复简洁，proposals 只使用允许的操作。"
-                "若目标是章节正文，单次只能修改一个章节或一个连续选区，"
-                "必须在 patch 中保留 base_revision_id、base_content_hash、"
-                "selection_start、selection_end、selection_hash，并用 replacement 表示替换文本。"
+                + turn_prompt
+                + "若目标是章节正文，单次只能修改一个章节或一个连续选区，"
+                + "必须在 patch 中保留 base_revision_id、base_content_hash、"
+                + "selection_start、selection_end、selection_hash，并用 replacement 表示替换文本。"
             ),
         }
     ]
@@ -804,12 +1014,174 @@ def _provider_messages(
     return messages, asset_ids
 
 
-def _normalise_provider_output(value: Any, raw_content: str = "") -> tuple[str, list[dict[str, Any]]]:
+_JSON_FENCE = re.compile(
+    r"\A```(?:[ \t]*(?:json|jsonc|javascript|js))?[ \t]*\r?\n?(.*?)\r?\n?```[ \t]*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+_PLAIN_FENCE = re.compile(
+    r"\A```[^\r\n`]*\r?\n(.*?)\r?\n?```[ \t]*\Z",
+    re.DOTALL,
+)
+_OPEN_FENCE = re.compile(r"\A```[^\r\n`]*(?:\r?\n|\Z)")
+_REPLY_OBJECT_PREFIX = re.compile(r'\A\s*\{\s*"(?:reply|message)"\s*:')
+INCOMPLETE_REPLY_MESSAGE = "回复格式不完整，可重试"
+
+
+class AgentOutputFormatError(ValueError):
+    """A provider returned a partial machine envelope instead of a reply."""
+
+    def __init__(self, message: str = INCOMPLETE_REPLY_MESSAGE) -> None:
+        super().__init__(message)
+
+
+def _fenced_body(value: str) -> str | None:
+    cleaned = value.strip().lstrip("\ufeff")
+    # The generic matcher must run first: the JSON matcher intentionally
+    # allows an omitted language and would otherwise treat ``text`` as the
+    # first line of a plain fenced reply.
+    match = _PLAIN_FENCE.match(cleaned)
+    if match is None:
+        match = _JSON_FENCE.match(cleaned)
+    return match.group(1).strip() if match else None
+
+
+def _fence_declares_json(value: str) -> bool:
+    """Return whether an outer code fence explicitly asks for JSON parsing."""
+
+    cleaned = value.strip().lstrip("\ufeff")
+    match = re.match(r"\A```([^\r\n`]*)", cleaned)
+    if match is None:
+        return False
+    language = match.group(1).strip().lower().split(None, 1)[0] if match.group(1).strip() else ""
+    return language in {"json", "jsonc", "javascript", "js"}
+
+
+def _stream_machine_prefix(value: str) -> bool | None:
+    """Classify a stream without mistaking Markdown lists for JSON."""
+
+    first = value.lstrip()
+    if not first:
+        return None
+    if first.startswith("{") or first.startswith("```"):
+        return True
+    # Hold one or two leading backticks until we know whether they form a
+    # fence.  A single inline Markdown code span remains ordinary prose.
+    if first.startswith("`") and len(first) < 3:
+        return None
+    return False
+
+
+def _complete_json(value: Any) -> Any | None:
+    """Parse only a complete JSON document (optionally in one outer fence).
+
+    ``raw_decode`` with trailing prose would make a partial model response look
+    valid.  A strict ``json.loads`` keeps proposal extraction deterministic and
+    treats all model output as inert data; no code in a fenced block is ever
+    evaluated.
+    """
+
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lstrip("\ufeff")
+    fenced = _fenced_body(text)
+    candidate = fenced if fenced is not None else text
+    if not candidate:
+        return None
+    try:
+        return json.loads(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _plain_reply(value: Any) -> str:
+    """Normalize natural-language output without exposing a Markdown wrapper."""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip().lstrip("\ufeff")
+        fenced = _fenced_body(text)
+        if fenced is not None:
+            parsed = _complete_json(text)
+            if isinstance(parsed, dict):
+                return _plain_reply(parsed.get("reply") or parsed.get("message"))
+            malformed_reply = _malformed_reply_value(text)
+            if malformed_reply is not None:
+                return malformed_reply
+            # A declared JSON/jsonc fence is a machine envelope even when its
+            # body is malformed; never expose the invalid body as a reply.
+            if _fence_declares_json(text) or fenced.startswith("{"):
+                raise AgentOutputFormatError()
+            # An outer fence around plain text is presentation noise, not an
+            # instruction.  Keep its inert contents while removing the fence.
+            return fenced
+        parsed = _complete_json(text)
+        if isinstance(parsed, dict) and ("reply" in parsed or "message" in parsed):
+            return _plain_reply(parsed.get("reply") or parsed.get("message"))
+        malformed_reply = _malformed_reply_value(text)
+        if malformed_reply is not None:
+            return malformed_reply
+        # Never display an incomplete code fence or a JSON-looking wrapper as
+        # ordinary prose.  A retryable format error is rendered by the worker
+        # as a short Chinese status message instead.
+        if _OPEN_FENCE.match(text) is not None or text.startswith("{"):
+            raise AgentOutputFormatError()
+        return text
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
+def _json_object(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
-        reply = str(value.get("reply") or value.get("message") or raw_content or "")
-        source = value.get("proposals") or value.get("changes") or []
+        return value
+    parsed = _complete_json(value)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _malformed_reply_value(value: str) -> str | None:
+    """Extract a reply from a truncated outer JSON object, safely.
+
+    Providers occasionally close the ``reply`` string but truncate the later
+    ``proposals`` array.  Parsing only that value with ``raw_decode`` handles
+    escaped Unicode/newline sequences without evaluating any trailing data.
+    If the value itself is partial, the caller receives a retryable format
+    error rather than a half-rendered JSON wrapper.
+    """
+
+    text = value.strip().lstrip("\ufeff")
+    fenced = _fenced_body(text)
+    if fenced is not None:
+        candidate = fenced
     else:
-        reply = raw_content or str(value or "")
+        opening = _OPEN_FENCE.match(text)
+        candidate = text[opening.end() :] if opening is not None else text
+    match = _REPLY_OBJECT_PREFIX.match(candidate)
+    if match is None:
+        return None
+    tail = candidate[match.end() :].lstrip()
+    try:
+        parsed, _end = json.JSONDecoder().raw_decode(tail)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AgentOutputFormatError() from exc
+    return _plain_reply(parsed)
+
+
+def _normalise_provider_output(value: Any, raw_content: str = "") -> tuple[str, list[dict[str, Any]]]:
+    source_object = _json_object(value)
+    if source_object is None:
+        source_object = _json_object(raw_content)
+    if source_object is not None:
+        reply_value = source_object.get("reply", source_object.get("message", ""))
+        reply = _plain_reply(reply_value)
+        source = source_object.get("proposals") or source_object.get("changes") or []
+    else:
+        reply = _plain_reply(raw_content or value)
         source = []
     proposals: list[dict[str, Any]] = []
     if isinstance(source, list):
@@ -817,9 +1189,11 @@ def _normalise_provider_output(value: Any, raw_content: str = "") -> tuple[str, 
             if not isinstance(item, dict):
                 continue
             operation = str(item.get("operation") or "").strip().lower()
-            patch = item.get("patch")
-            if not isinstance(patch, dict):
-                patch = item.get("patch_json") if isinstance(item.get("patch_json"), dict) else {}
+            patch = _json_object(item.get("patch"))
+            if patch is None:
+                patch = _json_object(item.get("patch_json"))
+            if patch is None:
+                patch = {}
             if operation not in ALLOWED_OPERATIONS or not patch:
                 continue
             proposals.append(
@@ -828,7 +1202,7 @@ def _normalise_provider_output(value: Any, raw_content: str = "") -> tuple[str, 
                     "target_type": str(item.get("target_type") or "general")[:80],
                     "target_id": str(item["target_id"]) if item.get("target_id") else None,
                     "patch": patch,
-                    "reason": str(item.get("reason") or "助手建议")[:2000],
+                    "reason": _plain_reply(item.get("reason") or "助手建议")[:2000],
                 }
             )
     return reply[:100_000], proposals
@@ -908,30 +1282,64 @@ def _make_proposals(
                 status="completed",
             )
         )
+        proposal_payload = {
+            "id": proposal.id,
+            "conversation_id": conversation.id,
+            "target": {
+                "type": proposal.target_type,
+                "id": proposal.target_id or "",
+            },
+            "base_version": base_version,
+            "summary": proposal.reason or "待应用的设定提案",
+            "patches": [
+                {"path": key, "value": value, "label": key}
+                for key, value in (proposal.patch_json or {}).items()
+            ],
+            "status": proposal.status,
+            "created_at": proposal.created_at.isoformat()
+            if proposal.created_at
+            else None,
+        }
         add_event(
             db,
             conversation,
-            "proposal_created",
+            "proposal.created",
             {
                 "proposal_id": proposal.id,
                 "operation": proposal.operation,
-                "proposal": {
-                    "id": proposal.id,
-                    "conversation_id": conversation.id,
-                    "target": {
-                        "type": proposal.target_type,
-                        "id": proposal.target_id or "",
-                    },
-                    "summary": proposal.reason or "待应用的设定提案",
-                    "patches": [
-                        {"path": key, "value": value, "label": key}
-                        for key, value in (proposal.patch_json or {}).items()
-                    ],
-                    "status": proposal.status,
-                    "created_at": proposal.created_at.isoformat()
-                    if proposal.created_at
-                    else None,
+                "proposal": proposal_payload,
+                "attempt": _run_attempt(run),
+                "target": proposal_payload["target"],
+                "base_version": base_version,
+            },
+            run_id=run.id,
+        )
+        for patch_key, patch_value in (proposal.patch_json or {}).items():
+            add_event(
+                db,
+                conversation,
+                "proposal.patch",
+                {
+                    "proposal_id": proposal.id,
+                    "patch": {"path": patch_key, "value": patch_value, "label": patch_key},
+                    "attempt": _run_attempt(run),
+                    "target": proposal_payload["target"],
+                    "base_version": base_version,
                 },
+                run_id=run.id,
+            )
+        add_event(
+            db,
+            conversation,
+            "proposal.ready",
+            {
+                "proposal_id": proposal.id,
+                "change_set_id": change_set.id,
+                "status": proposal.status,
+                "proposal": proposal_payload,
+                "attempt": _run_attempt(run),
+                "target": proposal_payload["target"],
+                "base_version": base_version,
             },
             run_id=run.id,
         )
@@ -995,18 +1403,43 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                     },
                 )
             )
-        assistant_message = AgentMessage(
-            project_id=conversation.project_id,
-            conversation_id=conversation.id,
-            run_id=run.id,
-            sequence=next_message_sequence(db, conversation.id),
-            role="assistant",
-            content="",
-            status="streaming",
-            metadata_json={"prompt_version": ASSISTANT_PROMPT_VERSION},
+        # A retry is another attempt of the same durable run.  Reuse its
+        # existing assistant row so the panel does not show a second answer
+        # and the previous partial transport buffer cannot become context.
+        assistant_message = db.scalar(
+            select(AgentMessage)
+            .where(
+                AgentMessage.run_id == run.id,
+                AgentMessage.role == "assistant",
+            )
+            .order_by(AgentMessage.sequence.desc())
+            .with_for_update()
         )
-        db.add(assistant_message)
-        db.flush()
+        reused_assistant_message = assistant_message is not None
+        if assistant_message is None:
+            assistant_message = AgentMessage(
+                project_id=conversation.project_id,
+                conversation_id=conversation.id,
+                run_id=run.id,
+                sequence=next_message_sequence(db, conversation.id),
+                role="assistant",
+                content="",
+                status="streaming",
+                metadata_json={"prompt_version": ASSISTANT_PROMPT_VERSION},
+            )
+            db.add(assistant_message)
+            db.flush()
+        else:
+            assistant_message.content = ""
+            assistant_message.status = "streaming"
+            assistant_message.request_id = None
+            assistant_message.model_name = None
+            assistant_message.usage_json = {}
+            assistant_message.metadata_json = {
+                "prompt_version": ASSISTANT_PROMPT_VERSION,
+                "retry_attempt": _run_attempt(run),
+            }
+        _set_agent_stage(db, conversation, run, "streaming", status="running")
         add_event(
             db,
             conversation,
@@ -1014,59 +1447,152 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
             {"message_id": assistant_message.id, "run_id": run.id},
             run_id=run.id,
         )
+        if reused_assistant_message:
+            # Replay clients may already have rendered deltas from the failed
+            # attempt.  Explicitly supersede that buffer before attempt N+1
+            # starts, while keeping one durable assistant message row.
+            add_event(
+                db,
+                conversation,
+                "message.replace",
+                {
+                    "message_id": assistant_message.id,
+                    "run_id": run.id,
+                    "content": "",
+                    "replacement": "",
+                    "reason": "retry_reset",
+                },
+                run_id=run.id,
+            )
         db.commit()
 
         reply = ""
         response: Any | None = None
         structured: Any = None
         streamed = False
+        delta_buffer: list[str] = []
+        delta_start_index: int | None = None
+        delta_end_index = 0
+        delta_last_flushed_at = time.monotonic()
+        stream_machine_envelope: bool | None = None
+        prefix_buffer: list[tuple[str, int]] = []
+
+        def flush_delta(*, force: bool = False) -> None:
+            nonlocal delta_start_index, delta_end_index, delta_last_flushed_at
+            if not delta_buffer:
+                return
+            now = time.monotonic()
+            if not force and (
+                len("".join(delta_buffer)) < AGENT_DELTA_BATCH_CHARS
+                and now - delta_last_flushed_at < AGENT_DELTA_BATCH_SECONDS
+            ):
+                return
+            merged = "".join(delta_buffer)
+            add_event(
+                db,
+                conversation,
+                "message.delta",
+                {
+                    "message_id": assistant_message.id,
+                    "run_id": run.id,
+                    "delta": merged,
+                    "index": delta_end_index,
+                    "start_index": delta_start_index,
+                    "end_index": delta_end_index,
+                },
+                run_id=run.id,
+            )
+            delta_buffer.clear()
+            delta_start_index = None
+            delta_last_flushed_at = now
+            # A batch commit makes the coalesced event available to a live
+            # reconnect without creating one transaction per provider token.
+            db.commit()
+
         try:
             def persist_delta(chunk: str, index: int) -> None:
-                nonlocal reply
+                nonlocal reply, delta_start_index, delta_end_index, stream_machine_envelope
                 if lease_owner is None:  # pragma: no cover - claim always supplies one
                     raise AgentLeaseLost("助手任务没有有效租约")
                 _assert_agent_lease(db, run.id, lease_owner)
+                if not chunk:
+                    return
                 reply += chunk
+                if stream_machine_envelope is None:
+                    stream_machine_envelope = _stream_machine_prefix(reply)
+                    if stream_machine_envelope is None:
+                        # Do not persist a one/two-backtick prefix until it
+                        # can be classified as an actual fenced envelope.
+                        prefix_buffer.append((chunk, index))
+                        return
+                if stream_machine_envelope:
+                    # Do not durably expose a machine envelope while it is
+                    # still arriving.  Final normalization emits one safe
+                    # message.replace event after the complete response.
+                    prefix_buffer.clear()
+                    assistant_message.content = ""
+                    return
                 assistant_message.content = reply[:100_000]
-                add_event(
-                    db,
-                    conversation,
-                    "message_delta",
-                    {
-                        "message_id": assistant_message.id,
-                        "run_id": run.id,
-                        "delta": chunk,
-                        "index": index,
-                    },
-                    run_id=run.id,
-                )
-                # Keep the event stream durable without forcing a transaction
-                # for every token.  A failure path commits the final partial
-                # content below before the outer run error is recorded.
-                if index % 4 == 0:
-                    db.commit()
+                if prefix_buffer:
+                    for pending_chunk, pending_index in prefix_buffer:
+                        if delta_start_index is None:
+                            delta_start_index = pending_index
+                        delta_end_index = pending_index
+                        delta_buffer.append(pending_chunk)
+                    prefix_buffer.clear()
+                if delta_start_index is None:
+                    delta_start_index = index
+                delta_end_index = index
+                delta_buffer.append(chunk)
+                flush_delta()
 
             chunks = _run_async(_stream_reply(provider, messages, persist_delta))
             streamed = True
+            if stream_machine_envelope is None:
+                # The stream ended with fewer than three leading backticks;
+                # that is ordinary inline text, not an incomplete fence.
+                stream_machine_envelope = False
+                assistant_message.content = reply[:100_000]
+                for pending_chunk, pending_index in prefix_buffer:
+                    if delta_start_index is None:
+                        delta_start_index = pending_index
+                    delta_end_index = pending_index
+                    delta_buffer.append(pending_chunk)
+                prefix_buffer.clear()
+            flush_delta(force=True)
+            if stream_machine_envelope:
+                assistant_message.content = ""
             if chunks:
                 db.commit()
             else:
                 streamed = False
         except (AttributeError, NotImplementedError):
             # Test doubles and older adapters may not expose streaming.
+            flush_delta(force=True)
+            if stream_machine_envelope:
+                reply = ""
+                assistant_message.content = ""
             streamed = False
         except ProviderError as exc:
+            flush_delta(force=True)
             if reply and (exc.retryable or exc.uncertain):
                 assistant_message.status = "partial"
                 assistant_message.metadata_json = {
                     "prompt_version": ASSISTANT_PROMPT_VERSION,
-                    "stream_error": str(exc)[:1000],
+                    "stream_error": _safe_agent_error(exc)[:1000],
                 }
-                assistant_message.content = reply[:100_000]
+                assistant_message.content = (
+                    INCOMPLETE_REPLY_MESSAGE if stream_machine_envelope else reply[:100_000]
+                )
                 db.commit()
                 raise
+            if stream_machine_envelope:
+                reply = ""
+                assistant_message.content = ""
             streamed = False
 
+        _set_agent_stage(db, conversation, run, "extracting_proposals", status="running")
+        db.commit()
         if streamed:
             # The natural-language response is already durable.  A second,
             # structured pass extracts reviewable changes without replacing
@@ -1091,38 +1617,93 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 # proposal extraction pass is unavailable.
                 structured = None
         else:
+            # Non-streaming providers still use two distinct model calls:
+            # first produce the user-facing natural-language answer, then
+            # extract reviewable proposals from that answer.  Sending the
+            # assistant schema on the first call made some gateways return a
+            # JSON envelope directly to the user and coupled ordinary replies
+            # to structured-output support.
+            response = _run_async(provider.complete(messages, role="assistant", temperature=0.4))
+            completion_content = (
+                response if isinstance(response, str) else getattr(response, "content", "")
+            )
+            reply = _plain_reply(completion_content)
+            proposal_messages = [
+                *messages,
+                {"role": "assistant", "content": reply},
+                {
+                    "role": "user",
+                    "content": (
+                        "请仅从上一条回复中提取需要用户审核的结构化变更，"
+                        "返回既定 JSON Schema；没有变更时 proposals 返回空数组。"
+                    ),
+                },
+            ]
             try:
-                structured, response = _run_async(
-                    provider.structured(messages, ASSISTANT_SCHEMA, role="assistant")
+                structured, _structured_response = _run_async(
+                    provider.structured(proposal_messages, ASSISTANT_SCHEMA, role="assistant")
                 )
             except Exception:
-                response = _run_async(provider.complete(messages, role="assistant", temperature=0.4))
+                # The ordinary reply is already available and remains valid
+                # even when the optional proposal extraction call fails.
                 structured = None
         if lease_owner is None:  # pragma: no cover - claim always supplies one
             raise AgentLeaseLost("助手任务没有有效租约")
         _assert_agent_lease(db, run.id, lease_owner)
         raw_content = getattr(response, "content", "") if response is not None else ""
-        normalised_reply, proposal_values = _normalise_provider_output(structured, raw_content)
+        # A streaming adapter may return no structured payload.  Normalize the
+        # complete stream as a fallback so a fenced JSON response cannot leak
+        # into the ordinary-language message or become an unvalidated patch.
+        normalise_source: Any = structured
+        if normalise_source is None and not raw_content and reply:
+            normalise_source = reply
+        normalised_reply, proposal_values = _normalise_provider_output(
+            normalise_source, raw_content or (reply if streamed else "")
+        )
         if not reply:
             reply = normalised_reply
+        elif streamed:
+            # A misconfigured streaming gateway can send a JSON/code-fenced
+            # document (including a truncated outer object).  Normalize the
+            # whole stream as inert transport data, never as visible
+            # Markdown, and retain any safely parsed patches.
+            streamed_reply, streamed_proposals = _normalise_provider_output(reply)
+            reply = streamed_reply
+            if not proposal_values:
+                proposal_values = streamed_proposals
         reply = reply[:100_000]
+        previous_content = assistant_message.content
         assistant_message.content = reply
         assistant_message.status = "completed"
         if response is not None:
-            assistant_message.request_id = response.request_id
-            assistant_message.model_name = response.model
-            assistant_message.usage_json = response.usage or {}
+            assistant_message.request_id = getattr(response, "request_id", None)
+            assistant_message.model_name = getattr(response, "model", None)
+            assistant_message.usage_json = getattr(response, "usage", None) or {}
         assistant_message.metadata_json = {
             "prompt_version": ASSISTANT_PROMPT_VERSION,
             "streamed": streamed,
             "authorised_asset_ids": authorised_asset_ids,
         }
+        if previous_content != reply or stream_machine_envelope:
+            add_event(
+                db,
+                conversation,
+                "message.replace",
+                {
+                    "message_id": assistant_message.id,
+                    "run_id": run.id,
+                    "content": reply,
+                    "replacement": reply,
+                    "reason": "final_normalization",
+                },
+                run_id=run.id,
+            )
         _make_proposals(db, conversation, run, project, user, proposal_values)
         _assert_agent_lease(db, run.id, lease_owner)
         _stop_agent_lease_heartbeat(heartbeat)
         heartbeat = None
         run.status = "completed"
-        run.stage = "completed"
+        _set_agent_stage(db, conversation, run, "completed", status="completed")
         run.output_hash = _hash_text(reply)
         run.finished_at = utcnow()
         run.error = None
@@ -1134,6 +1715,20 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
             {
                 "message_id": assistant_message.id,
                 "run_id": run.id,
+                "reply": reply,
+                "proposal_count": len(proposal_values),
+            },
+            run_id=run.id,
+        )
+        add_event(
+            db,
+            conversation,
+            "run.completed",
+            {
+                "run_id": run.id,
+                "message_id": assistant_message.id,
+                "status": run.status,
+                "stage": run.stage,
                 "reply": reply,
                 "proposal_count": len(proposal_values),
             },
@@ -1165,6 +1760,8 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
     except Exception as exc:
         _stop_agent_lease_heartbeat(heartbeat)
         heartbeat = None
+        if isinstance(exc, SQLAlchemyError):
+            _log_storage_failure("execute_run", exc)
         db.rollback()
         if isinstance(exc, AgentLeaseLost):
             # Recovery or another worker owns the run now.  Do not overwrite
@@ -1173,13 +1770,13 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
         run = db.get(AgentRun, run_id)
         if run is not None and run.status == "running":
             conversation = db.get(AgentConversation, run.conversation_id)
-            run.status = "failed"
-            run.stage = "failed"
-            run.error = (
-                "Agent 事件保存发生冲突，已保留本次运行记录，请重试。"
-                if isinstance(exc, IntegrityError)
-                else str(exc)[:4000]
+            retryable_format = isinstance(exc, AgentOutputFormatError)
+            retryable_provider = isinstance(exc, ProviderError) and (
+                exc.retryable or exc.uncertain
             )
+            run.status = "needs_retry" if retryable_format or retryable_provider else "failed"
+            run.stage = "failed"
+            run.error = _safe_agent_error(exc)
             run.finished_at = utcnow()
             partial = db.scalar(
                 select(AgentMessage)
@@ -1192,16 +1789,28 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
             )
             if partial is not None:
                 partial.status = "partial"
+                if retryable_format:
+                    # The in-progress buffer can contain the malformed JSON
+                    # envelope; never leave that machine wrapper in the
+                    # durable message visible to the panel.
+                    partial.content = run.error
                 partial.metadata_json = {
                     **(partial.metadata_json or {}),
                     "stream_error": run.error,
                 }
             if conversation is not None:
+                _set_agent_stage(db, conversation, run, "failed", status=run.status)
                 add_event(
                     db,
                     conversation,
-                    "run_failed",
-                    {"run_id": run.id, "error": run.error},
+                    "run.failed",
+                    {
+                        "run_id": run.id,
+                        "status": run.status,
+                        "stage": run.stage,
+                        "error": run.error,
+                        "message": run.error,
+                    },
                     run_id=run.id,
                 )
             job = db.scalar(
@@ -1210,8 +1819,8 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 .with_for_update()
             )
             if job is not None and job.lease_owner == lease_owner:
-                job.state = "failed"
-                job.current_stage = "failed"
+                job.state = run.status
+                job.current_stage = run.status
                 job.last_error = run.error
                 job.lease_owner = None
                 job.lease_expires_at = None

@@ -38,27 +38,27 @@ type AuthScreenProps = {
 
 const pageCopy: Record<Exclude<AuthView, "account">, { eyebrow: string; title: string; detail: string }> = {
   login: {
-    eyebrow: "RETURN TO THE MANUSCRIPT",
+    eyebrow: "回到你的故事",
     title: "继续你的故事",
-    detail: "每个用户拥有独立的故事正典、章节与模型密钥。",
+    detail: "你的小说、人物资料和模型设置只属于当前账号。",
   },
   register: {
-    eyebrow: "OPEN A NEW NOTEBOOK",
+    eyebrow: "建立新的写作空间",
     title: "建立你的编剧室",
-    detail: "注册后先验证邮箱，再开始保存第一套故事正典。",
+    detail: "注册并验证邮箱后，就可以开始保存自己的故事。",
   },
   "verify-email": {
-    eyebrow: "VERIFY THE MARGIN",
+    eyebrow: "确认账号归属",
     title: "确认你的邮箱",
     detail: "验证邮箱后，章节、设定与 Provider 才会进入你的私有工作区。",
   },
   "forgot-password": {
-    eyebrow: "RECOVER THE THREAD",
+    eyebrow: "找回登录方式",
     title: "找回账号",
     detail: "我们会发送一封有效期有限的重置邮件。无论邮箱是否存在，提示都保持一致。",
   },
   "reset-password": {
-    eyebrow: "RESTORE ACCESS",
+    eyebrow: "重新进入工作区",
     title: "设置新密码",
     detail: "新密码保存后，其他设备上的会话可以一并撤销。",
   },
@@ -209,7 +209,7 @@ export default function AuthScreen({
     if (!verificationRequired) {
       return {
         ...base,
-        detail: "注册后即可使用账号密码登录，开始保存你的第一套故事正典。",
+        detail: "注册后即可使用账号密码登录，开始保存你的故事。",
       };
     }
     return base;
@@ -349,10 +349,10 @@ export default function AuthScreen({
         <InkLandscape className="auth-ink" tone="dark" />
         <div className="auth-manuscript-top">
           <span className="auth-seal"><BookSeal /></span>
-          <span>章回 / PRIVATE STORY DESK</span>
+          <span>章回 / 私人写作台</span>
         </div>
         <div className="auth-manuscript-copy">
-          <p className="eyebrow">故事正典 · 版本留痕 · 私有密钥</p>
+          <p className="eyebrow">正文 · 人物 · 情节 · 仅你可见</p>
           <h1>让每一章，<em>有来处。</em></h1>
           <p>从人物第一次出现，到一条尚未回收的线索，所有已确认的事实都会留下来源。你拒绝的草稿，不会偷偷改写故事。</p>
         </div>
@@ -360,9 +360,9 @@ export default function AuthScreen({
           <div className="auth-timeline-line" />
           <div className="auth-timeline-item"><i /> <span>{verificationRequired ? "邮箱验证" : "账号密码"}</span><small>{verificationRequired ? "确认这本手稿属于你" : "按部署方式保护工作区"}</small></div>
           <div className="auth-timeline-item"><i /> <span>添加 Provider</span><small>模型密钥只进你的凭据库</small></div>
-          <div className="auth-timeline-item"><i /> <span>接受正典</span><small>生成前先固定故事状态</small></div>
+          <div className="auth-timeline-item"><i /> <span>确认建议</span><small>只有接受的内容才用于后续写作</small></div>
         </div>
-        <span className="auth-page-mark">卷一 / 正典</span>
+        <span className="auth-page-mark">写作 / 资料</span>
       </div>
 
       <main className="auth-panel">

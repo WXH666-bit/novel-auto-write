@@ -243,6 +243,7 @@ def test_genuine_legacy_sqlite_migrates_owner_constraints_and_flat_uploads(
     chapter_id = "44444444-4444-4444-4444-444444444444"
     revision_id = "55555555-5555-5555-5555-555555555555"
     provider_id = "22222222-2222-2222-2222-222222222222"
+    provider_explicit_false_id = "66666666-6666-6666-6666-666666666666"
     import_id = "33333333-3333-3333-3333-333333333333"
     raw_source = "第一章\n雾港的旧稿。".encode()
     source_hash = hashlib.sha256(raw_source).hexdigest()
@@ -367,9 +368,32 @@ def test_genuine_legacy_sqlite_migrates_owner_constraints_and_flat_uploads(
             text(
                 "INSERT INTO provider_profiles VALUES "
                 "(:id,'旧本地模型','http://127.0.0.1:1234/v1','chat_completions',"
-                "'{\"writer\":\"legacy-model\"}',8192,120,'{}',NULL,1,:created,:updated)"
+                "'{\"writer\":\"legacy-model\"}',8192,120,"
+                ":capabilities,NULL,1,:created,:updated)"
             ),
-            {"id": provider_id, "created": timestamp, "updated": timestamp},
+            {
+                "id": provider_id,
+                "capabilities": (
+                    '{"image_input":"not-a-flag","supports_vision":"true",'
+                    '"multimodal":"also-invalid","json_schema":true,"custom":"kept"}'
+                ),
+                "created": timestamp,
+                "updated": timestamp,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO provider_profiles VALUES "
+                "(:id,'显式关闭模型','http://127.0.0.1:1231/v1','chat_completions',"
+                "'{\"writer\":\"legacy-model\"}',8192,120,"
+                ":capabilities,NULL,1,:created,:updated)"
+            ),
+            {
+                "id": provider_explicit_false_id,
+                "capabilities": '{"vision":false,"supports_vision":"true","custom":"kept"}',
+                "created": timestamp,
+                "updated": timestamp,
+            },
         )
         connection.execute(
             text(
@@ -415,7 +439,7 @@ def test_genuine_legacy_sqlite_migrates_owner_constraints_and_flat_uploads(
     }
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260901_0004"
+            "20260902_0005"
         )
         migrated = connection.execute(
             text("SELECT owner_id,name,story_bible,canon_version,memory_epoch FROM projects")
@@ -432,6 +456,23 @@ def test_genuine_legacy_sqlite_migrates_owner_constraints_and_flat_uploads(
             {"id": revision_id},
         ).one()
         assert tuple(migrated_revision) == (chapter_content, chapter_hash)
+        migrated_provider = connection.execute(
+            text("SELECT capabilities FROM provider_profiles WHERE id=:id"),
+            {"id": provider_id},
+        ).scalar_one()
+        assert json.loads(migrated_provider) == {
+            "custom": "kept",
+            "json_schema": True,
+            "vision": True,
+        }
+        migrated_explicit_false = connection.execute(
+            text("SELECT capabilities FROM provider_profiles WHERE id=:id"),
+            {"id": provider_explicit_false_id},
+        ).scalar_one()
+        assert json.loads(migrated_explicit_false) == {
+            "custom": "kept",
+            "vision": False,
+        }
         stored_name = connection.execute(
             text("SELECT stored_name FROM import_sources WHERE id=:id"), {"id": import_id}
         ).scalar_one()
@@ -503,7 +544,7 @@ def test_existing_0002_sqlite_adds_nullable_username_identity(tmp_path) -> None:
     }
     with engine.begin() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20260901_0004"
+            "20260902_0005"
         )
         assert connection.execute(
             text("SELECT email_normalized FROM users WHERE id='old-email'")

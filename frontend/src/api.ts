@@ -7,6 +7,7 @@ import type {
   AssistantEvent,
   AssistantMessage,
   AssistantProposal,
+  AssistantRun,
   CanonItem,
   CharacterCard,
   Chapter,
@@ -16,6 +17,7 @@ import type {
   MemoryRunEvent,
   PlotThread,
   Project,
+  ProjectAttention,
   PortraitAsset,
   ProviderProfile,
   ReviewBundle,
@@ -177,14 +179,17 @@ export function normalizeUser(value: unknown): User {
     is_active:
       source.is_active === undefined ? true : Boolean(source.is_active),
     default_provider_id:
-      source.default_provider_id === null || source.default_provider_id === undefined
+      source.default_provider_id === null ||
+      source.default_provider_id === undefined
         ? null
         : String(source.default_provider_id),
     created_at: String(source.created_at ?? "") || undefined,
   };
 }
 
-export function normalizeAccountPreferences(value: unknown): AccountPreferences {
+export function normalizeAccountPreferences(
+  value: unknown,
+): AccountPreferences {
   const source = (value || {}) as Record<string, unknown>;
   const payload =
     source.preferences && typeof source.preferences === "object"
@@ -192,7 +197,8 @@ export function normalizeAccountPreferences(value: unknown): AccountPreferences 
       : source.data && typeof source.data === "object"
         ? (source.data as Record<string, unknown>)
         : source;
-  const defaultStartMode = payload.default_start_mode ?? payload.defaultStartMode;
+  const defaultStartMode =
+    payload.default_start_mode ?? payload.defaultStartMode;
   return {
     auto_summary_enabled: Boolean(
       payload.auto_summary_enabled ?? payload.autoSummaryEnabled ?? true,
@@ -204,7 +210,8 @@ export function normalizeAccountPreferences(value: unknown): AccountPreferences 
     preferences_version: numberOrUndefined(
       payload.preferences_version ?? payload.preferencesVersion,
     ),
-    updated_at: String(payload.updated_at ?? payload.updatedAt ?? "") || undefined,
+    updated_at:
+      String(payload.updated_at ?? payload.updatedAt ?? "") || undefined,
   };
 }
 
@@ -217,9 +224,10 @@ export function normalizeAuthSession(value: unknown): AuthSession {
       : {};
   return {
     user: normalizeUser(userSource),
-    csrf_token: String(
-      source.csrf_token ?? source.csrfToken ?? session.csrf_token ?? "",
-    ) || undefined,
+    csrf_token:
+      String(
+        source.csrf_token ?? source.csrfToken ?? session.csrf_token ?? "",
+      ) || undefined,
   };
 }
 
@@ -233,9 +241,10 @@ export async function getAccountPreferences(): Promise<AccountPreferences> {
   );
 }
 
-export async function updateAccountPreferences(
-  input: { auto_summary_enabled?: boolean; expected_version?: number },
-): Promise<AccountPreferences> {
+export async function updateAccountPreferences(input: {
+  auto_summary_enabled?: boolean;
+  expected_version?: number;
+}): Promise<AccountPreferences> {
   return normalizeAccountPreferences(
     await apiRequest<unknown>("/account/preferences", {
       method: "PATCH",
@@ -346,7 +355,10 @@ export async function forgotPassword(email: string) {
   });
 }
 
-export async function resetPassword(input: { token: string; password: string }) {
+export async function resetPassword(input: {
+  token: string;
+  password: string;
+}) {
   return apiRequest<unknown>("/auth/reset-password", {
     method: "POST",
     body: JSON.stringify(input),
@@ -388,7 +400,10 @@ export async function getProject(projectId: string): Promise<Project> {
 }
 
 export async function createProject(
-  input: Partial<Project> & { start_mode?: StartMode; first_chapter_title?: string },
+  input: Partial<Project> & {
+    start_mode?: StartMode;
+    first_chapter_title?: string;
+  },
 ): Promise<Project> {
   const payload = await apiRequest<unknown>("/projects", {
     method: "POST",
@@ -396,10 +411,10 @@ export async function createProject(
       ...input,
       name: input.title,
       description: input.logline,
-      ...(input.word_target !== undefined || input.target_word_count !== undefined
+      ...(input.word_target !== undefined ||
+      input.target_word_count !== undefined
         ? {
-            target_word_count:
-              input.target_word_count ?? input.word_target,
+            target_word_count: input.target_word_count ?? input.word_target,
           }
         : {}),
       ...(input.start_mode ? { start_mode: input.start_mode } : {}),
@@ -420,10 +435,10 @@ export async function updateProject(
       ...input,
       ...(input.title !== undefined ? { name: input.title } : {}),
       ...(input.logline !== undefined ? { description: input.logline } : {}),
-      ...(input.word_target !== undefined || input.target_word_count !== undefined
+      ...(input.word_target !== undefined ||
+      input.target_word_count !== undefined
         ? {
-            target_word_count:
-              input.target_word_count ?? input.word_target,
+            target_word_count: input.target_word_count ?? input.word_target,
           }
         : {}),
     }),
@@ -455,8 +470,12 @@ export async function createChapter(
       method: "POST",
       body: JSON.stringify({
         volume_number: input.volume_number ?? 1,
-        ...(input.chapter_number ? { chapter_number: input.chapter_number } : {}),
-        ...(input.sort_order !== undefined ? { sort_order: input.sort_order } : {}),
+        ...(input.chapter_number
+          ? { chapter_number: input.chapter_number }
+          : {}),
+        ...(input.sort_order !== undefined
+          ? { sort_order: input.sort_order }
+          : {}),
         title: input.title || "未命名章节",
         status: input.status || "draft",
         summary: input.summary ?? null,
@@ -494,10 +513,13 @@ export async function completeChapter(
   const source = (payload || {}) as Record<string, unknown>;
   return {
     chapter: normalizeChapter(source.chapter ?? payload),
-    memory_run: source.memory_run ? normalizeMemoryRun(source.memory_run) : null,
-    auto_summary_enabled: source.auto_summary_enabled === undefined
-      ? undefined
-      : Boolean(source.auto_summary_enabled),
+    memory_run: source.memory_run
+      ? normalizeMemoryRun(source.memory_run)
+      : null,
+    auto_summary_enabled:
+      source.auto_summary_enabled === undefined
+        ? undefined
+        : Boolean(source.auto_summary_enabled),
   };
 }
 
@@ -581,24 +603,33 @@ export async function analyzeProjectMemory(
   return normalizeMemoryRun(
     await apiRequest<unknown>(`/projects/${projectId}/memory/analyze`, {
       method: "POST",
-      body: JSON.stringify({ scope: input.scope || "project", ...(input.chapter_id ? { chapter_id: input.chapter_id } : {}) }),
+      body: JSON.stringify({
+        scope: input.scope || "project",
+        ...(input.chapter_id ? { chapter_id: input.chapter_id } : {}),
+      }),
     }),
   );
 }
 
-export async function getProjectMemory(projectId: string): Promise<ProjectMemory> {
+export async function getProjectMemory(
+  projectId: string,
+): Promise<ProjectMemory> {
   const payload = await apiRequest<unknown>(`/projects/${projectId}/memory`);
-  const raw = (unwrap<Record<string, unknown>>(payload, ["memory", "data"]) || {}) as Record<string, unknown>;
+  const raw = (unwrap<Record<string, unknown>>(payload, ["memory", "data"]) ||
+    {}) as Record<string, unknown>;
   const projectSummary = raw.project_summary ?? raw.projectSummary;
   const chapterRows = raw.chapter_summaries ?? raw.chapterSummaries;
   const runRows = raw.runs ?? raw.memory_runs ?? raw.memoryRuns;
   return {
     project_id: String(raw.project_id ?? raw.projectId ?? projectId),
     memory_epoch: Number(raw.memory_epoch ?? raw.memoryEpoch ?? 0) || 0,
-    auto_summary_enabled: raw.auto_summary_enabled === undefined
-      ? true
-      : Boolean(raw.auto_summary_enabled),
-    project_summary: projectSummary ? normalizeStorySummary(projectSummary, projectId) : null,
+    auto_summary_enabled:
+      raw.auto_summary_enabled === undefined
+        ? true
+        : Boolean(raw.auto_summary_enabled),
+    project_summary: projectSummary
+      ? normalizeStorySummary(projectSummary, projectId)
+      : null,
     chapter_summaries: Array.isArray(chapterRows)
       ? chapterRows.map((item) => normalizeStorySummary(item, projectId))
       : [],
@@ -607,15 +638,20 @@ export async function getProjectMemory(projectId: string): Promise<ProjectMemory
 }
 
 export async function getMemoryRun(runId: string): Promise<MemoryRun> {
-  return normalizeMemoryRun(await apiRequest<unknown>(`/memory-runs/${encodeURIComponent(runId)}`));
+  return normalizeMemoryRun(
+    await apiRequest<unknown>(`/memory-runs/${encodeURIComponent(runId)}`),
+  );
 }
 
 export async function retryMemoryRun(runId: string): Promise<MemoryRun> {
   return normalizeMemoryRun(
-    await apiRequest<unknown>(`/memory-runs/${encodeURIComponent(runId)}/retry`, {
-      method: "POST",
-      body: JSON.stringify({}),
-    }),
+    await apiRequest<unknown>(
+      `/memory-runs/${encodeURIComponent(runId)}/retry`,
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+    ),
   );
 }
 
@@ -628,7 +664,9 @@ export function listenMemoryRunEvents(
   onEvent: (event: MemoryRunEvent) => void,
   onError?: () => void,
 ) {
-  const source = new EventSource(memoryRunEventsUrl(runId), { withCredentials: true });
+  const source = new EventSource(memoryRunEventsUrl(runId), {
+    withCredentials: true,
+  });
   const parseProgress = (event: MessageEvent<string>) => {
     try {
       const payload = JSON.parse(event.data) as unknown;
@@ -644,7 +682,9 @@ export function listenMemoryRunEvents(
         type: "artifact",
         sequence: Number(payload.sequence ?? 0) || 0,
         stage: String(payload.stage ?? "") || undefined,
-        content_hash: String(payload.content_hash ?? payload.contentHash ?? "") || undefined,
+        content_hash:
+          String(payload.content_hash ?? payload.contentHash ?? "") ||
+          undefined,
       });
     } catch {
       /* malformed memory events are ignored */
@@ -657,8 +697,12 @@ export function listenMemoryRunEvents(
   return () => source.close();
 }
 
-export async function getCharacters(projectId: string): Promise<CharacterCard[]> {
-  const payload = await apiRequest<unknown>(`/projects/${projectId}/characters`);
+export async function getCharacters(
+  projectId: string,
+): Promise<CharacterCard[]> {
+  const payload = await apiRequest<unknown>(
+    `/projects/${projectId}/characters`,
+  );
   const result = unwrap<unknown>(payload, ["characters", "items", "data"]);
   return (Array.isArray(result) ? result : []).map((item) =>
     normalizeCharacter(item, projectId),
@@ -684,22 +728,33 @@ export async function updateCharacter(
   input: Partial<CharacterCard>,
 ): Promise<CharacterCard> {
   return normalizeCharacter(
-    await apiRequest<unknown>(`/projects/${projectId}/characters/${characterId}`, {
-      method: "PATCH",
-      body: JSON.stringify(input),
-    }),
+    await apiRequest<unknown>(
+      `/projects/${projectId}/characters/${characterId}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(input),
+      },
+    ),
     projectId,
   );
 }
 
-export async function getCharacter(characterId: string): Promise<CharacterCard> {
+export async function getCharacter(
+  characterId: string,
+): Promise<CharacterCard> {
   return normalizeCharacter(
     await apiRequest<unknown>(`/characters/${encodeURIComponent(characterId)}`),
   );
 }
 
-export async function deleteCharacter(projectId: string, characterId: string): Promise<void> {
-  await apiRequest<unknown>(`/projects/${projectId}/characters/${characterId}`, { method: "DELETE" });
+export async function deleteCharacter(
+  projectId: string,
+  characterId: string,
+): Promise<void> {
+  await apiRequest<unknown>(
+    `/projects/${projectId}/characters/${characterId}`,
+    { method: "DELETE" },
+  );
 }
 
 export async function uploadCharacterPortrait(
@@ -727,9 +782,12 @@ export async function deleteCharacterPortrait(
   mediaId?: string | null,
 ): Promise<void> {
   try {
-    await apiRequest<unknown>(`/characters/${encodeURIComponent(characterId)}/portrait`, {
-      method: "DELETE",
-    });
+    await apiRequest<unknown>(
+      `/characters/${encodeURIComponent(characterId)}/portrait`,
+      {
+        method: "DELETE",
+      },
+    );
   } catch (error) {
     if (apiErrorStatus(error) !== 404) throw error;
   }
@@ -757,7 +815,9 @@ export async function saveStoryGraph(
     // PATCH one of those records (that would bump memory_epoch); only the
     // separate layout endpoint receives positions.  Fallback nodes are the
     // only nodes that need to be materialised here.
-    const synthetic = /^(character|thread|event)-/.test(node.id) || node.data?.is_fallback === true;
+    const synthetic =
+      /^(character|thread|event)-/.test(node.id) ||
+      node.data?.is_fallback === true;
     if (!synthetic) {
       nodeIds.set(node.id, node.id);
       continue;
@@ -772,20 +832,38 @@ export async function saveStoryGraph(
     };
     const payload = {
       node_type: node.type === "thread" ? "plot" : node.type,
-      ref_id: node.ref_id ?? (node.data?.ref_id as string | undefined) ?? (node.data?.character_id as string | undefined) ?? (node.data?.thread_id as string | undefined) ?? null,
-      character_id: node.character_id ?? (node.data?.character_id as string | undefined) ?? null,
-      chapter_id: node.chapter_id ?? (node.data?.chapter_id as string | undefined) ?? null,
-      plot_thread_id: node.plot_thread_id ?? (node.data?.plot_thread_id as string | undefined) ?? (node.data?.thread_id as string | undefined) ?? null,
+      ref_id:
+        node.ref_id ??
+        (node.data?.ref_id as string | undefined) ??
+        (node.data?.character_id as string | undefined) ??
+        (node.data?.thread_id as string | undefined) ??
+        null,
+      character_id:
+        node.character_id ??
+        (node.data?.character_id as string | undefined) ??
+        null,
+      chapter_id:
+        node.chapter_id ??
+        (node.data?.chapter_id as string | undefined) ??
+        null,
+      plot_thread_id:
+        node.plot_thread_id ??
+        (node.data?.plot_thread_id as string | undefined) ??
+        (node.data?.thread_id as string | undefined) ??
+        null,
       label: node.label,
       data: nodeData,
       position_x: node.position.x,
       position_y: node.position.y,
       status: node.status || "active",
     };
-    const saved = await apiRequest<unknown>(`/projects/${projectId}/story-graph/nodes`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
+    const saved = await apiRequest<unknown>(
+      `/projects/${projectId}/story-graph/nodes`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
     const normalized = normalizeStoryGraphNode(saved);
     if (normalized) nodeIds.set(node.id, normalized.id);
   }
@@ -806,10 +884,13 @@ export async function saveStoryGraph(
       status: edge.status || "active",
     };
     if (!edge.id.startsWith("edge-") && edge.version !== undefined) {
-      await apiRequest<unknown>(`/projects/${projectId}/story-graph/edges/${encodeURIComponent(edge.id)}`, {
-        method: "PATCH",
-        body: JSON.stringify({ ...payload, expected_version: edge.version }),
-      });
+      await apiRequest<unknown>(
+        `/projects/${projectId}/story-graph/edges/${encodeURIComponent(edge.id)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ ...payload, expected_version: edge.version }),
+        },
+      );
     } else {
       await apiRequest<unknown>(`/projects/${projectId}/story-graph/edges`, {
         method: "POST",
@@ -819,14 +900,25 @@ export async function saveStoryGraph(
   }
   for (const edgeId of options.deletedEdgeIds || []) {
     try {
-      await apiRequest<unknown>(`/projects/${projectId}/story-graph/edges/${encodeURIComponent(edgeId)}`, { method: "DELETE" });
+      await apiRequest<unknown>(
+        `/projects/${projectId}/story-graph/edges/${encodeURIComponent(edgeId)}`,
+        { method: "DELETE" },
+      );
     } catch (error) {
       if (apiErrorStatus(error) !== 404) throw error;
     }
   }
-  await saveStoryGraphLayout(projectId, {
-    nodes: graph.nodes.map((node) => ({ id: nodeIds.get(node.id) ?? node.id, x: node.position.x, y: node.position.y })),
-  }, options.expectedLayoutVersion ?? graph.layout_version ?? graph.version);
+  await saveStoryGraphLayout(
+    projectId,
+    {
+      nodes: graph.nodes.map((node) => ({
+        id: nodeIds.get(node.id) ?? node.id,
+        x: node.position.x,
+        y: node.position.y,
+      })),
+    },
+    options.expectedLayoutVersion ?? graph.layout_version ?? graph.version,
+  );
   return getStoryGraph(projectId);
 }
 
@@ -837,7 +929,12 @@ export async function saveStoryGraphLayout(
 ): Promise<unknown> {
   return apiRequest<unknown>(`/projects/${projectId}/story-graph/layout`, {
     method: "PATCH",
-    body: JSON.stringify({ layout_json: layout, ...(expectedVersion !== undefined ? { expected_version: expectedVersion } : {}) }),
+    body: JSON.stringify({
+      layout_json: layout,
+      ...(expectedVersion !== undefined
+        ? { expected_version: expectedVersion }
+        : {}),
+    }),
   });
 }
 
@@ -846,15 +943,19 @@ export async function createAssistantConversation(
   input: { target: AgentTarget; title?: string },
 ): Promise<AssistantConversation> {
   return normalizeAssistantConversation(
-    await apiRequest<unknown>(`/projects/${projectId}/assistant/conversations`, {
-      method: "POST",
-      body: JSON.stringify({
-        title: input.title || "故事设定助手",
-        purpose: input.target.type === "character" ? "setup_character" : "setup",
-        apply_mode: "preview",
-        target: input.target,
-      }),
-    }),
+    await apiRequest<unknown>(
+      `/projects/${projectId}/assistant/conversations`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          title: input.title || "故事设定助手",
+          purpose:
+            input.target.type === "character" ? "setup_character" : "setup",
+          apply_mode: "preview",
+          target: input.target,
+        }),
+      },
+    ),
     projectId,
   );
 }
@@ -864,7 +965,9 @@ export async function getAssistantConversation(
   conversationId: string,
 ): Promise<AssistantConversation> {
   return normalizeAssistantConversation(
-    await apiRequest<unknown>(`/projects/${projectId}/assistant/conversations/${conversationId}`),
+    await apiRequest<unknown>(
+      `/projects/${projectId}/assistant/conversations/${conversationId}`,
+    ),
     projectId,
   );
 }
@@ -872,16 +975,22 @@ export async function getAssistantConversation(
 export async function listAssistantConversations(
   projectId: string,
 ): Promise<AssistantConversation[]> {
-  const payload = await apiRequest<unknown>(`/projects/${projectId}/assistant/conversations`);
+  const payload = await apiRequest<unknown>(
+    `/projects/${projectId}/assistant/conversations`,
+  );
   const rows = unwrap<unknown>(payload, ["conversations", "items", "data"]);
-  return (Array.isArray(rows) ? rows : []).map((item) => normalizeAssistantConversation(item, projectId));
+  return (Array.isArray(rows) ? rows : []).map((item) =>
+    normalizeAssistantConversation(item, projectId),
+  );
 }
 
 export async function listAssistantMessages(
   projectId: string,
   conversationId: string,
 ): Promise<AssistantMessage[]> {
-  const payload = await apiRequest<unknown>(`/projects/${projectId}/assistant/conversations/${conversationId}/messages`);
+  const payload = await apiRequest<unknown>(
+    `/projects/${projectId}/assistant/conversations/${conversationId}/messages`,
+  );
   const rows = unwrap<unknown>(payload, ["messages", "items", "data"]);
   return (Array.isArray(rows) ? rows : []).map(normalizeAssistantMessage);
 }
@@ -890,8 +999,12 @@ export async function listAssistantProposals(
   projectId: string,
   conversationId?: string,
 ): Promise<AssistantProposal[]> {
-  const query = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : "";
-  const payload = await apiRequest<unknown>(`/projects/${projectId}/assistant/proposals${query}`);
+  const query = conversationId
+    ? `?conversation_id=${encodeURIComponent(conversationId)}`
+    : "";
+  const payload = await apiRequest<unknown>(
+    `/projects/${projectId}/assistant/proposals${query}`,
+  );
   const rows = unwrap<unknown>(payload, ["proposals", "items", "data"]);
   return (Array.isArray(rows) ? rows : []).map(normalizeAssistantProposal);
 }
@@ -908,7 +1021,9 @@ export async function sendAssistantMessage(
     idempotency_key?: string;
   } = {},
 ): Promise<AssistantMessage> {
-  const payload = await apiRequest<unknown>(`/projects/${projectId}/assistant/conversations/${conversationId}/messages`, {
+  const payload = await apiRequest<unknown>(
+    `/projects/${projectId}/assistant/conversations/${conversationId}/messages`,
+    {
       method: "POST",
       body: JSON.stringify({
         content,
@@ -916,9 +1031,12 @@ export async function sendAssistantMessage(
         target: options.target || {},
         context_snapshot: options.context_snapshot || {},
         authorized_asset_ids: options.authorized_asset_ids || [],
-        ...(options.expected_version ? { expected_version: options.expected_version } : {}),
+        ...(options.expected_version
+          ? { expected_version: options.expected_version }
+          : {}),
       }),
-    });
+    },
+  );
   const message = unwrap<unknown>(payload, ["message", "data"]);
   return normalizeAssistantMessage(message);
 }
@@ -927,7 +1045,11 @@ export async function applyAssistantProposal(
   projectId: string,
   conversationId: string,
   proposalId: string,
-  options: { expected_version?: number | null; expected_memory_epoch?: number | null; reason?: string } = {},
+  options: {
+    expected_version?: number | null;
+    expected_memory_epoch?: number | null;
+    reason?: string;
+  } = {},
 ): Promise<AssistantProposal> {
   void conversationId;
   return normalizeAssistantProposal(
@@ -936,8 +1058,12 @@ export async function applyAssistantProposal(
       {
         method: "POST",
         body: JSON.stringify({
-          ...(options.expected_version != null ? { expected_version: options.expected_version } : {}),
-          ...(options.expected_memory_epoch != null ? { expected_memory_epoch: options.expected_memory_epoch } : {}),
+          ...(options.expected_version != null
+            ? { expected_version: options.expected_version }
+            : {}),
+          ...(options.expected_memory_epoch != null
+            ? { expected_memory_epoch: options.expected_memory_epoch }
+            : {}),
           ...(options.reason ? { reason: options.reason } : {}),
         }),
       },
@@ -955,7 +1081,10 @@ export async function rejectAssistantProposal(
   return normalizeAssistantProposal(
     await apiRequest<unknown>(
       `/projects/${projectId}/assistant/proposals/${proposalId}/reject`,
-      { method: "POST", body: JSON.stringify(options.reason ? { reason: options.reason } : {}) },
+      {
+        method: "POST",
+        body: JSON.stringify(options.reason ? { reason: options.reason } : {}),
+      },
     ),
   );
 }
@@ -963,7 +1092,11 @@ export async function rejectAssistantProposal(
 export async function applyAssistantProposals(
   projectId: string,
   proposalIds: string[],
-  options: { expected_memory_epoch?: number | null; expected_versions?: Record<string, number>; reason?: string } = {},
+  options: {
+    expected_memory_epoch?: number | null;
+    expected_versions?: Record<string, number>;
+    reason?: string;
+  } = {},
 ): Promise<AssistantProposal[]> {
   const payload = await apiRequest<Record<string, unknown>>(
     `/projects/${projectId}/assistant/proposals/apply-batch`,
@@ -971,8 +1104,12 @@ export async function applyAssistantProposals(
       method: "POST",
       body: JSON.stringify({
         proposal_ids: proposalIds,
-        ...(options.expected_memory_epoch != null ? { expected_memory_epoch: options.expected_memory_epoch } : {}),
-        ...(options.expected_versions ? { expected_versions: options.expected_versions } : {}),
+        ...(options.expected_memory_epoch != null
+          ? { expected_memory_epoch: options.expected_memory_epoch }
+          : {}),
+        ...(options.expected_versions
+          ? { expected_versions: options.expected_versions }
+          : {}),
         ...(options.reason ? { reason: options.reason } : {}),
       }),
     },
@@ -990,14 +1127,45 @@ export async function rejectAssistantProposals(
     `/projects/${projectId}/assistant/proposals/reject-batch`,
     {
       method: "POST",
-      body: JSON.stringify({ proposal_ids: proposalIds, ...(options.reason ? { reason: options.reason } : {}) }),
+      body: JSON.stringify({
+        proposal_ids: proposalIds,
+        ...(options.reason ? { reason: options.reason } : {}),
+      }),
     },
   );
   const rows = unwrap<unknown>(payload, ["proposals", "items", "data"]);
   return (Array.isArray(rows) ? rows : []).map(normalizeAssistantProposal);
 }
 
-export function assistantEventsUrl(projectId: string, conversationId: string, after?: number) {
+export async function listAssistantRuns(
+  projectId: string,
+  conversationId: string,
+): Promise<AssistantRun[]> {
+  const payload = await apiRequest<unknown>(
+    `/projects/${projectId}/assistant/conversations/${conversationId}/runs`,
+  );
+  const rows = unwrap<unknown>(payload, ["runs", "items", "data"]);
+  return (Array.isArray(rows) ? rows : []).map(normalizeAssistantRun);
+}
+
+export async function retryAssistantRun(
+  projectId: string,
+  conversationId: string,
+  runId: string,
+): Promise<AssistantRun> {
+  return normalizeAssistantRun(
+    await apiRequest<unknown>(
+      `/projects/${projectId}/assistant/conversations/${conversationId}/runs/${runId}/retry`,
+      { method: "POST" },
+    ),
+  );
+}
+
+export function assistantEventsUrl(
+  projectId: string,
+  conversationId: string,
+  after?: number,
+) {
   const query = after && after > 0 ? `?after=${encodeURIComponent(after)}` : "";
   return `${API_ROOT}/projects/${projectId}/assistant/conversations/${conversationId}/events/stream${query}`;
 }
@@ -1006,12 +1174,16 @@ export function listenAssistantEvents(
   projectId: string,
   conversationId: string,
   onEvent: (event: AssistantEvent) => void,
-  onError?: () => void,
+  onReconnect?: () => void,
   after?: number,
+  onOpen?: () => void,
 ) {
-  const source = new EventSource(assistantEventsUrl(projectId, conversationId, after), {
-    withCredentials: true,
-  });
+  const source = new EventSource(
+    assistantEventsUrl(projectId, conversationId, after),
+    {
+      withCredentials: true,
+    },
+  );
   const handleEvent = (event: MessageEvent<string>) => {
     try {
       const parsed = JSON.parse(event.data) as unknown;
@@ -1022,10 +1194,11 @@ export function listenAssistantEvents(
   };
   source.onmessage = handleEvent;
   source.addEventListener("assistant", handleEvent as EventListener);
+  source.onopen = () => onOpen?.();
   source.onerror = () => {
     // Keep the native EventSource alive: the browser reconnects with the
     // persisted Last-Event-ID, so durable deltas resume without duplication.
-    onError?.();
+    onReconnect?.();
   };
   return () => source.close();
 }
@@ -1054,9 +1227,12 @@ export async function createGeneration(
       input.target_word_count ?? input.word_target ?? 3500,
     ),
     instructions,
-    destination: input.destination === "current_blank" ? "current_blank" : "new_child",
+    destination:
+      input.destination === "current_blank" ? "current_blank" : "new_child",
     skip_memory_once: Boolean(input.skip_memory_once),
-    ...(input.skip_memory_reason ? { skip_memory_reason: String(input.skip_memory_reason) } : {}),
+    ...(input.skip_memory_reason
+      ? { skip_memory_reason: String(input.skip_memory_reason) }
+      : {}),
     mode:
       input.mode === "outline"
         ? "outline"
@@ -1173,6 +1349,55 @@ export async function getProviders(): Promise<ProviderProfile[]> {
   return (Array.isArray(result) ? result : []).map(normalizeProvider);
 }
 
+export async function getProjectAttention(
+  projectId: string,
+): Promise<ProjectAttention> {
+  const raw = await apiRequest<Record<string, unknown>>(
+    `/projects/${projectId}/attention`,
+  );
+  const items = Array.isArray(raw.items) ? raw.items : [];
+  return {
+    total: Number(raw.total || 0),
+    reviews: Number(raw.reviews || 0),
+    rechecks: Number(raw.rechecks || 0),
+    proposals: Number(raw.proposals || 0),
+    retries: Number(raw.retries || 0),
+    items: items.map((item) => {
+      const row = (item || {}) as Record<string, unknown>;
+      const rawKind = String(row.kind || "retry");
+      const kind =
+        rawKind === "review" || rawKind === "recheck" || rawKind === "proposal"
+          ? rawKind
+          : "retry";
+      return {
+        id: String(row.id || ""),
+        kind,
+        status: String(row.status || ""),
+        title: String(row.title || "待处理事项"),
+        detail: String(row.detail || "") || undefined,
+        chapter_id:
+          row.chapter_id === null
+            ? null
+            : String(row.chapter_id || "") || undefined,
+        conversation_id:
+          row.conversation_id === null
+            ? null
+            : String(row.conversation_id || "") || undefined,
+        run_id:
+          row.run_id === null ? null : String(row.run_id || "") || undefined,
+        task_type: String(row.task_type || "") || undefined,
+        job_id:
+          row.job_id === null ? null : String(row.job_id || "") || undefined,
+        target_type:
+          row.target_type === null
+            ? null
+            : String(row.target_type || "") || undefined,
+        created_at: String(row.created_at || "") || undefined,
+      };
+    }),
+  };
+}
+
 export async function createProvider(input: Partial<ProviderProfile>) {
   return normalizeProvider(
     await apiRequest<unknown>("/providers", {
@@ -1222,9 +1447,7 @@ export async function rebuildProjectMemory(
   );
 }
 
-export async function testProvider(
-  input: Partial<ProviderProfile>,
-): Promise<{
+export async function testProvider(input: Partial<ProviderProfile>): Promise<{
   ok: boolean;
   latency_ms?: number;
   model?: string;
@@ -1356,7 +1579,8 @@ export function normalizeProject(value: unknown): Project {
     viewpoint: String(source.viewpoint ?? source.pov ?? ""),
     tone: String(source.tone ?? source.style ?? ""),
     style: String(source.style ?? source.tone ?? ""),
-    story_bible: String(source.story_bible ?? source.storyBible ?? "") || undefined,
+    story_bible:
+      String(source.story_bible ?? source.storyBible ?? "") || undefined,
     outline:
       source.outline && typeof source.outline === "object"
         ? (source.outline as Record<string, unknown>)
@@ -1386,7 +1610,9 @@ export function normalizeProject(value: unknown): Project {
     updated_at: String(source.updated_at ?? source.updatedAt ?? ""),
     cover_mark: String(source.cover_mark ?? source.coverMark ?? "章"),
     source: source.source === "imported" ? "imported" : "local",
-    summary_status: (String(source.summary_status ?? source.summaryStatus ?? "current") as Project["summary_status"]),
+    summary_status: String(
+      source.summary_status ?? source.summaryStatus ?? "current",
+    ) as Project["summary_status"],
   };
 }
 
@@ -1434,7 +1660,9 @@ export function normalizeChapter(value: unknown): Chapter {
     status: (source.status ?? "draft") as Chapter["status"],
     word_count: Number(source.word_count ?? source.wordCount ?? content.length),
     summary: String(source.summary ?? source.abstract ?? ""),
-    summary_status: (String(source.summary_status ?? source.summaryStatus ?? "current") as Chapter["summary_status"]),
+    summary_status: String(
+      source.summary_status ?? source.summaryStatus ?? "current",
+    ) as Chapter["summary_status"],
     content,
     revision_id: String(currentRevisionId ?? "") || undefined,
     updated_at: String(source.updated_at ?? source.updatedAt ?? ""),
@@ -1716,56 +1944,109 @@ function normalizeTimeline(
 }
 
 export function normalizeMemoryRun(value: unknown): MemoryRun {
-  const source = (unwrap<Record<string, unknown>>(value, ["run", "memory_run"]) || {}) as Record<string, unknown>;
+  const source = (unwrap<Record<string, unknown>>(value, [
+    "run",
+    "memory_run",
+  ]) || {}) as Record<string, unknown>;
   const rawStatus = String(source.status ?? source.state ?? "queued");
-  const status = (["queued", "running", "current", "failed", "stale", "skipped", "cancelled", "completed", "needs_retry"] as const).includes(
-    rawStatus as MemoryRun["status"],
-  )
+  const status = (
+    [
+      "queued",
+      "running",
+      "current",
+      "failed",
+      "stale",
+      "skipped",
+      "cancelled",
+      "completed",
+      "needs_retry",
+    ] as const
+  ).includes(rawStatus as MemoryRun["status"])
     ? (rawStatus as MemoryRun["status"])
     : "queued";
   return {
     id: String(source.id ?? source.run_id ?? crypto.randomUUID()),
     project_id: String(source.project_id ?? source.projectId ?? ""),
     status,
-    scope: source.scope === "project" ? "project" : source.scope === "chapter" ? "chapter" : source.scope === "arc" ? "arc" : "chapters",
-    chapter_id: source.chapter_id === null
-      ? null
-      : String(source.chapter_id ?? source.chapterId ?? "") || undefined,
+    scope:
+      source.scope === "project"
+        ? "project"
+        : source.scope === "chapter"
+          ? "chapter"
+          : source.scope === "arc"
+            ? "arc"
+            : "chapters",
+    chapter_id:
+      source.chapter_id === null
+        ? null
+        : String(source.chapter_id ?? source.chapterId ?? "") || undefined,
     chapter_ids: Array.isArray(source.chapter_ids ?? source.chapterIds)
       ? ((source.chapter_ids ?? source.chapterIds) as unknown[]).map(String)
       : source.chapter_id
         ? [String(source.chapter_id)]
         : [],
     progress: numberOrUndefined(source.progress ?? source.percent),
-    phase_label: String(source.phase_label ?? source.phaseLabel ?? source.message ?? ""),
-    error: String(source.error ?? source.last_error ?? source.lastError ?? "") || undefined,
-    created_at: String(source.created_at ?? source.createdAt ?? "") || undefined,
-    completed_at: String(source.completed_at ?? source.completedAt ?? "") || undefined,
+    phase_label: String(
+      source.phase_label ?? source.phaseLabel ?? source.message ?? "",
+    ),
+    error:
+      String(source.error ?? source.last_error ?? source.lastError ?? "") ||
+      undefined,
+    created_at:
+      String(source.created_at ?? source.createdAt ?? "") || undefined,
+    completed_at:
+      String(source.completed_at ?? source.completedAt ?? "") || undefined,
     stage: String(source.stage ?? source.current_stage ?? "") || undefined,
-    started_at: String(source.started_at ?? source.startedAt ?? "") || undefined,
-    finished_at: String(source.finished_at ?? source.finishedAt ?? "") || undefined,
-    idempotency_key: String(source.idempotency_key ?? source.idempotencyKey ?? "") || undefined,
-    provider_profile_id: source.provider_profile_id === null
-      ? null
-      : String(source.provider_profile_id ?? source.providerProfileId ?? "") || undefined,
+    started_at:
+      String(source.started_at ?? source.startedAt ?? "") || undefined,
+    finished_at:
+      String(source.finished_at ?? source.finishedAt ?? "") || undefined,
+    idempotency_key:
+      String(source.idempotency_key ?? source.idempotencyKey ?? "") ||
+      undefined,
+    provider_profile_id:
+      source.provider_profile_id === null
+        ? null
+        : String(
+            source.provider_profile_id ?? source.providerProfileId ?? "",
+          ) || undefined,
   };
 }
 
 function normalizeStorySummary(value: unknown, projectId = ""): StorySummary {
-  const source = (unwrap<Record<string, unknown>>(value, ["summary", "story_summary", "storySummary"]) || {}) as Record<string, unknown>;
+  const source = (unwrap<Record<string, unknown>>(value, [
+    "summary",
+    "story_summary",
+    "storySummary",
+  ]) || {}) as Record<string, unknown>;
   const structured = source.structured_json ?? source.structuredJson;
   return {
     id: String(source.id ?? source.summary_id ?? crypto.randomUUID()),
     project_id: String(source.project_id ?? source.projectId ?? projectId),
     scope: String(source.scope ?? "project"),
-    chapter_id: source.chapter_id === null ? null : String(source.chapter_id ?? source.chapterId ?? "") || undefined,
-    current_revision_id: source.current_revision_id === null ? null : String(source.current_revision_id ?? source.currentRevisionId ?? "") || undefined,
+    chapter_id:
+      source.chapter_id === null
+        ? null
+        : String(source.chapter_id ?? source.chapterId ?? "") || undefined,
+    current_revision_id:
+      source.current_revision_id === null
+        ? null
+        : String(
+            source.current_revision_id ?? source.currentRevisionId ?? "",
+          ) || undefined,
     status: String(source.status ?? "current"),
-    summary_text: String(source.summary_text ?? source.summaryText ?? source.summary ?? ""),
-    structured_json: structured && typeof structured === "object" ? structured as Record<string, unknown> : {},
+    summary_text: String(
+      source.summary_text ?? source.summaryText ?? source.summary ?? "",
+    ),
+    structured_json:
+      structured && typeof structured === "object"
+        ? (structured as Record<string, unknown>)
+        : {},
     memory_epoch: Number(source.memory_epoch ?? source.memoryEpoch ?? 0) || 0,
-    created_at: String(source.created_at ?? source.createdAt ?? "") || undefined,
-    updated_at: String(source.updated_at ?? source.updatedAt ?? "") || undefined,
+    created_at:
+      String(source.created_at ?? source.createdAt ?? "") || undefined,
+    updated_at:
+      String(source.updated_at ?? source.updatedAt ?? "") || undefined,
   };
 }
 
@@ -1780,59 +2061,108 @@ function normalizePortrait(value: unknown, projectId = ""): PortraitAsset {
   return {
     id: String(source.id ?? source.asset_id ?? crypto.randomUUID()),
     project_id: String(source.project_id ?? source.projectId ?? projectId),
-    filename: String(source.filename ?? source.file_name ?? source.original_name ?? "") || undefined,
-    url: String(source.url ?? source.public_url ?? source.download_url ?? source.path ?? ""),
+    filename:
+      String(
+        source.filename ?? source.file_name ?? source.original_name ?? "",
+      ) || undefined,
+    url: String(
+      source.url ??
+        source.public_url ??
+        source.download_url ??
+        source.path ??
+        "",
+    ),
     alt: String(source.alt ?? source.alt_text ?? "") || undefined,
     width: numberOrUndefined(source.width),
     height: numberOrUndefined(source.height),
-    content_type: String(source.content_type ?? source.contentType ?? source.mime ?? "") || undefined,
-    byte_size: numberOrUndefined(source.byte_size ?? source.byteSize ?? source.size),
+    content_type:
+      String(source.content_type ?? source.contentType ?? source.mime ?? "") ||
+      undefined,
+    byte_size: numberOrUndefined(
+      source.byte_size ?? source.byteSize ?? source.size,
+    ),
     checksum: String(source.checksum ?? source.hash ?? "") || undefined,
-    created_at: String(source.created_at ?? source.createdAt ?? "") || undefined,
+    created_at:
+      String(source.created_at ?? source.createdAt ?? "") || undefined,
   };
 }
 
-export function normalizeCharacter(value: unknown, projectId = ""): CharacterCard {
+export function normalizeCharacter(
+  value: unknown,
+  projectId = "",
+): CharacterCard {
   const raw = (value || {}) as Record<string, unknown>;
   const profile =
     raw.profile && typeof raw.profile === "object"
       ? (raw.profile as Record<string, unknown>)
       : {};
-  const imageMediaId = String(raw.image_media_id ?? raw.imageMediaId ?? "") || undefined;
+  const imageMediaId =
+    String(raw.image_media_id ?? raw.imageMediaId ?? "") || undefined;
   const portraitValue = raw.portrait ?? raw.avatar ?? raw.image;
   const rawStatus = String(raw.status ?? "draft");
-  const status = (["draft", "pending", "confirmed", "needs_review", "archived", "active"] as const).includes(
-    rawStatus as CharacterCard["status"],
-  )
+  const status = (
+    [
+      "draft",
+      "pending",
+      "confirmed",
+      "needs_review",
+      "archived",
+      "active",
+    ] as const
+  ).includes(rawStatus as CharacterCard["status"])
     ? (rawStatus as CharacterCard["status"])
     : "draft";
-  const rawData = raw.data && typeof raw.data === "object" ? (raw.data as Record<string, unknown>) : {};
+  const rawData =
+    raw.data && typeof raw.data === "object"
+      ? (raw.data as Record<string, unknown>)
+      : {};
   const refs = Array.isArray(raw.source_refs ?? raw.sourceRefs)
     ? ((raw.source_refs ?? raw.sourceRefs) as unknown[]).map(normalizeSourceRef)
     : Array.isArray(rawData.source_refs ?? rawData.sourceRefs)
-      ? ((rawData.source_refs ?? rawData.sourceRefs) as unknown[]).map(normalizeSourceRef)
+      ? ((rawData.source_refs ?? rawData.sourceRefs) as unknown[]).map(
+          normalizeSourceRef,
+        )
       : [];
   const portrait = portraitValue
     ? normalizePortrait(portraitValue, projectId)
     : imageMediaId
-      ? normalizePortrait({ id: imageMediaId, project_id: projectId, url: `${API_ROOT}/media/${encodeURIComponent(imageMediaId)}` }, projectId)
+      ? normalizePortrait(
+          {
+            id: imageMediaId,
+            project_id: projectId,
+            url: `${API_ROOT}/media/${encodeURIComponent(imageMediaId)}`,
+          },
+          projectId,
+        )
       : null;
   return {
     id: String(raw.id ?? raw.character_id ?? crypto.randomUUID()),
     project_id: String(raw.project_id ?? raw.projectId ?? projectId),
-    name: String(raw.name ?? raw.key ?? raw.subject ?? profile.name ?? "未命名人物"),
+    name: String(
+      raw.name ?? raw.key ?? raw.subject ?? profile.name ?? "未命名人物",
+    ),
     aliases: textList(raw.aliases ?? profile.aliases),
     role: String(raw.role ?? profile.role ?? "") || undefined,
     age: String(raw.age ?? profile.age ?? "") || undefined,
     gender: String(raw.gender ?? profile.gender ?? "") || undefined,
     pronouns: String(raw.pronouns ?? profile.pronouns ?? "") || undefined,
     appearance: String(raw.appearance ?? profile.appearance ?? "") || undefined,
-    personality: String(raw.personality ?? profile.personality ?? "") || undefined,
+    personality:
+      String(raw.personality ?? profile.personality ?? "") || undefined,
     motivation: String(raw.motivation ?? profile.motivation ?? "") || undefined,
     occupation: String(raw.occupation ?? profile.occupation ?? "") || undefined,
     background: String(raw.background ?? profile.background ?? "") || undefined,
-    goals: String(raw.goals ?? raw.goal ?? profile.goals ?? profile.goal ?? "") || undefined,
-    conflict_fears: String(raw.conflict_fears ?? raw.conflict ?? profile.conflict_fears ?? profile.conflict ?? "") || undefined,
+    goals:
+      String(raw.goals ?? raw.goal ?? profile.goals ?? profile.goal ?? "") ||
+      undefined,
+    conflict_fears:
+      String(
+        raw.conflict_fears ??
+          raw.conflict ??
+          profile.conflict_fears ??
+          profile.conflict ??
+          "",
+      ) || undefined,
     abilities: String(raw.abilities ?? profile.abilities ?? "") || undefined,
     arc: String(raw.arc ?? raw.character_arc ?? profile.arc ?? "") || undefined,
     voice: String(raw.voice ?? profile.voice ?? "") || undefined,
@@ -1840,18 +2170,23 @@ export function normalizeCharacter(value: unknown, projectId = ""): CharacterCar
     custom_fields:
       raw.custom_fields && typeof raw.custom_fields === "object"
         ? Object.fromEntries(
-            Object.entries(raw.custom_fields as Record<string, unknown>).map(([key, item]) => [
-              key,
-              typeof item === "string" ? item : JSON.stringify(item),
-            ]),
+            Object.entries(raw.custom_fields as Record<string, unknown>).map(
+              ([key, item]) => [
+                key,
+                typeof item === "string" ? item : JSON.stringify(item),
+              ],
+            ),
           )
         : {},
     portrait,
     status,
     image_media_id: imageMediaId ?? null,
     source_refs: refs,
-    canon_item_id: String(raw.canon_item_id ?? raw.canonItemId ?? "") || undefined,
-    current_revision_id: String(raw.current_revision_id ?? raw.currentRevisionId ?? "") || undefined,
+    canon_item_id:
+      String(raw.canon_item_id ?? raw.canonItemId ?? "") || undefined,
+    current_revision_id:
+      String(raw.current_revision_id ?? raw.currentRevisionId ?? "") ||
+      undefined,
     version: numberOrUndefined(raw.version),
     updated_at: String(raw.updated_at ?? raw.updatedAt ?? "") || undefined,
     created_at: String(raw.created_at ?? raw.createdAt ?? "") || undefined,
@@ -1860,40 +2195,83 @@ export function normalizeCharacter(value: unknown, projectId = ""): CharacterCar
 
 function normalizeStoryGraphNode(value: unknown): StoryGraphNode | null {
   const raw = (value || {}) as Record<string, unknown>;
-  const data = raw.data && typeof raw.data === "object" ? (raw.data as Record<string, unknown>) : {};
-  const rawType = String(raw.type ?? raw.node_type ?? data.type ?? "custom").toLowerCase();
-  const type: StoryGraphNode["type"] | null = rawType === "character" || rawType === "person"
-    ? "character"
-    : rawType === "thread" || rawType === "plot" || rawType === "plot_thread" || rawType === "story_line"
-      ? "thread"
-      : rawType === "event" || rawType === "timeline"
-        ? "event"
-        : null;
+  const data =
+    raw.data && typeof raw.data === "object"
+      ? (raw.data as Record<string, unknown>)
+      : {};
+  const rawType = String(
+    raw.type ?? raw.node_type ?? data.type ?? "custom",
+  ).toLowerCase();
+  const type: StoryGraphNode["type"] | null =
+    rawType === "character" || rawType === "person"
+      ? "character"
+      : rawType === "thread" ||
+          rawType === "plot" ||
+          rawType === "plot_thread" ||
+          rawType === "story_line"
+        ? "thread"
+        : rawType === "event" || rawType === "timeline"
+          ? "event"
+          : null;
   // Graph v1 deliberately excludes chapter/setting/custom nodes.  Dropping
   // them here keeps both React Flow and the relation table honest about the
   // supported vocabulary instead of silently relabelling them as events.
   if (!type) return null;
-  const position = raw.position && typeof raw.position === "object" ? (raw.position as Record<string, unknown>) : {};
+  const position =
+    raw.position && typeof raw.position === "object"
+      ? (raw.position as Record<string, unknown>)
+      : {};
   return {
     id: String(raw.id ?? crypto.randomUUID()),
     type,
     label: String(raw.label ?? raw.name ?? data.label ?? "未命名节点"),
     subtitle: String(raw.subtitle ?? data.subtitle ?? "") || undefined,
-    image_url: String(raw.image_url ?? raw.imageUrl ?? data.image_url ?? "") || undefined,
+    image_url:
+      String(raw.image_url ?? raw.imageUrl ?? data.image_url ?? "") ||
+      undefined,
     status: String(raw.status ?? data.status ?? "") || undefined,
     position: {
       x: Number(position.x ?? raw.position_x ?? raw.x ?? 0),
       y: Number(position.y ?? raw.position_y ?? raw.y ?? 0),
     },
     data,
-    ref_id: String(raw.ref_id ?? raw.refId ?? data.ref_id ?? data.refId ?? "") || undefined,
-    character_id: String(raw.character_id ?? raw.characterId ?? data.character_id ?? data.characterId ?? "") || undefined,
-    chapter_id: String(raw.chapter_id ?? raw.chapterId ?? data.chapter_id ?? data.chapterId ?? "") || undefined,
-    plot_thread_id: String(raw.plot_thread_id ?? raw.plotThreadId ?? data.plot_thread_id ?? data.plotThreadId ?? data.thread_id ?? data.threadId ?? "") || undefined,
+    ref_id:
+      String(raw.ref_id ?? raw.refId ?? data.ref_id ?? data.refId ?? "") ||
+      undefined,
+    character_id:
+      String(
+        raw.character_id ??
+          raw.characterId ??
+          data.character_id ??
+          data.characterId ??
+          "",
+      ) || undefined,
+    chapter_id:
+      String(
+        raw.chapter_id ??
+          raw.chapterId ??
+          data.chapter_id ??
+          data.chapterId ??
+          "",
+      ) || undefined,
+    plot_thread_id:
+      String(
+        raw.plot_thread_id ??
+          raw.plotThreadId ??
+          data.plot_thread_id ??
+          data.plotThreadId ??
+          data.thread_id ??
+          data.threadId ??
+          "",
+      ) || undefined,
     source_refs: Array.isArray(raw.source_refs ?? raw.sourceRefs)
-      ? ((raw.source_refs ?? raw.sourceRefs) as unknown[]).map(normalizeSourceRef)
+      ? ((raw.source_refs ?? raw.sourceRefs) as unknown[]).map(
+          normalizeSourceRef,
+        )
       : Array.isArray(data.source_refs ?? data.sourceRefs)
-        ? ((data.source_refs ?? data.sourceRefs) as unknown[]).map(normalizeSourceRef)
+        ? ((data.source_refs ?? data.sourceRefs) as unknown[]).map(
+            normalizeSourceRef,
+          )
         : [],
     version: numberOrUndefined(raw.version),
   };
@@ -1901,32 +2279,53 @@ function normalizeStoryGraphNode(value: unknown): StoryGraphNode | null {
 
 function normalizeStoryGraphEdge(value: unknown): StoryGraphEdge {
   const raw = (value || {}) as Record<string, unknown>;
-  const rawData = raw.data && typeof raw.data === "object" ? (raw.data as Record<string, unknown>) : {};
+  const rawData =
+    raw.data && typeof raw.data === "object"
+      ? (raw.data as Record<string, unknown>)
+      : {};
   const refs = Array.isArray(raw.source_refs ?? raw.sourceRefs)
     ? ((raw.source_refs ?? raw.sourceRefs) as unknown[]).map(normalizeSourceRef)
     : Array.isArray(rawData.source_refs ?? rawData.sourceRefs)
-      ? ((rawData.source_refs ?? rawData.sourceRefs) as unknown[]).map(normalizeSourceRef)
+      ? ((rawData.source_refs ?? rawData.sourceRefs) as unknown[]).map(
+          normalizeSourceRef,
+        )
       : [];
   const rawStatus = String(raw.status ?? "pending");
-  const status = (["active", "draft", "pending", "confirmed", "needs_review"] as const).includes(
+  const status = (
+    ["active", "draft", "pending", "confirmed", "needs_review"] as const
+  ).includes(
     rawStatus as "active" | "draft" | "pending" | "confirmed" | "needs_review",
   )
-    ? (rawStatus as "active" | "draft" | "pending" | "confirmed" | "needs_review")
+    ? (rawStatus as
+        | "active"
+        | "draft"
+        | "pending"
+        | "confirmed"
+        | "needs_review")
     : "pending";
   return {
     id: String(raw.id ?? crypto.randomUUID()),
     source: String(raw.source ?? raw.source_node_id ?? raw.sourceId ?? ""),
     target: String(raw.target ?? raw.target_node_id ?? raw.targetId ?? ""),
     label: String(raw.label ?? raw.name ?? "") || undefined,
-    kind: String(raw.kind ?? raw.relation_type ?? raw.type ?? "relationship") || undefined,
-    direction: raw.direction === "directed" || raw.directed === true ? "directed" : "undirected",
+    kind:
+      String(raw.kind ?? raw.relation_type ?? raw.type ?? "relationship") ||
+      undefined,
+    direction:
+      raw.direction === "directed" || raw.directed === true
+        ? "directed"
+        : "undirected",
     status,
     note: String(raw.note ?? "") || undefined,
     source_refs: refs,
-    relation_type: String(raw.relation_type ?? raw.kind ?? "related") || undefined,
+    relation_type:
+      String(raw.relation_type ?? raw.kind ?? "related") || undefined,
     directed: raw.directed === undefined ? true : Boolean(raw.directed),
     weight: numberOrUndefined(raw.weight),
-    data: raw.data && typeof raw.data === "object" ? (raw.data as Record<string, unknown>) : {},
+    data:
+      raw.data && typeof raw.data === "object"
+        ? (raw.data as Record<string, unknown>)
+        : {},
     source_node_id: String(raw.source_node_id ?? raw.source ?? "") || undefined,
     target_node_id: String(raw.target_node_id ?? raw.target ?? "") || undefined,
     version: numberOrUndefined(raw.version),
@@ -1934,9 +2333,19 @@ function normalizeStoryGraphEdge(value: unknown): StoryGraphEdge {
 }
 
 export function normalizeStoryGraph(value: unknown): StoryGraph {
-  const raw = (unwrap<Record<string, unknown>>(value, ["story_graph", "storyGraph", "graph"]) || {}) as Record<string, unknown>;
-  const layout = raw.layout && typeof raw.layout === "object" ? (raw.layout as Record<string, unknown>) : {};
-  const layoutJson = layout.layout_json && typeof layout.layout_json === "object" ? (layout.layout_json as Record<string, unknown>) : {};
+  const raw = (unwrap<Record<string, unknown>>(value, [
+    "story_graph",
+    "storyGraph",
+    "graph",
+  ]) || {}) as Record<string, unknown>;
+  const layout =
+    raw.layout && typeof raw.layout === "object"
+      ? (raw.layout as Record<string, unknown>)
+      : {};
+  const layoutJson =
+    layout.layout_json && typeof layout.layout_json === "object"
+      ? (layout.layout_json as Record<string, unknown>)
+      : {};
   const layoutRows = Array.isArray(layoutJson.nodes)
     ? (layoutJson.nodes as unknown[])
     : Array.isArray(layoutJson.positions)
@@ -1948,18 +2357,38 @@ export function normalizeStoryGraph(value: unknown): StoryGraph {
     const row = item as Record<string, unknown>;
     const id = String(row.id ?? row.node_id ?? "");
     if (!id) return;
-    const x = Number(row.x ?? row.position_x ?? (row.position && typeof row.position === "object" ? (row.position as Record<string, unknown>).x : 0));
-    const y = Number(row.y ?? row.position_y ?? (row.position && typeof row.position === "object" ? (row.position as Record<string, unknown>).y : 0));
-    positions.set(id, { x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0 });
+    const x = Number(
+      row.x ??
+        row.position_x ??
+        (row.position && typeof row.position === "object"
+          ? (row.position as Record<string, unknown>).x
+          : 0),
+    );
+    const y = Number(
+      row.y ??
+        row.position_y ??
+        (row.position && typeof row.position === "object"
+          ? (row.position as Record<string, unknown>).y
+          : 0),
+    );
+    positions.set(id, {
+      x: Number.isFinite(x) ? x : 0,
+      y: Number.isFinite(y) ? y : 0,
+    });
   });
-  const nodes = (Array.isArray(raw.nodes) ? raw.nodes.map(normalizeStoryGraphNode).filter(Boolean) : []) as StoryGraphNode[];
+  const nodes = (
+    Array.isArray(raw.nodes)
+      ? raw.nodes.map(normalizeStoryGraphNode).filter(Boolean)
+      : []
+  ) as StoryGraphNode[];
   nodes.forEach((node) => {
     const position = positions.get(node.id);
     if (position) node.position = position;
   });
   const nodeIds = new Set(nodes.map((node) => node.id));
-  const edges = (Array.isArray(raw.edges) ? raw.edges.map(normalizeStoryGraphEdge) : [])
-    .filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
+  const edges = (
+    Array.isArray(raw.edges) ? raw.edges.map(normalizeStoryGraphEdge) : []
+  ).filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
   return {
     nodes,
     edges,
@@ -1971,22 +2400,26 @@ export function normalizeStoryGraph(value: unknown): StoryGraph {
 
 function normalizeAgentTarget(value: unknown): AgentTarget {
   const raw = (value || {}) as Record<string, unknown>;
-  const rawType = String(raw.type ?? raw.target_type ?? raw.targetType ?? "project").toLowerCase();
-  const type = rawType.includes("character") || rawType === "person"
-    ? "character"
-    : rawType.includes("chapter") || rawType.includes("selection")
-      ? "chapter"
-    : rawType.includes("thread") || rawType.includes("plot")
-      ? "thread"
-      : rawType.includes("relation") || rawType.includes("edge")
-        ? "relationship"
-        : "project";
+  const rawType = String(
+    raw.type ?? raw.target_type ?? raw.targetType ?? "project",
+  ).toLowerCase();
+  const type =
+    rawType.includes("character") || rawType === "person"
+      ? "character"
+      : rawType.includes("chapter") || rawType.includes("selection")
+        ? "chapter"
+        : rawType.includes("thread") || rawType.includes("plot")
+          ? "thread"
+          : rawType.includes("relation") || rawType.includes("edge")
+            ? "relationship"
+            : "project";
   return {
     type,
     id: String(raw.id ?? raw.target_id ?? raw.targetId ?? ""),
-    chapter_id: raw.chapter_id === null
-      ? null
-      : String(raw.chapter_id ?? raw.chapterId ?? "") || undefined,
+    chapter_id:
+      raw.chapter_id === null
+        ? null
+        : String(raw.chapter_id ?? raw.chapterId ?? "") || undefined,
   } as AgentTarget;
 }
 
@@ -1997,7 +2430,9 @@ function normalizeAgentPatch(value: unknown): AgentPatch {
     value: raw.value,
     label: String(raw.label ?? raw.field_label ?? "") || undefined,
     source_refs: Array.isArray(raw.source_refs ?? raw.sourceRefs)
-      ? ((raw.source_refs ?? raw.sourceRefs) as unknown[]).map(normalizeSourceRef)
+      ? ((raw.source_refs ?? raw.sourceRefs) as unknown[]).map(
+          normalizeSourceRef,
+        )
       : [],
     confidence: numberOrUndefined(raw.confidence),
   };
@@ -2011,12 +2446,14 @@ function normalizeAssistantMessage(value: unknown): AssistantMessage {
     role: role === "user" || role === "system" ? role : "assistant",
     content: String(raw.content ?? raw.text ?? ""),
     status: String(raw.status ?? "") || undefined,
-    target: raw.target_json || raw.target
-      ? normalizeAgentTarget(raw.target_json ?? raw.target)
-      : undefined,
-    context_snapshot: raw.context_snapshot && typeof raw.context_snapshot === "object"
-      ? (raw.context_snapshot as AgentContextSnapshot)
-      : undefined,
+    target:
+      raw.target_json || raw.target
+        ? normalizeAgentTarget(raw.target_json ?? raw.target)
+        : undefined,
+    context_snapshot:
+      raw.context_snapshot && typeof raw.context_snapshot === "object"
+        ? (raw.context_snapshot as AgentContextSnapshot)
+        : undefined,
     authorized_asset_ids: Array.isArray(raw.authorized_asset_ids)
       ? (raw.authorized_asset_ids as unknown[]).map(String)
       : [],
@@ -2030,77 +2467,204 @@ function normalizeAssistantMessage(value: unknown): AssistantMessage {
 function normalizeAssistantProposal(value: unknown): AssistantProposal {
   const raw = (value || {}) as Record<string, unknown>;
   const rawStatus = String(raw.status ?? "proposed");
-  const status = (["proposed", "applying", "applied", "rejected"] as const).includes(
-    rawStatus as AssistantProposal["status"],
-  )
+  const status = (
+    ["proposed", "applying", "applied", "rejected"] as const
+  ).includes(rawStatus as AssistantProposal["status"])
     ? (rawStatus as AssistantProposal["status"])
     : "proposed";
-  const patchJson = raw.patch_json && typeof raw.patch_json === "object"
-    ? (raw.patch_json as Record<string, unknown>)
-    : {};
+  const patchJson =
+    raw.patch_json && typeof raw.patch_json === "object"
+      ? (raw.patch_json as Record<string, unknown>)
+      : {};
   const rawPatches = raw.patches ?? raw.operations ?? patchJson.patches;
   const patches = Array.isArray(rawPatches)
     ? (rawPatches as unknown[]).map(normalizeAgentPatch)
     : Object.entries(patchJson)
-      .filter(([key]) => key !== "patches")
-      .map(([path, patchValue]) => normalizeAgentPatch({ path, value: patchValue }));
-  const operation = String(raw.operation ?? "").replaceAll("_", " ").trim();
+        .filter(([key]) => key !== "patches")
+        .map(([path, patchValue]) =>
+          normalizeAgentPatch({ path, value: patchValue }),
+        );
+  const operation = String(raw.operation ?? "").trim();
+  const operationLabel = operation.replaceAll("_", " ").trim();
   return {
     id: String(raw.id ?? raw.proposal_id ?? crypto.randomUUID()),
     conversation_id: String(raw.conversation_id ?? raw.conversationId ?? ""),
-    target: normalizeAgentTarget(raw.target ?? { target_type: raw.target_type, target_id: raw.target_id }),
-    summary: String(raw.summary ?? raw.description ?? raw.reason ?? (operation ? `建议${operation}` : "待应用的设定提案")),
+    target: normalizeAgentTarget(
+      raw.target ?? { target_type: raw.target_type, target_id: raw.target_id },
+    ),
+    summary: String(
+      raw.summary ??
+        raw.description ??
+        raw.reason ??
+        (operationLabel ? `建议${operationLabel}` : "待应用的设定提案"),
+    ),
     patches,
     status,
     created_at: String(raw.created_at ?? raw.createdAt ?? "") || undefined,
-    operation: operation || String(raw.operation ?? "") || undefined,
+    // Keep the canonical operation token for graph/character routing.  The
+    // summary above is the human-readable form shown in the proposal card.
+    operation: operation || undefined,
     target_type: String(raw.target_type ?? raw.targetType ?? "") || undefined,
-    target_id: raw.target_id === null ? null : String(raw.target_id ?? raw.targetId ?? "") || undefined,
-    change_set_id: String(raw.change_set_id ?? raw.changeSetId ?? "") || undefined,
-    base_version: raw.base_version === null ? null : numberOrUndefined(raw.base_version ?? raw.baseVersion),
-    base_memory_epoch: raw.base_memory_epoch === null ? null : numberOrUndefined(raw.base_memory_epoch ?? raw.baseMemoryEpoch),
+    target_id:
+      raw.target_id === null
+        ? null
+        : String(raw.target_id ?? raw.targetId ?? "") || undefined,
+    change_set_id:
+      String(raw.change_set_id ?? raw.changeSetId ?? "") || undefined,
+    base_version:
+      raw.base_version === null
+        ? null
+        : numberOrUndefined(raw.base_version ?? raw.baseVersion),
+    base_memory_epoch:
+      raw.base_memory_epoch === null
+        ? null
+        : numberOrUndefined(raw.base_memory_epoch ?? raw.baseMemoryEpoch),
     reason: String(raw.reason ?? "") || undefined,
   };
 }
 
-function normalizeAssistantConversation(value: unknown, projectId = ""): AssistantConversation {
-  const raw = (unwrap<Record<string, unknown>>(value, ["conversation", "session"]) || {}) as Record<string, unknown>;
+function normalizeAssistantConversation(
+  value: unknown,
+  projectId = "",
+): AssistantConversation {
+  const raw = (unwrap<Record<string, unknown>>(value, [
+    "conversation",
+    "session",
+  ]) || {}) as Record<string, unknown>;
   return {
     id: String(raw.id ?? raw.conversation_id ?? crypto.randomUUID()),
     project_id: String(raw.project_id ?? raw.projectId ?? projectId),
     target: normalizeAgentTarget(raw.target),
-    status: (String(raw.status ?? "idle") as AssistantConversation["status"]),
-    messages: Array.isArray(raw.messages) ? raw.messages.map(normalizeAssistantMessage) : [],
-    proposals: Array.isArray(raw.proposals) ? raw.proposals.map(normalizeAssistantProposal) : [],
+    status: String(raw.status ?? "idle") as AssistantConversation["status"],
+    messages: Array.isArray(raw.messages)
+      ? raw.messages.map(normalizeAssistantMessage)
+      : [],
+    proposals: Array.isArray(raw.proposals)
+      ? raw.proposals.map(normalizeAssistantProposal)
+      : [],
     title: String(raw.title ?? "") || undefined,
     purpose: String(raw.purpose ?? "") || undefined,
     version: numberOrUndefined(raw.version),
-    provider_profile_id: raw.provider_profile_id === null ? null : String(raw.provider_profile_id ?? "") || undefined,
+    provider_profile_id:
+      raw.provider_profile_id === null
+        ? null
+        : String(raw.provider_profile_id ?? "") || undefined,
+    provider_name:
+      String(
+        raw.provider_name ??
+          (raw.provider as Record<string, unknown> | undefined)?.name ??
+          "",
+      ) || undefined,
+    provider_capabilities: normalizeProviderCapabilities(
+      raw.provider_capabilities ??
+        (raw.provider as Record<string, unknown> | undefined)?.capabilities,
+    ),
     updated_at: String(raw.updated_at ?? raw.updatedAt ?? "") || undefined,
   };
 }
 
-function normalizeAssistantEvent(value: unknown): AssistantEvent {
+export function normalizeAssistantRun(value: unknown): AssistantRun {
+  const raw = (unwrap<Record<string, unknown>>(value, ["run", "data"]) ||
+    {}) as Record<string, unknown>;
+  return {
+    id: String(raw.id ?? raw.run_id ?? ""),
+    project_id: String(raw.project_id ?? ""),
+    conversation_id: String(raw.conversation_id ?? ""),
+    message_id:
+      raw.message_id === null
+        ? null
+        : String(raw.message_id ?? "") || undefined,
+    status: String(raw.status ?? "queued"),
+    stage: String(raw.stage ?? "") || undefined,
+    provider_profile_id:
+      raw.provider_profile_id === null
+        ? null
+        : String(raw.provider_profile_id ?? "") || undefined,
+    error: raw.error === null ? null : String(raw.error ?? "") || undefined,
+    attempt: numberOrUndefined(raw.attempt ?? raw.attempts),
+    created_at: String(raw.created_at ?? "") || undefined,
+    started_at:
+      raw.started_at === null
+        ? null
+        : String(raw.started_at ?? "") || undefined,
+    finished_at:
+      raw.finished_at === null
+        ? null
+        : String(raw.finished_at ?? "") || undefined,
+  };
+}
+
+function mergeProposalEventMetadata(
+  proposal: Record<string, unknown>,
+  ...envelopes: Record<string, unknown>[]
+): Record<string, unknown> {
+  const merged = { ...proposal };
+  // The SSE wire format carries durable event metadata beside the nested
+  // proposal. Older workers omitted operation/target/version from the nested
+  // object, so fill only missing values and keep proposal fields authoritative.
+  for (const envelope of envelopes) {
+    for (const [key, value] of Object.entries(envelope)) {
+      if (key === "proposal" || value === undefined) continue;
+      const current = merged[key];
+      if (current === undefined || current === null || current === "") {
+        merged[key] = value;
+      }
+    }
+  }
+  return merged;
+}
+
+export function normalizeAssistantEvent(value: unknown): AssistantEvent {
   const raw = (value || {}) as Record<string, unknown>;
   const sequence = Number(raw.sequence ?? raw.seq ?? 0);
-  const payload = raw.payload_json && typeof raw.payload_json === "object"
-    ? (raw.payload_json as Record<string, unknown>)
-    : raw.payload && typeof raw.payload === "object"
-      ? (raw.payload as Record<string, unknown>)
-      : raw;
+  const payload =
+    raw.payload_json && typeof raw.payload_json === "object"
+      ? (raw.payload_json as Record<string, unknown>)
+      : raw.payload && typeof raw.payload === "object"
+        ? (raw.payload as Record<string, unknown>)
+        : raw;
   const eventName = String(raw.event_type ?? raw.type ?? "").toLowerCase();
   const type = eventName.replace(/[.\-]/g, "_");
+  const meta = {
+    sequence,
+    run_id: String(raw.run_id ?? payload.run_id ?? "") || undefined,
+    attempt: numberOrUndefined(raw.attempt ?? payload.attempt),
+    target:
+      raw.target || payload.target
+        ? normalizeAgentTarget(raw.target ?? payload.target)
+        : undefined,
+    base_version:
+      (raw.base_version ?? payload.base_version) === null
+        ? null
+        : numberOrUndefined(raw.base_version ?? payload.base_version),
+    cursor:
+      String((raw.cursor ?? payload.cursor ?? sequence) || "") || undefined,
+    retryable:
+      typeof (payload.retryable ?? raw.retryable) === "boolean"
+        ? Boolean(payload.retryable ?? raw.retryable)
+        : undefined,
+  };
   if (type === "message_delta" || type === "message_stream_delta") {
     return {
-      sequence,
+      ...meta,
       type: "message_delta",
       message_id: String(payload.message_id ?? payload.messageId ?? ""),
       delta: String(payload.delta ?? payload.content ?? ""),
     };
   }
+  if (type === "message_replace") {
+    return {
+      ...meta,
+      type: "message_replace",
+      message_id: String(payload.message_id ?? payload.messageId ?? ""),
+      content: String(
+        payload.content ?? payload.reply ?? payload.message ?? "",
+      ),
+    };
+  }
   if (type === "message_completed") {
     return {
-      sequence,
+      ...meta,
       type: "message_completed",
       message_id: String(payload.message_id ?? payload.messageId ?? ""),
       reply: String(payload.reply ?? payload.content ?? ""),
@@ -2108,43 +2672,117 @@ function normalizeAssistantEvent(value: unknown): AssistantEvent {
     };
   }
   if (type === "proposal_created") {
+    const nestedProposal =
+      payload.proposal && typeof payload.proposal === "object"
+        ? (payload.proposal as Record<string, unknown>)
+        : null;
+    const proposalInput = nestedProposal
+      ? mergeProposalEventMetadata(nestedProposal, raw, payload)
+      : payload;
     return {
-      sequence,
+      ...meta,
       type: "proposal_created",
-      proposal: normalizeAssistantProposal(payload.proposal ?? payload),
+      proposal: normalizeAssistantProposal(proposalInput),
     };
   }
   if (type === "proposal_patch") {
     return {
-      sequence,
+      ...meta,
       type,
       proposal_id: String(payload.proposal_id ?? payload.proposalId ?? ""),
       patch: normalizeAgentPatch(payload.patch ?? payload),
     };
   }
-  if (type === "proposal_completed") {
+  if (type === "proposal_completed" || type === "proposal_ready") {
     return {
-      sequence,
-      type,
+      ...meta,
+      type: "proposal_completed",
       proposal_id: String(payload.proposal_id ?? payload.proposalId ?? ""),
     };
   }
-  if (type === "run_failed" || type === "error") return { sequence, type: "error", message: String(payload.message ?? payload.error ?? "Agent 暂时不可用") };
-  const rawStatus = type === "run_started" || type === "message_started"
-    ? "streaming"
-    : type === "message_completed"
-      ? "idle"
-      : String(payload.status ?? "idle");
-  const allowedStatuses = ["idle", "streaming", "applying", "applied", "error", "disconnected", "cancelled"] as const;
-  const status = allowedStatuses.includes(rawStatus as (typeof allowedStatuses)[number])
+  if (type === "run_failed" || type === "error")
+    return {
+      ...meta,
+      type: "error",
+      retryable: meta.retryable ?? true,
+      message: String(payload.message ?? payload.error ?? "Agent 暂时不可用"),
+    };
+  const rawStatus =
+    type === "run_started" || type === "message_started"
+      ? "streaming"
+      : type === "run_completed"
+        ? "idle"
+        : type === "run_stage"
+          ? String(
+              payload.status ??
+                (payload.stage === "queued" ? "queued" : "streaming"),
+            )
+          : String(payload.status ?? "idle");
+  const allowedStatuses = [
+    "idle",
+    "queued",
+    "running",
+    "streaming",
+    "reconnecting",
+    "applying",
+    "applied",
+    "error",
+    "disconnected",
+    "cancelled",
+  ] as const;
+  const status = allowedStatuses.includes(
+    rawStatus as (typeof allowedStatuses)[number],
+  )
     ? (rawStatus as (typeof allowedStatuses)[number])
     : "idle";
   return {
-    sequence,
+    ...meta,
     type: "status",
     status,
+    stage: String(payload.stage ?? "") || undefined,
     message: String(payload.message ?? payload.reply ?? "") || undefined,
   };
+}
+
+function strictCapabilityBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return undefined;
+  }
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "yes", "on", "enabled"].includes(normalized)) return true;
+  if (["false", "0", "no", "off", "disabled", ""].includes(normalized))
+    return false;
+  return undefined;
+}
+
+export function normalizeProviderCapabilities(
+  value: unknown,
+): Record<string, boolean> {
+  const raw =
+    value && typeof value === "object"
+      ? (value as Record<string, unknown>)
+      : {};
+  const normalized: Record<string, boolean> = {};
+  for (const [key, item] of Object.entries(raw)) {
+    if (
+      ["vision", "image_input", "supports_vision", "multimodal"].includes(key)
+    )
+      continue;
+    const parsed = strictCapabilityBoolean(item);
+    if (parsed !== undefined) normalized[key] = parsed;
+  }
+  // A canonical explicit false is authoritative. Legacy aliases are consulted
+  // only when vision is absent or malformed.
+  const canonical = strictCapabilityBoolean(raw.vision);
+  const legacy = [raw.image_input, raw.supports_vision, raw.multimodal]
+    .map(strictCapabilityBoolean)
+    .find((item) => item !== undefined);
+  normalized.vision = canonical ?? legacy ?? false;
+  return normalized;
 }
 
 export function normalizeProvider(value: unknown): ProviderProfile {
@@ -2160,13 +2798,15 @@ export function normalizeProvider(value: unknown): ProviderProfile {
     protocol: (source.protocol ??
       source.protocol_mode ??
       "chat_completions") as ProviderProfile["protocol"],
-    api_version: String(source.api_version ?? source.apiVersion ?? "") || undefined,
+    api_version:
+      String(source.api_version ?? source.apiVersion ?? "") || undefined,
     max_output_tokens: numberOrUndefined(
       source.max_output_tokens ?? source.maxOutputTokens,
     ),
     anthropic_workspace_id:
-      String(source.anthropic_workspace_id ?? source.anthropicWorkspaceId ?? "") ||
-      undefined,
+      String(
+        source.anthropic_workspace_id ?? source.anthropicWorkspaceId ?? "",
+      ) || undefined,
     default_model: String(
       source.default_model ??
         source.model ??
@@ -2183,9 +2823,8 @@ export function normalizeProvider(value: unknown): ProviderProfile {
         source.timeoutMs ??
         Number(source.timeout_seconds ?? 60) * 1000,
     ),
-    capabilities: (source.capabilities ?? {}) as Record<string, boolean>,
-    enabled:
-      source.enabled === undefined ? true : Boolean(source.enabled),
+    capabilities: normalizeProviderCapabilities(source.capabilities),
+    enabled: source.enabled === undefined ? true : Boolean(source.enabled),
     is_default: Boolean(source.is_default ?? source.isDefault ?? false),
     deleted_at:
       source.deleted_at === null || source.deleted_at === undefined

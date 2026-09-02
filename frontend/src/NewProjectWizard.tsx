@@ -37,7 +37,7 @@ const startModes: Array<{
     icon: Bot,
     label: "和 Agent 一起搭建",
     title: "先把故事骨架说出来",
-    detail: "进入设定工坊，让 Agent 通过对话帮你填写人物、世界和主线。",
+    detail: "打开人物页，让右侧 Agent 通过对话帮你填写人物、世界和主线。",
   },
   {
     mode: "import",
@@ -139,9 +139,9 @@ export default function NewProjectWizard({
           <div className="wizard-body">
             <div className="wizard-intro">
               <div>
-                <span className="eyebrow">01 / CHOOSE YOUR FIRST PAGE</span>
+                <span className="eyebrow">第一步 · 选择起点</span>
                 <h3>你想从哪里落笔？</h3>
-                <p>三种入口最后都会回到同一套故事正典；你可以随时在表格和关系图之间切换。</p>
+                <p>三种入口都会进入同一个写作台；你可以随时在表格和关系图之间切换。</p>
               </div>
               <span className="wizard-seal" aria-hidden="true"><Sparkles size={18} /></span>
             </div>
@@ -186,9 +186,9 @@ export default function NewProjectWizard({
               <div><span>{selected.label}</span><strong>{selected.title}</strong></div>
             </div>
             <div className="wizard-form-heading">
-              <span className="eyebrow">02 / GIVE IT A NAME</span>
+              <span className="eyebrow">第二步 · 填写基本信息</span>
               <h3>先给这本小说一个坐标</h3>
-              <p>{mode === "import" ? "稍后选择原稿；这里的信息会成为导入项目的故事首页。" : mode === "setup" ? "创建后打开设定工坊，Agent 会把这些信息作为第一轮对话的起点。" : "创建后马上出现第一章空白稿纸，随时可以补充人物和规则。"}</p>
+              <p>{mode === "import" ? "稍后选择原稿；这里的信息会成为导入项目的故事首页。" : mode === "setup" ? "创建后打开人物页，右侧 Agent 会把这些信息作为第一轮对话的起点。" : "创建后马上出现第一章空白稿纸，随时可以补充人物和规则。"}</p>
             </div>
             <label className="field">
               <span>小说名称</span>

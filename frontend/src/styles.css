@@ -2262,3 +2262,668 @@ html { scrollbar-color: rgba(79, 117, 107, .58) rgba(31, 41, 36, .07); }
     padding-right: 8px;
   }
 }
+
+/* --------------------------------------------------------------------------
+   协作台壳 · writing is the focus, the ledger is an on-demand reference.
+   Keep this last so the shell stays intentional even as older surface styles
+   remain available to the library and review views.
+   -------------------------------------------------------------------------- */
+.topbar-workspace {
+  position: relative;
+  min-height: 64px;
+  padding-inline: 24px;
+  gap: 16px;
+  background: rgba(244, 241, 232, .94);
+}
+.topbar-workspace .brand-lockup {
+  min-width: 190px;
+}
+.workspace-context {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.workspace-context > span {
+  color: var(--teal);
+  font-family: var(--serif);
+  font-size: 11px;
+}
+.workspace-context strong {
+  max-width: 230px;
+  overflow: hidden;
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 14px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-context em {
+  max-width: 210px;
+  overflow: hidden;
+  padding-left: 7px;
+  border-left: 1px solid var(--line-strong);
+  color: var(--muted);
+  font-size: 10px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topbar-workspace .top-actions {
+  position: relative;
+  gap: 10px;
+}
+.topbar-save-state {
+  min-height: 34px;
+  margin-right: 2px;
+  padding: 0 3px;
+  font-size: 10px;
+}
+.topbar-attention,
+.topbar-more {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  color: var(--muted);
+  background: transparent;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.topbar-attention:hover,
+.topbar-more:hover,
+.topbar-attention[aria-expanded="true"],
+.topbar-more[aria-expanded="true"] {
+  border-color: rgba(74, 84, 78, .25);
+  color: var(--ink);
+  background: rgba(79, 117, 107, .08);
+}
+.topbar-attention.has-items {
+  border-color: rgba(169, 70, 59, .28);
+  color: var(--red);
+  background: rgba(169, 70, 59, .06);
+}
+.topbar-attention b {
+  min-width: 19px;
+  height: 19px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 4px;
+  border-radius: 50%;
+  color: var(--paper);
+  background: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+}
+.topbar-attention.has-items b {
+  background: var(--red);
+}
+.topbar-complete {
+  min-height: 36px;
+  padding-inline: 12px;
+}
+.topbar-more svg {
+  transition: transform .18s ease;
+}
+.topbar-more[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+.topbar-workspace .workspace-avatar {
+  display: none;
+}
+.topbar-workspace .account-menu {
+  top: calc(100% + 8px);
+  right: 0;
+}
+.attention-popover {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 10px);
+  right: 126px;
+  width: min(340px, calc(100vw - 32px));
+  overflow: hidden;
+  border: 1px solid rgba(74, 84, 78, .35);
+  background: var(--paper);
+  box-shadow: 0 18px 44px rgba(31, 41, 36, .17);
+}
+.attention-popover-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 13px 11px;
+  border-bottom: 1px solid var(--line);
+}
+.attention-popover-head > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.attention-popover-head .eyebrow {
+  margin: 0;
+  font-size: 8px;
+}
+.attention-popover-head strong {
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 15px;
+  font-weight: 600;
+}
+.attention-list {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+}
+.attention-item {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid transparent;
+  color: var(--ink);
+  background: transparent;
+  text-align: left;
+}
+.attention-item:hover {
+  border-color: var(--line);
+  background: rgba(79, 117, 107, .07);
+}
+.attention-item > span:nth-child(2) {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+.attention-item strong {
+  overflow: hidden;
+  font-family: var(--serif);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attention-item small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attention-item-mark {
+  width: 27px;
+  height: 27px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--teal);
+  background: rgba(79, 117, 107, .1);
+}
+.attention-review,
+.attention-recheck {
+  color: var(--red);
+  background: rgba(169, 70, 59, .1);
+}
+.attention-empty {
+  margin: 0;
+  padding: 18px 16px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.7;
+}
+.attention-review-link {
+  width: calc(100% - 16px);
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  margin: 0 8px 8px;
+  border: 1px solid var(--line);
+  color: var(--teal);
+  background: transparent;
+  font-size: 10px;
+}
+.attention-review-link:hover {
+  border-color: var(--teal);
+  background: rgba(79, 117, 107, .07);
+}
+
+/* Writing keeps a clear page. The ledger and plot rail return only through
+   their explicit mobile/reference controls. */
+.desk-shell {
+  grid-template-columns: 214px minmax(0, 1fr);
+  background: rgba(221, 225, 218, .66);
+}
+.desk-shell > .ledger-sidebar,
+.desk-shell .plot-rail {
+  display: none;
+}
+.chapter-sidebar {
+  position: relative;
+  z-index: 3;
+  min-height: 0;
+}
+.sidebar-collapse-toggle {
+  min-width: 36px;
+  min-height: 36px;
+  border: 1px solid transparent;
+}
+.sidebar-collapse-toggle:hover {
+  border-color: var(--line);
+}
+.desk-shell.sidebar-collapsed {
+  grid-template-columns: 66px minmax(0, 1fr);
+}
+.sidebar-collapsed .chapter-sidebar .sidebar-top {
+  justify-content: center;
+  padding-inline: 8px;
+}
+.sidebar-collapsed .chapter-sidebar .back-to-library {
+  width: 36px;
+  justify-content: center;
+  padding: 0;
+  font-size: 0;
+}
+.sidebar-collapsed .chapter-sidebar .back-to-library svg {
+  margin: 0;
+}
+.sidebar-collapsed .sidebar-collapse-toggle {
+  order: 2;
+}
+.sidebar-collapsed .chapter-sidebar .project-mini-head,
+.sidebar-collapsed .chapter-sidebar .chapter-tree-label,
+.sidebar-collapsed .chapter-sidebar .sidebar-bottom {
+  display: none;
+}
+.sidebar-collapsed .chapter-actions {
+  flex-direction: column;
+  gap: 6px;
+  padding: 13px 10px;
+}
+.sidebar-collapsed .chapter-actions .button {
+  width: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  font-size: 0;
+}
+.sidebar-collapsed .chapter-actions .button svg {
+  margin: 0;
+}
+.sidebar-collapsed .chapter-actions .quiet-icon {
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  margin: 0;
+}
+.sidebar-collapsed .chapter-tree {
+  padding-inline: 7px;
+}
+.sidebar-collapsed .volume-heading {
+  justify-content: center;
+  padding-inline: 0;
+  font-size: 0;
+}
+.sidebar-collapsed .volume-heading svg {
+  display: none;
+}
+.sidebar-collapsed .volume-heading small {
+  margin: 0;
+  font-size: 9px;
+}
+.sidebar-collapsed .chapter-item {
+  min-height: 44px;
+  justify-content: center;
+  gap: 3px;
+  padding-inline: 3px;
+}
+.sidebar-collapsed .chapter-item:hover {
+  padding-left: 3px;
+}
+.sidebar-collapsed .chapter-number {
+  width: auto;
+  font-size: 11px;
+}
+.sidebar-collapsed .chapter-item-copy {
+  display: none;
+}
+.sidebar-collapsed .chapter-status {
+  width: 13px;
+  margin-left: 0;
+}
+.editor-column {
+  min-height: calc(100vh - 64px);
+}
+.editor-header {
+  min-height: 74px;
+  padding-inline: clamp(16px, 3vw, 32px);
+}
+.editor-header .editor-actions .save-indicator,
+.editor-header .editor-actions .button-secondary,
+.editor-header .editor-actions .chapter-skip-memory {
+  display: none;
+}
+.editor-header .editor-actions {
+  gap: 7px;
+}
+.editor-header .editor-actions .button-primary {
+  min-height: 36px;
+}
+
+/* Advanced connection controls and the visual capability save state. */
+.connection-section {
+  padding-top: 17px;
+}
+.connection-section-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 5px;
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 14px;
+}
+.connection-section-title span {
+  color: var(--muted);
+  font-family: var(--sans);
+  font-size: 9px;
+  font-weight: 400;
+}
+.connection-section .form-grid {
+  padding-top: 8px;
+}
+.advanced-parameters {
+  margin-top: 4px;
+  border-top: 1px solid var(--line);
+}
+.advanced-toggle {
+  width: 100%;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 10px;
+  text-align: left;
+}
+.advanced-toggle > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink);
+  font-weight: 600;
+}
+.advanced-toggle > span svg {
+  transition: transform .18s ease;
+}
+.advanced-toggle[aria-expanded="true"] > span svg {
+  transform: rotate(180deg);
+}
+.advanced-toggle small {
+  color: var(--muted);
+  font-size: 9px;
+}
+.advanced-toggle:hover > span {
+  color: var(--teal);
+}
+.advanced-parameters-grid {
+  padding: 8px 0 3px;
+}
+.capability-badge {
+  padding: 4px 6px;
+  color: var(--muted);
+  background: rgba(74, 84, 78, .08);
+  font-size: 9px;
+  white-space: nowrap;
+}
+.capability-saved {
+  color: var(--sage);
+  background: rgba(95, 118, 95, .1);
+}
+.capability-saving {
+  color: var(--teal);
+  background: rgba(79, 117, 107, .1);
+}
+.capability-error {
+  color: var(--red);
+  background: rgba(169, 70, 59, .1);
+}
+.capability-toggle {
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 13px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  background: rgba(252, 251, 246, .46);
+}
+.capability-toggle input {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  accent-color: var(--teal);
+}
+.capability-toggle > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.capability-toggle strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+.capability-toggle small {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.55;
+}
+.capability-save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  font-size: 9px;
+}
+.capability-save-saved {
+  color: var(--sage);
+}
+.capability-save-saving {
+  color: var(--teal);
+}
+.capability-save-error {
+  color: var(--red);
+}
+
+.empty-desk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+@media (max-width: 1024px) {
+  .topbar-workspace .brand-lockup {
+    min-width: 150px;
+  }
+  .workspace-context strong {
+    max-width: 160px;
+  }
+  .desk-shell:not(.sidebar-collapsed) {
+    grid-template-columns: 198px minmax(0, 1fr);
+  }
+  .desk-shell.sidebar-collapsed {
+    grid-template-columns: 66px minmax(0, 1fr);
+  }
+  .editor-header {
+    padding-inline: 18px;
+  }
+  .editor-title-row h1 {
+    font-size: 23px;
+  }
+  .paper-wrap,
+  .empty-chapter {
+    margin-inline: 18px;
+  }
+}
+
+@media (max-width: 880px) {
+  .topbar-workspace .brand-lockup {
+    min-width: 0;
+  }
+  .topbar-workspace .brand-caption,
+  .topbar-workspace .brand-divider {
+    display: none;
+  }
+  .topbar-mobile-nav {
+    display: inline-grid;
+  }
+  .desk-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .desk-shell:not(.sidebar-collapsed) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .chapter-sidebar {
+    width: min(292px, 86vw);
+  }
+  .sidebar-collapse-toggle {
+    display: none;
+  }
+  .editor-column {
+    min-height: calc(100vh - 58px);
+  }
+  .desk-shell .ledger-sidebar {
+    display: none;
+  }
+  .desk-shell .ledger-sidebar.mobile-open {
+    display: flex;
+  }
+  .attention-popover {
+    right: 76px;
+  }
+}
+
+@media (max-width: 620px) {
+  .topbar-workspace {
+    min-height: 56px;
+    padding-inline: 8px;
+    gap: 5px;
+  }
+  .topbar-workspace .brand-lockup {
+    width: 34px;
+    flex: 0 0 34px;
+    gap: 0;
+    justify-content: center;
+  }
+  .topbar-workspace .brand-mark {
+    width: 30px;
+    height: 30px;
+  }
+  .workspace-context {
+    display: none;
+  }
+  .topbar-workspace .top-actions {
+    width: 100%;
+    justify-content: flex-end;
+    gap: 4px;
+  }
+  .topbar-save-state {
+    min-width: 35px;
+    min-height: 44px;
+    margin-right: 0;
+    padding: 0 3px;
+    font-size: 0;
+  }
+  .topbar-attention,
+  .topbar-more,
+  .topbar-complete {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+  }
+  .topbar-attention span {
+    font-size: 0;
+  }
+  .topbar-attention {
+    gap: 3px;
+  }
+  .topbar-attention b {
+    min-width: 17px;
+    height: 17px;
+    font-size: 8px;
+  }
+  .topbar-complete {
+    font-size: 0;
+  }
+  .topbar-more {
+    font-size: 0;
+  }
+  .topbar-more svg {
+    width: 17px;
+    height: 17px;
+  }
+  .topbar-mobile-nav {
+    display: none;
+  }
+  .topbar-workspace .account-menu {
+    top: calc(100% + 5px);
+    right: 2px;
+  }
+  .attention-popover {
+    top: calc(100% + 5px);
+    right: 3px;
+    width: min(340px, calc(100vw - 16px));
+  }
+  .editor-header {
+    min-height: 65px;
+    padding: 11px 13px 10px;
+  }
+  .editor-header .editor-actions .button-primary {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 9px;
+    font-size: 0;
+  }
+  .editor-header .editor-actions .button-primary svg {
+    margin: 0;
+  }
+  .empty-desk-actions {
+    width: 100%;
+    flex-direction: column;
+  }
+  .empty-desk-actions .button {
+    width: min(300px, 100%);
+    min-height: 48px;
+  }
+  .connection-section-title {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .advanced-parameters-grid {
+    grid-template-columns: 1fr;
+  }
+  .advanced-parameters-grid .field-wide {
+    grid-column: auto;
+  }
+  .capability-toggle {
+    min-height: 60px;
+  }
+}

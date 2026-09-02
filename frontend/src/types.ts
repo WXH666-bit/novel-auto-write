@@ -305,7 +305,12 @@ export interface ProjectMemory {
 
 export type MemoryRunEvent =
   | { type: "progress"; run: MemoryRun }
-  | { type: "artifact"; sequence: number; stage?: string; content_hash?: string };
+  | {
+      type: "artifact";
+      sequence: number;
+      stage?: string;
+      content_hash?: string;
+    };
 
 export type AgentTarget =
   | { type: "project"; id: string; chapter_id?: string | null }
@@ -316,7 +321,10 @@ export type AgentTarget =
 
 export type AgentRunStatus =
   | "idle"
+  | "queued"
+  | "running"
   | "streaming"
+  | "reconnecting"
   | "applying"
   | "applied"
   | "error"
@@ -351,7 +359,11 @@ export interface AgentContextSnapshot {
   [key: string]: unknown;
 }
 
-export type AssistantProposalStatus = "proposed" | "applying" | "applied" | "rejected";
+export type AssistantProposalStatus =
+  | "proposed"
+  | "applying"
+  | "applied"
+  | "rejected";
 
 export interface AssistantProposal {
   id: string;
@@ -393,17 +405,96 @@ export interface AssistantConversation {
   purpose?: string;
   version?: number;
   provider_profile_id?: string | null;
+  provider_name?: string;
+  provider_capabilities?: Record<string, boolean>;
   updated_at?: string;
 }
 
+export interface AssistantRun {
+  id: string;
+  project_id: string;
+  conversation_id: string;
+  message_id?: string | null;
+  status: string;
+  stage?: string;
+  provider_profile_id?: string | null;
+  error?: string | null;
+  attempt?: number;
+  created_at?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+interface AssistantEventMeta {
+  sequence: number;
+  run_id?: string;
+  attempt?: number;
+  target?: AgentTarget;
+  base_version?: number | null;
+  cursor?: string;
+  retryable?: boolean;
+}
+
 export type AssistantEvent =
-  | { sequence: number; type: "message_delta"; message_id: string; delta: string }
-  | { sequence: number; type: "message_completed"; message_id: string; reply: string; proposal_count?: number }
-  | { sequence: number; type: "proposal_created"; proposal: AssistantProposal }
-  | { sequence: number; type: "proposal_patch"; proposal_id: string; patch: AgentPatch }
-  | { sequence: number; type: "proposal_completed"; proposal_id: string }
-  | { sequence: number; type: "status"; status: AgentRunStatus; message?: string }
-  | { sequence: number; type: "error"; message: string };
+  | (AssistantEventMeta & {
+      type: "message_delta";
+      message_id: string;
+      delta: string;
+    })
+  | (AssistantEventMeta & {
+      type: "message_replace";
+      message_id: string;
+      content: string;
+    })
+  | (AssistantEventMeta & {
+      type: "message_completed";
+      message_id: string;
+      reply: string;
+      proposal_count?: number;
+    })
+  | (AssistantEventMeta & {
+      type: "proposal_created";
+      proposal: AssistantProposal;
+    })
+  | (AssistantEventMeta & {
+      type: "proposal_patch";
+      proposal_id: string;
+      patch: AgentPatch;
+    })
+  | (AssistantEventMeta & { type: "proposal_completed"; proposal_id: string })
+  | (AssistantEventMeta & {
+      type: "status";
+      status: AgentRunStatus;
+      stage?: string;
+      message?: string;
+    })
+  | (AssistantEventMeta & { type: "error"; message: string });
+
+export type AttentionKind = "review" | "recheck" | "proposal" | "retry";
+
+export interface ProjectAttentionItem {
+  id: string;
+  kind: AttentionKind;
+  status: string;
+  title: string;
+  detail?: string;
+  chapter_id?: string | null;
+  conversation_id?: string | null;
+  run_id?: string | null;
+  task_type?: "generation" | "memory" | "assistant" | "review" | string;
+  job_id?: string | null;
+  target_type?: string | null;
+  created_at?: string;
+}
+
+export interface ProjectAttention {
+  total: number;
+  reviews: number;
+  rechecks: number;
+  proposals: number;
+  retries: number;
+  items: ProjectAttentionItem[];
+}
 
 export interface AuditIssue {
   id: string;

@@ -74,6 +74,7 @@ import {
   editReviewDraft,
   getCanon,
   getChapters,
+  getProjectAttention,
   getProviders,
   getCurrentUser,
   getAccountPreferences,
@@ -99,6 +100,7 @@ import {
   onAuthEvent,
   rebuildProjectMemory,
   reviewAction,
+  retryAssistantRun,
   retryGeneration,
   retryMemoryRun,
   testProvider,
@@ -132,6 +134,8 @@ import type {
   PlotThread,
   Project,
   ProviderProfile,
+  ProjectAttention,
+  ProjectAttentionItem,
   ReviewBundle,
   SourceRef,
   TimelineEvent,
@@ -331,6 +335,11 @@ function Workspace({
   const [ledgerTab, setLedgerTab] = useState<LedgerTab>("canon");
   const [mobileSidebar, setMobileSidebar] = useState(false);
   const [mobileLedger, setMobileLedger] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() =>
+    typeof window !== "undefined" && window.innerWidth <= 1024 && window.innerWidth > 880,
+  );
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  const [attentionBusyId, setAttentionBusyId] = useState("");
   const [showNewProject, setShowNewProject] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [showGeneration, setShowGeneration] = useState(false);
@@ -430,6 +439,9 @@ function Workspace({
       setShowGeneration(false);
       setShowReview(false);
       setShowCommand(false);
+      setAttentionOpen(false);
+      setAttentionBusyId("");
+      setSidebarCollapsed(false);
       setStudioMode("characters");
       setStudioAutoOpenAgent(false);
       setAccountMenuOpen(false);
@@ -486,6 +498,13 @@ function Workspace({
     queryFn: () => getStoryMap(activeProjectId),
     enabled: Boolean(activeProjectId),
   });
+  const attentionQuery = useQuery({
+    queryKey: ["project-attention", activeProjectId],
+    queryFn: () => getProjectAttention(activeProjectId),
+    enabled: Boolean(activeProjectId),
+    staleTime: 8_000,
+    refetchInterval: 15_000,
+  });
   const storyMap = storyMapQuery.data ?? {
     threads: [],
     timeline: [],
@@ -508,6 +527,9 @@ function Workspace({
     (review
       ? chapters.find((chapter) => chapter.id === review.chapter_id)
       : activeChapter) ?? null;
+  // The attention endpoint is authoritative. During its initial request keep
+  // the slot quiet instead of inferring work from stale local queries.
+  const attentionCount = attentionQuery.data?.total ?? 0;
 
   const saveGenerationSettings = useCallback(
     (projectId: string, payload: Partial<Project>) => {
@@ -929,9 +951,9 @@ function Workspace({
     setJob(null);
     setReview(null);
     setMemoryRun(null);
-    setStudioMode("characters");
+    setStudioMode("manuscript");
     setStudioAutoOpenAgent(false);
-    setView("desk");
+    setView("studio");
   };
 
   const invalidateProjectMemory = async (projectId: string) => {
@@ -944,6 +966,7 @@ function Workspace({
       queryClient.invalidateQueries({ queryKey: ["story-graph", projectId] }),
       queryClient.invalidateQueries({ queryKey: ["project-memory", projectId] }),
       queryClient.invalidateQueries({ queryKey: ["memory-proposals", projectId] }),
+      queryClient.invalidateQueries({ queryKey: ["project-attention", projectId] }),
     ]);
   };
 
@@ -1037,7 +1060,7 @@ function Workspace({
         ...(previous?.preferences_version ? { expected_version: previous.preferences_version } : {}),
       });
       queryClient.setQueryData(["account-preferences"], saved);
-      setToast({ tone: "success", message: enabled ? "以后完成章节时会自动整理故事记忆。" : "已关闭自动整理；你仍可在设定工坊手动分析。" });
+      setToast({ tone: "success", message: enabled ? "以后完成章节时会自动整理故事记忆。" : "已关闭自动整理；需要时仍可手动分析。" });
     } catch (error) {
       queryClient.setQueryData(["account-preferences"], previous);
       setToast({ tone: "warning", message: error instanceof Error ? error.message : "设置保存失败，请稍后重试。" });
@@ -1057,7 +1080,9 @@ function Workspace({
         [...(current || []), chapter].sort((a, b) => a.number - b.number),
       );
       setActiveChapterId(chapter.id);
-      setView("desk");
+      setStudioMode("manuscript");
+      setStudioAutoOpenAgent(false);
+      setView("studio");
       setToast({ tone: "success", message: "新的空白稿纸已经放入左侧章节树。" });
     } catch (error) {
       setToast({ tone: "warning", message: error instanceof Error ? error.message : "新建稿纸失败。" });
@@ -1088,10 +1113,14 @@ function Workspace({
         setStudioAutoOpenAgent(true);
         setView("studio");
       } else if (mode === "import") {
-        setView("desk");
+        setStudioMode("manuscript");
+        setStudioAutoOpenAgent(false);
+        setView("studio");
         setShowImport(true);
       } else {
-        setView("desk");
+        setStudioMode("manuscript");
+        setStudioAutoOpenAgent(false);
+        setView("studio");
       }
       setNewProjectForm({
         title: "",
@@ -1102,7 +1131,7 @@ function Workspace({
       setNewProjectStartMode(accountPreferences.default_start_mode || "blank");
       setToast({
         tone: "success",
-        message: mode === "setup" ? "项目已创建。先在设定工坊把故事骨架说给 Agent。" : mode === "import" ? "项目已创建，请选择要导入的旧稿。" : "项目已创建，第一张空白稿纸已经准备好。",
+        message: mode === "setup" ? "项目已创建。打开人物页，在右侧把故事骨架说给 Agent。" : mode === "import" ? "项目已创建，请选择要导入的旧稿。" : "项目已创建，第一张空白稿纸已经准备好。",
       });
     },
     onError: (error) => {
@@ -1239,6 +1268,135 @@ function Workspace({
       return;
     }
     setShowReview(true);
+  };
+
+  const revealAgentConversation = (
+    conversationId: string | null | undefined,
+    proposalId?: string | null,
+  ) => {
+    setStudioAutoOpenAgent(true);
+    setView("studio");
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (conversationId) {
+          window.dispatchEvent(
+            new CustomEvent("story-studio-open-conversation", {
+              detail: {
+                projectId: activeProjectId,
+                conversationId,
+              },
+            }),
+          );
+        } else if (proposalId) {
+          window.dispatchEvent(
+            new CustomEvent("story-studio-open-proposal", {
+              detail: {
+                projectId: activeProjectId,
+                proposalId,
+              },
+            }),
+          );
+        }
+        window.dispatchEvent(
+          new CustomEvent("story-studio-mobile-panel", { detail: "agent" }),
+        );
+      });
+    });
+  };
+
+  const openAttentionItem = async (item: ProjectAttentionItem) => {
+    if (!activeProject || attentionBusyId) return;
+    setAttentionBusyId(item.id);
+    try {
+      if (item.kind === "review" || item.kind === "recheck") {
+        const next = await getReview(item.id);
+        setReview(next);
+        setActiveChapterId(item.chapter_id || next.chapter_id);
+        setShowReview(true);
+        setAttentionOpen(false);
+        return;
+      }
+
+      if (item.kind === "proposal") {
+        const targetType = String(item.target_type || "").toLowerCase();
+        if (targetType.includes("chapter")) {
+          setStudioMode("manuscript");
+          if (item.chapter_id) setActiveChapterId(item.chapter_id);
+        } else if (
+          targetType.includes("graph") ||
+          targetType.includes("edge") ||
+          targetType.includes("relation") ||
+          targetType.includes("thread") ||
+          targetType.includes("event")
+        ) {
+          setStudioMode("story-map");
+        } else {
+          setStudioMode("characters");
+        }
+        setAttentionOpen(false);
+        revealAgentConversation(item.conversation_id, item.id);
+        return;
+      }
+
+      const runId = item.run_id || item.id;
+      const taskType =
+        item.task_type ||
+        (item.title.includes("助手")
+          ? "assistant"
+          : item.title.includes("记忆")
+            ? "memory"
+            : "generation");
+      if (taskType === "assistant") {
+        if (!item.conversation_id || !runId) {
+          throw new Error("这条 Agent 任务缺少可恢复的会话，请重新发起一次对话。");
+        }
+        await retryAssistantRun(
+          activeProject.id,
+          item.conversation_id,
+          runId,
+        );
+        setAttentionOpen(false);
+        revealAgentConversation(item.conversation_id);
+        setToast({ tone: "info", message: "Agent 已从上次中断处继续。" });
+      } else if (taskType === "memory") {
+        const next = await retryMemoryRun(runId);
+        setMemoryRun(next);
+        setAttentionOpen(false);
+        setToast({ tone: "info", message: "故事记忆已重新排队整理。" });
+      } else {
+        const next = await retryGeneration(runId);
+        setJob(next);
+        if (next.chapter_id) setActiveChapterId(next.chapter_id);
+        setStudioMode("manuscript");
+        setView("studio");
+        setAttentionOpen(false);
+        setToast({ tone: "info", message: "正文任务已从上次进度继续。" });
+      }
+      await queryClient.invalidateQueries({
+        queryKey: ["project-attention", activeProject.id],
+      });
+    } catch (error) {
+      setToast({
+        tone: "error",
+        message:
+          error instanceof Error ? error.message : "待处理事项暂时无法打开。",
+      });
+    } finally {
+      setAttentionBusyId("");
+    }
+  };
+
+  const openGeneration = () => {
+    if (!activeProject) return;
+    if (!providers.length) {
+      setView("settings");
+      setToast({
+        tone: "warning",
+        message: "尚未添加模型。请先配置你自己的 Provider。",
+      });
+      return;
+    }
+    setShowGeneration(true);
   };
 
   useEffect(() => {
@@ -1474,16 +1632,25 @@ function Workspace({
         : activeProject?.title || "未选择项目";
   const headerKicker =
     view === "library"
-      ? "藏书阁 / 私人卷宗"
+      ? "我的故事"
       : view === "settings"
-        ? "砚台 / 模型与生成"
-        : "案头 / 故事正典";
+        ? "模型与生成"
+        : view === "studio"
+          ? studioMode === "manuscript"
+            ? "写作"
+            : studioMode === "characters"
+              ? "人物"
+              : "图谱"
+          : "写作";
   const overlayOpen =
     showNewProject ||
     showImport ||
     showGeneration ||
     showReview ||
     showCommand;
+  const workspaceView = view === "desk" || view === "studio";
+  const showChapterActions =
+    view === "desk" || (view === "studio" && studioMode === "manuscript");
 
   useEffect(() => {
     const stage = workspaceStageRef.current;
@@ -1509,7 +1676,7 @@ function Workspace({
           lastWorkspaceFocusRef.current = event.target as HTMLElement;
         }}
       >
-      <header className="topbar">
+      <header className={`topbar ${workspaceView ? "topbar-workspace" : ""}`}>
         <button
           className="brand-lockup"
           onClick={() => setView("library")}
@@ -1523,37 +1690,107 @@ function Workspace({
           <span className="brand-divider" />
           <span className="brand-caption">长篇叙事案头</span>
         </button>
-        <div className="breadcrumb">
-          <span>{headerKicker}</span>
-          <ChevronRight size={13} />
-          <strong>{headerTitle}</strong>
-        </div>
+        {workspaceView ? (
+          <div className="workspace-context" aria-label="当前写作位置">
+            <span>{headerKicker}</span>
+            <ChevronRight size={13} />
+            <strong>{activeProject?.title || headerTitle}</strong>
+            {activeChapter && <em>{activeChapter.title || `第 ${activeChapter.number} 章`}</em>}
+          </div>
+        ) : (
+          <div className="breadcrumb">
+            <span>{headerKicker}</span>
+            <ChevronRight size={13} />
+            <strong>{headerTitle}</strong>
+          </div>
+        )}
         <div className="top-actions">
-          {provider ? (
-            <span className="provider-badge">
-              <span className="status-dot green" /> {provider.name}
-            </span>
+          {workspaceView ? (
+            <>
+              {showChapterActions && (
+                <span className={`save-indicator save-${saveState} topbar-save-state`} aria-live="polite">
+                  {saveState === "saving" ? (
+                    <Loader2 size={14} className="spin" />
+                  ) : saveState === "dirty" || saveState === "error" ? (
+                    <CircleAlert size={14} />
+                  ) : (
+                    <CheckCircle2 size={14} />
+                  )}
+                  {saveState === "saving"
+                    ? "保存中"
+                    : saveState === "dirty"
+                      ? "未保存"
+                      : saveState === "error"
+                        ? "保存失败"
+                        : "已保存"}
+                </span>
+              )}
+              <button
+                className={`topbar-attention ${attentionCount ? "has-items" : ""}`}
+                onClick={() => setAttentionOpen((open) => !open)}
+                aria-haspopup="dialog"
+                aria-expanded={attentionOpen}
+              >
+                <CircleAlert size={14} />
+                <span>待处理</span>
+                {attentionCount > 0 && <b>{attentionCount}</b>}
+              </button>
+              {showChapterActions && (
+                <button
+                  className="button button-primary button-compact topbar-complete"
+                  onClick={() => void finishChapter(true)}
+                  disabled={!activeChapter || completionBusy || saveState === "saving"}
+                >
+                  {completionBusy ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />}
+                  完成本章
+                </button>
+              )}
+              <button
+                className="topbar-more"
+                onClick={() => setAccountMenuOpen((open) => !open)}
+                aria-label="更多操作"
+                aria-haspopup="menu"
+                aria-expanded={accountMenuOpen}
+              >
+                更多 <ChevronDown size={14} />
+              </button>
+              <button
+                className="icon-button only-mobile topbar-mobile-nav"
+                onClick={() => setMobileSidebar(true)}
+                aria-label="打开章节树"
+              >
+                <Menu size={17} />
+              </button>
+            </>
           ) : (
-            <span className="provider-badge provider-badge-empty">
-              <span className="status-dot" /> 尚未添加模型
-            </span>
+            <>
+              {provider ? (
+                <span className="provider-badge">
+                  <span className="status-dot green" /> {provider.name}
+                </span>
+              ) : (
+                <span className="provider-badge provider-badge-empty">
+                  <span className="status-dot" /> 尚未添加模型
+                </span>
+              )}
+              <button
+                className="icon-button only-mobile"
+                onClick={() => setMobileSidebar(true)}
+                aria-label="打开章节树"
+              >
+                <Menu size={17} />
+              </button>
+              <button
+                className="icon-button"
+                onClick={() => setShowCommand(true)}
+                aria-label="打开命令栏"
+              >
+                <Command size={17} />
+              </button>
+            </>
           )}
           <button
-            className="icon-button only-mobile"
-            onClick={() => setMobileSidebar(true)}
-            aria-label="打开章节树"
-          >
-            <Menu size={17} />
-          </button>
-          <button
-            className="icon-button"
-            onClick={() => setShowCommand(true)}
-            aria-label="打开命令栏"
-          >
-            <Command size={17} />
-          </button>
-          <button
-            className="avatar"
+            className={`avatar ${workspaceView ? "workspace-avatar" : ""}`}
             onClick={() => setAccountMenuOpen((open) => !open)}
             aria-label="打开账号菜单"
             aria-haspopup="menu"
@@ -1564,14 +1801,61 @@ function Workspace({
           {accountMenuOpen && (
             <div className="account-menu" role="menu">
               <div className="account-menu-head"><span className="account-menu-avatar">{(session.user.display_name || session.user.username || session.user.email || "章").slice(0, 1).toUpperCase()}</span><div><strong>{session.user.display_name || "未设置称呼"}</strong><small>{session.user.username ? `用户名：${session.user.username}` : session.user.email || "账号身份不可用"}</small></div></div>
+              {workspaceView && (
+                <>
+                  <div className="account-menu-section-label">当前项目</div>
+                  {activeProject && (
+                    <button role="menuitem" onClick={() => { setAccountMenuOpen(false); void createBlankChapter(); }}>
+                      <Plus size={14} /> 新建稿纸
+                    </button>
+                  )}
+                  {activeProject && providers.length > 0 && (
+                    <button role="menuitem" onClick={() => { setAccountMenuOpen(false); openGeneration(); }}>
+                      <WandSparkles size={14} /> 生成下一章
+                    </button>
+                  )}
+                  {activeProject && (
+                    <button role="menuitem" onClick={() => { setAccountMenuOpen(false); setShowImport(true); }}>
+                      <Upload size={14} /> 导入旧稿
+                    </button>
+                  )}
+                  {activeProject && !["running", "queued"].includes(memoryRun?.status || "") && (
+                    <button role="menuitem" onClick={() => { setAccountMenuOpen(false); void (memoryRun?.status === "failed" || memoryRun?.status === "needs_retry" ? retryMemory() : analyzeMemory()); }}>
+                      <RefreshCw size={14} /> {memoryRun?.status === "failed" || memoryRun?.status === "needs_retry" ? "重试记忆整理" : "立即整理记忆"}
+                    </button>
+                  )}
+                  {activeProject && (
+                    <button role="menuitem" onClick={() => { setAccountMenuOpen(false); setView("settings"); }}>
+                      <Settings size={14} /> 模型设置
+                    </button>
+                  )}
+                  <button role="menuitem" onClick={() => { setAccountMenuOpen(false); setView("library"); }}>
+                    <BookOpen size={14} /> 返回项目库
+                  </button>
+                  <div className="account-menu-rule" />
+                </>
+              )}
               <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onAccount(); }}><UserRound size={14} /> 账号与安全</button>
-              <button role="menuitem" onClick={() => { setAccountMenuOpen(false); setView("settings"); }}><Settings size={14} /> 模型与生成</button>
+              {!workspaceView && <button role="menuitem" onClick={() => { setAccountMenuOpen(false); setView("settings"); }}><Settings size={14} /> 模型与生成</button>}
               <div className="account-menu-rule" />
               <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onLogout(); }}><LogOut size={14} /> 退出当前设备</button>
               <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onLogoutAll(); }}><ShieldCheck size={14} /> 退出全部会话</button>
             </div>
           )}
         </div>
+        {workspaceView && attentionOpen && (
+          <AttentionPopover
+            count={attentionCount}
+            attention={attentionQuery.data}
+            onClose={() => setAttentionOpen(false)}
+            onItem={(item) => void openAttentionItem(item)}
+            busyId={attentionBusyId}
+            onReview={() => {
+              setAttentionOpen(false);
+              openReview();
+            }}
+          />
+        )}
       </header>
 
       {job && (
@@ -1661,12 +1945,25 @@ function Workspace({
               return result;
             }}
             onExport={exportProject}
-            onBack={() => setView(activeProject ? "desk" : "library")}
+            onBack={() => {
+              if (activeProject) {
+                setStudioMode("manuscript");
+                setStudioAutoOpenAgent(false);
+                setView("studio");
+              } else {
+                setView("library");
+              }
+            }}
           />
         )}
         {view === "studio" && activeProject && (
           <>
-          <MobileWorkshopTabs initialPanel={studioAutoOpenAgent ? "agent" : studioMode === "story-map" ? "graph" : "dossier"} />
+          <MobileWorkshopTabs
+            key={`${activeProject.id}-${studioMode}-${studioAutoOpenAgent ? "agent" : "content"}`}
+            initialPanel={studioAutoOpenAgent ? "agent" : "content"}
+            attentionCount={attentionCount}
+            onAttention={() => setAttentionOpen(true)}
+          />
           <StoryStudio
             project={activeProject}
             storyMap={storyMap}
@@ -1678,7 +1975,12 @@ function Workspace({
             projectMemory={projectMemory}
             initialMode={studioMode}
             autoOpenAgent={studioAutoOpenAgent}
-            onBack={() => setView("desk")}
+            onContentChange={handleContentChange}
+            onCreateChapter={() => void createBlankChapter()}
+            onImport={() => setShowImport(true)}
+            onGenerate={openGeneration}
+            onModeChange={setStudioMode}
+            onBack={() => setView("library")}
              onChapter={(chapter) => setActiveChapterId(chapter.id)}
              onAnalyzeMemory={() => void analyzeMemory()}
              onRetryMemory={() => void retryMemory()}
@@ -1702,20 +2004,10 @@ function Workspace({
             }}
             onContentChange={handleContentChange}
             onTab={setLedgerTab}
-            onGenerate={() => {
-              if (!providers.length) {
-                setView("settings");
-                setToast({
-                  tone: "warning",
-                  message: "尚未添加模型。请先配置你自己的 Provider。",
-                });
-                return;
-              }
-              setShowGeneration(true);
-            }}
+            onGenerate={openGeneration}
             onCreateChapter={() => void createBlankChapter()}
             onStudio={() => {
-              setStudioMode("characters");
+              setStudioMode("manuscript");
               setStudioAutoOpenAgent(false);
               setView("studio");
             }}
@@ -1735,6 +2027,8 @@ function Workspace({
             onSettings={() => setView("settings")}
             onRebuild={rebuildMemory}
             onMobileLedger={() => setMobileLedger(true)}
+            sidebarCollapsed={sidebarCollapsed}
+            onToggleSidebar={() => setSidebarCollapsed((collapsed) => !collapsed)}
             mobileSidebar={mobileSidebar}
             mobileLedger={mobileLedger}
             onCloseMobileSidebar={() => setMobileSidebar(false)}
@@ -1746,6 +2040,10 @@ function Workspace({
             onCreate={() => setShowNewProject(true)}
             onImport={() => {
               setNewProjectStartMode("import");
+              setShowNewProject(true);
+            }}
+            onSetup={() => {
+              setNewProjectStartMode("setup");
               setShowNewProject(true);
             }}
           />
@@ -1890,7 +2188,7 @@ export default function App() {
     return renderAuthScreen(deepLinkView);
   }
   if (authQuery.isLoading && !authCleared) {
-    return <div className="auth-loading"><div className="auth-loading-mark"><BookOpen size={19} /></div><span>正在打开你的故事正典…</span></div>;
+    return <div className="auth-loading"><div className="auth-loading-mark"><BookOpen size={19} /></div><span>正在打开你的故事…</span></div>;
   }
   if (!session?.user?.id) {
     return renderAuthScreen(authView);
@@ -1920,21 +2218,21 @@ function LibraryView({
     <div className="library-page">
       <section className="library-intro">
         <div>
-          <p className="eyebrow">私人藏书阁 / 故事正典</p>
+          <p className="eyebrow">你的故事</p>
           <h1>
             把下一章写在
             <br />
             <em>已经发生过的事上。</em>
           </h1>
           <p className="intro-copy">
-            章回将正文、人物状态、剧情线和矛盾账本放在同一个可追溯的工作面上。拒绝的草稿不会悄悄改写故事。
+            在一个地方管理正文、人物和剧情。只有你确认的内容，才会用于后续写作。
           </p>
         </div>
         <div className="intro-side-note">
           <span className="note-line" />
-          <span>当前工作原则</span>
-          <strong>未审核，不入典</strong>
-          <small>每次接受都会留下版本、来源和理由。</small>
+          <span>内容安全</span>
+          <strong>建议先确认，再使用</strong>
+          <small>接受过的改动都会留下版本和来源。</small>
         </div>
       </section>
 
@@ -1980,7 +2278,7 @@ function LibraryView({
         <div>
           <strong>本地优先，版本可回滚</strong>
           <span>
-            项目和 API Key 分开保存；导出备份包含正典与修订，不包含密钥。
+            项目和模型密钥分开保存；导出的备份不会包含密钥。
           </span>
         </div>
         <button className="text-button" onClick={onSettings}>
@@ -2032,7 +2330,7 @@ function ProjectCard({
         <span>
           <span className="mini-dot" /> {shortTime(project.updated_at)}
         </span>
-        <span>正典 v{project.canon_version || 0}</span>
+        <span>资料版本 {project.canon_version || 0}</span>
         <button
           className="card-arrow"
           onClick={onOpen}
@@ -2053,9 +2351,11 @@ function ProjectCard({
 function EmptyDesk({
   onCreate,
   onImport,
+  onSetup,
 }: {
   onCreate: () => void;
   onImport: () => void;
+  onSetup: () => void;
 }) {
   return (
     <div className="empty-desk">
@@ -2067,12 +2367,15 @@ function EmptyDesk({
       <p>
         新建项目，或把现有的 TXT / Markdown 旧稿带进来。导入内容会先停在审核区。
       </p>
-      <div>
+      <div className="empty-desk-actions">
         <button className="button button-primary" onClick={onCreate}>
           <Plus size={15} /> 新建小说
         </button>
         <button className="button button-secondary" onClick={onImport}>
           <Upload size={15} /> 导入旧稿
+        </button>
+        <button className="button button-secondary" onClick={onSetup}>
+          <Sparkles size={15} /> 先搭故事骨架
         </button>
       </div>
     </div>
@@ -2108,6 +2411,8 @@ interface WritingDeskProps {
   onSettings: () => void;
   onRebuild: () => void;
   onMobileLedger: () => void;
+  sidebarCollapsed: boolean;
+  onToggleSidebar: () => void;
   mobileSidebar: boolean;
   mobileLedger: boolean;
   onCloseMobileSidebar: () => void;
@@ -2139,6 +2444,8 @@ function WritingDesk({
   onSettings,
   onRebuild,
   onMobileLedger,
+  sidebarCollapsed,
+  onToggleSidebar,
   mobileSidebar,
   mobileLedger,
   onCloseMobileSidebar,
@@ -2146,13 +2453,22 @@ function WritingDesk({
   providerGuide,
 }: WritingDeskProps) {
   return (
-    <div className="desk-shell">
+    <div className={`desk-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside
         className={`chapter-sidebar ${mobileSidebar ? "mobile-open" : ""}`}
       >
         <div className="sidebar-top">
           <button className="back-to-library" onClick={onLibrary}>
             <ChevronLeft size={15} /> 项目库
+          </button>
+          <button
+            className="quiet-icon sidebar-collapse-toggle"
+            onClick={onToggleSidebar}
+            aria-label={sidebarCollapsed ? "展开章节导航" : "收起章节导航"}
+            aria-expanded={!sidebarCollapsed}
+            title={sidebarCollapsed ? "展开章节导航" : "收起章节导航"}
+          >
+            {sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
           </button>
           <button
             className="quiet-icon only-mobile"
@@ -2353,6 +2669,7 @@ function ChapterTree({
               key={chapter.id}
               className={`chapter-item ${chapter.id === activeId ? "is-selected" : ""}`}
               onClick={() => onChapter(chapter)}
+              title={chapter.title || "未命名章节"}
             >
               <span className="chapter-number">
                 {String(chapter.number).padStart(2, "0")}
@@ -2715,6 +3032,16 @@ function LedgerSidebar({
   };
   onReview: () => void;
 }) {
+  const canonCount = canon.length;
+  const confirmedCount = canon.filter((item) =>
+    ["confirmed", "superseded"].includes(item.status),
+  ).length;
+  const pendingCount = canon.filter((item) =>
+    ["pending", "needs_review"].includes(item.status),
+  ).length;
+  const health = canonCount
+    ? Math.min(100, Math.max(0, Math.round((confirmedCount / canonCount) * 100)))
+    : 0;
   const tabItems: Array<{
     key: LedgerTab;
     label: string;
@@ -2752,10 +3079,16 @@ function LedgerSidebar({
       <div className="ledger-summary">
         <div className="ledger-summary-top">
           <span>正典健康度</span>
-          <strong>有 1 项待复核</strong>
+          <strong>
+            {canonCount === 0
+              ? "尚未建立"
+              : pendingCount
+                ? `${pendingCount} 项待处理`
+                : `${health}% 已确认`}
+          </strong>
         </div>
         <div className="health-track">
-          <span style={{ width: "82%" }} />
+          <span style={{ width: `${health}%` }} />
         </div>
         <div className="ledger-summary-bottom">
           <span>
@@ -3053,34 +3386,96 @@ function SourceChip({
   );
 }
 
+function canonicalProviderCapabilities(
+  provider?: Pick<ProviderProfile, "capabilities"> | null,
+): Record<string, boolean> {
+  const source = provider?.capabilities;
+  const capabilities: Record<string, boolean> = {};
+  if (source) {
+    Object.entries(source).forEach(([key, value]) => {
+      if (
+        ["vision", "image_input", "supports_vision", "multimodal"].includes(
+          key,
+        )
+      ) {
+        return;
+      }
+      if (typeof value === "boolean") capabilities[key] = value;
+    });
+  }
+  const legacyVision = source
+    ? [source.image_input, source.supports_vision, source.multimodal].find(
+        (value) => typeof value === "boolean",
+      )
+    : undefined;
+  capabilities.vision =
+    typeof source?.vision === "boolean"
+      ? source.vision
+      : typeof legacyVision === "boolean"
+        ? legacyVision
+        : false;
+  return capabilities;
+}
+
+function providerDraft(provider: ProviderProfile): ProviderProfile {
+  return {
+    ...provider,
+    api_key: "",
+    capabilities: canonicalProviderCapabilities(provider),
+  };
+}
+
 function ProviderCapabilityCard({
   draft,
   onChange,
+  saveState = "idle",
+  disabled = false,
 }: {
   draft: ProviderProfile;
-  onChange: (capabilities: Record<string, boolean>) => void;
+  onChange: (enabled: boolean) => void;
+  saveState?: "idle" | "saving" | "saved" | "error";
+  disabled?: boolean;
 }) {
-  const vision = Boolean(draft.capabilities?.vision || draft.capabilities?.image_input || draft.capabilities?.multimodal);
+  const vision = Boolean(draft.capabilities?.vision);
+  const statusLabel =
+    saveState === "saving"
+      ? "保存中…"
+      : saveState === "saved"
+        ? "已保存"
+        : saveState === "error"
+          ? "保存失败"
+          : vision
+            ? "视觉已启用"
+            : "仅文本";
   return (
     <div className="settings-card provider-capabilities-card">
       <div className="settings-card-head">
         <div>
-          <h2>能力声明</h2>
-          <p>只有明确声明视觉输入的 Provider，才会在 Agent 对话中出现“让 Agent 看图”的单次授权。</p>
+          <h2>视觉输入</h2>
+          <p>只有声明支持视觉输入的连接，Agent 才会允许你逐次授权人物图片。</p>
         </div>
-        <span className="capability-badge">{vision ? "视觉已启用" : "仅文本"}</span>
+        <span className={`capability-badge capability-${saveState}`}>{statusLabel}</span>
       </div>
       <label className="capability-toggle">
         <input
           type="checkbox"
           checked={vision}
-          onChange={(event) => onChange({ ...(draft.capabilities || {}), vision: event.target.checked })}
+          disabled={disabled || saveState === "saving"}
+          onChange={(event) => onChange(event.target.checked)}
         />
         <span>
           <strong>支持视觉输入</strong>
-          <small>启用后，人物图片仍需用户在每次消息发送前单独勾选授权。</small>
+          <small>勾选后立即保存；发送人物图片时仍需单独授权。</small>
         </span>
       </label>
+      {saveState !== "idle" && (
+        <span className={`capability-save-state capability-save-${saveState}`} role="status" aria-live="polite">
+          {saveState === "saving" && <Loader2 size={12} className="spin" />}
+          {saveState === "saved" && <CheckCircle2 size={12} />}
+          {saveState === "error" && <CircleAlert size={12} />}
+          {statusLabel}
+        </span>
+      )}
     </div>
   );
 }
@@ -3119,7 +3514,10 @@ function SettingsView({
   const [isNew, setIsNew] = useState(false);
   const [busy, setBusy] = useState(false);
   const [testState, setTestState] = useState<"idle" | "testing" | "ok" | "error">("idle");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [capabilitySaveState, setCapabilitySaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [notice, setNotice] = useState("");
+  const draftSyncLockRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!isNew && selectedId && !providers.some((item) => item.id === selectedId)) {
@@ -3129,12 +3527,26 @@ function SettingsView({
 
   useEffect(() => {
     if (isNew) return;
+    if (draftSyncLockRef.current === selectedId) return;
     const selected = providers.find((item) => item.id === selectedId) || null;
-    setDraft(selected ? { ...selected, api_key: "" } : null);
+    setDraft(selected ? providerDraft(selected) : null);
+    setCapabilitySaveState("idle");
   }, [isNew, providers, selectedId]);
 
   const update = (key: keyof ProviderProfile, value: unknown) => {
-    setDraft((current) => (current ? { ...current, [key]: value } : current));
+    setDraft((current) => {
+      if (!current) return current;
+      if (key === "capabilities") {
+        const capabilities = value && typeof value === "object"
+          ? (value as Record<string, boolean>)
+          : {};
+        return {
+          ...current,
+          capabilities: canonicalProviderCapabilities({ capabilities }),
+        };
+      }
+      return { ...current, [key]: value };
+    });
   };
   const switchProtocol = (protocol: ProviderProfile["protocol"]) => {
     setDraft((current) => {
@@ -3159,6 +3571,8 @@ function SettingsView({
     setIsNew(true);
     setSelectedId("");
     setTestState("idle");
+    setAdvancedOpen(false);
+    setCapabilitySaveState("idle");
     setNotice("");
     setDraft({
       name: "",
@@ -3170,6 +3584,7 @@ function SettingsView({
       timeout_ms: 60000,
       max_output_tokens: 4096,
       api_key: "",
+      capabilities: { vision: false },
     });
   };
   const save = async () => {
@@ -3181,12 +3596,14 @@ function SettingsView({
     setBusy(true);
     setNotice("");
     try {
-      const saved = isNew ? await onCreate(draft) : await onUpdate(draft.id || "", draft);
+      const payload = { ...draft, capabilities: canonicalProviderCapabilities(draft) };
+      const saved = isNew ? await onCreate(payload) : await onUpdate(draft.id || "", payload);
       setIsNew(false);
       setSelectedId(saved.id || "");
-      setDraft({ ...saved, api_key: "" });
+      setDraft(providerDraft(saved));
+      setCapabilitySaveState("idle");
       onChangeDefault(saved.id === defaultProviderId ? saved : providers.find((item) => item.id === defaultProviderId) || null);
-      setNotice("Provider 已保存。是否设为默认项由你决定。" );
+      setNotice("连接已保存。是否设为账户默认项由你决定。" );
       onRefresh();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Provider 保存失败。" );
@@ -3216,7 +3633,7 @@ function SettingsView({
       const remaining = providers.filter((item) => item.id !== draft.id);
       const next = remaining[0];
       setSelectedId(next?.id || "");
-      setDraft(next ? { ...next, api_key: "" } : null);
+      setDraft(next ? providerDraft(next) : null);
       setNotice("Provider 已删除。" );
       onChangeDefault(
         removingDefault
@@ -3256,6 +3673,50 @@ function SettingsView({
     }
   };
 
+  const saveCapability = async (enabled: boolean) => {
+    if (!draft) return;
+    const previous = draft;
+    const capabilities = canonicalProviderCapabilities({
+      capabilities: { ...(draft.capabilities || {}), vision: enabled },
+    });
+    const next = {
+      ...draft,
+      capabilities,
+    };
+    setDraft(next);
+    setNotice("");
+    if (isNew || !draft.id) {
+      setCapabilitySaveState("idle");
+      setNotice("视觉设置会随新连接一起保存。" );
+      return;
+    }
+    draftSyncLockRef.current = draft.id;
+    setCapabilitySaveState("saving");
+    try {
+      const saved = await onUpdate(draft.id, { capabilities });
+      if (selectedId === draft.id) {
+        setDraft(
+          providerDraft({
+            ...saved,
+            capabilities: {
+              ...capabilities,
+              ...(saved.capabilities || {}),
+              vision: enabled,
+            },
+          }),
+        );
+      }
+      setCapabilitySaveState("saved");
+      setNotice("视觉输入设置已保存。" );
+    } catch (error) {
+      if (selectedId === draft.id) setDraft(previous);
+      setCapabilitySaveState("error");
+      setNotice(error instanceof Error ? error.message : "视觉输入设置保存失败，请重试。" );
+    } finally {
+      draftSyncLockRef.current = null;
+    }
+  };
+
   const roles = [
     ["planner", "剧情规划"],
     ["drafter", "正文写作"],
@@ -3268,18 +3729,18 @@ function SettingsView({
   ] as const;
   return (
     <div className="settings-page">
-      <div className="settings-top"><button className="back-to-library" onClick={onBack}><ChevronLeft size={15} /> 返回工作台</button><span className="settings-version">章回 0.2 · PRIVATE MODEL DESK</span></div>
+      <div className="settings-top"><button className="back-to-library" onClick={onBack}><ChevronLeft size={15} /> 返回工作台</button><span className="settings-version">模型连接与生成设置</span></div>
       <div className="settings-layout">
         <section className="settings-content">
-           <div className="settings-heading"><div><p className="eyebrow">PRIVATE PROVIDERS / BYOK</p><h1>模型与生成</h1><p>Provider 只属于当前账号。密钥通过系统凭据库隔离保存，永远不会写入小说、任务快照或项目导出。</p><p className="settings-default-guide"><strong>账户默认 Provider</strong> 决定未特别指定时使用哪套连接；每个 Provider 的“内置默认模型”和八角色映射属于它自己的配置，两者互不替代。</p><p className="settings-default-guide"><strong>调用提示</strong> 摘要与 Agent 会消耗独立的模型额度；若要让人物卡片携带图片，请选择声明支持视觉输入的 Provider，发送前仍需逐次授权。</p></div><span className="settings-provider-status"><span className="status-dot green" /> {defaultProviderId ? "账户默认已设置" : "尚未设置账户默认"}</span></div>
+           <div className="settings-heading"><div><p className="eyebrow">连接模型</p><h1>模型与生成</h1><p>每个连接只属于当前账号。密钥会放在系统凭据库里，不会写入小说、任务快照或项目导出。</p><p className="settings-default-guide"><strong>账户默认</strong> 用于未特别指定的生成任务；生成时仍可以临时切换连接。</p></div><span className="settings-provider-status"><span className="status-dot green" /> {defaultProviderId ? "账户默认已设置" : "尚未设置账户默认"}</span></div>
           <div className="provider-settings-grid">
-             <div className="settings-card provider-list-card"><div className="settings-card-head"><div><h2>我的 Provider</h2><p>{providers.length ? `${providers.length} 个私有配置` : "尚未添加模型"}</p></div><button className="button button-secondary button-small" onClick={beginNew}><PlusCircle size={14} /> 新增</button></div>{providers.length ? <div className="provider-list">{providers.map((item) => { const isAccountDefault = defaultProviderId ? item.id === defaultProviderId : Boolean(item.is_default); const vision = Boolean(item.capabilities?.vision || item.capabilities?.image_input || item.capabilities?.multimodal); return <div className="provider-list-row" key={item.id}><button className={`provider-list-item ${item.id === selectedId && !isNew ? "is-selected" : ""}`} onClick={() => { setIsNew(false); setSelectedId(item.id || ""); }}><span className="provider-list-icon"><ServerCog size={15} /></span><span><strong>{item.name}</strong><small>{item.protocol === "anthropic_messages" ? "Anthropic Messages" : item.protocol === "responses" ? "Responses API" : "Chat Completions"} · {vision ? "视觉输入可用" : "仅文本"}</small></span>{isAccountDefault && <em>账户默认</em>}<ChevronRight size={14} /></button>{item.id && <button className={`provider-default-action ${isAccountDefault ? "is-default" : ""}`} onClick={() => void setAccountDefault(item.id || "")} disabled={busy || isAccountDefault}>{isAccountDefault ? <><CheckCircle2 size={13} /> 当前账户默认</> : <><CheckCircle2 size={13} /> 设为账户默认</>}</button>}</div>; })}</div> : <div className="provider-empty"><div className="provider-empty-seal"><ServerCog size={20} /></div><strong>尚未添加模型</strong><p>先添加一个你自己的 Provider，章回不会自动创建内置配置或共享密钥。</p><button className="button button-primary" onClick={beginNew}><Plus size={14} /> 添加第一个 Provider</button></div>}</div>
-            {draft ? <div className="settings-card provider-editor-card"><div className="settings-card-head"><div><p className="eyebrow">{isNew ? "NEW PROFILE" : "EDIT PROFILE"}</p><h2>{isNew ? "新增 Provider" : draft.name || "编辑 Provider"}</h2><p>Provider 内默认模型只属于这套连接；账户默认 Provider 需单独点击“设为账户默认”。生成抽屉可以临时切换。</p></div>{!isNew && draft.id === defaultProviderId && <span className="connection-state"><span className="status-dot green" /> 账户默认使用中</span>}</div><div className="form-grid"><label className="field"><span>显示名称</span><input value={draft.name} onChange={(event) => update("name", event.target.value)} placeholder="例如：我的 Claude" /></label><label className="field"><span>协议模式</span><select value={draft.protocol || "chat_completions"} onChange={(event) => switchProtocol(event.target.value as ProviderProfile["protocol"])}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></label><label className="field field-wide"><span>Base URL</span><input value={draft.base_url} onChange={(event) => update("base_url", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1"} /></label>{draft.protocol === "anthropic_messages" && <label className="field"><span>Anthropic API 版本</span><input value={draft.api_version || "2023-06-01"} onChange={(event) => update("api_version", event.target.value)} placeholder="2023-06-01" /></label>}<label className="field"><span>Provider 默认模型 <small>此连接的内部回退</small></span><input value={draft.default_model || ""} onChange={(event) => update("default_model", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "claude-sonnet-4-5" : "local-storyteller"} /></label><PresetNumberField key={`${isNew ? "new" : draft.id || selectedId}-context-length`} label="上下文长度" value={draft.context_length ?? 32768} options={CONTEXT_LENGTH_PRESETS} min={1024} onChange={(value) => update("context_length", value)} /><PresetNumberField key={`${isNew ? "new" : draft.id || selectedId}-max-output`} label="最大输出 tokens" value={draft.max_output_tokens ?? 4096} options={MAX_OUTPUT_TOKENS_PRESETS} min={256} onChange={(value) => update("max_output_tokens", value)} /><label className="field"><span>请求超时（毫秒）</span><input type="number" min="1000" value={draft.timeout_ms || 60000} onChange={(event) => update("timeout_ms", Number(event.target.value))} /></label><label className="field field-wide"><span>API Key <small>{draft.api_key_set ? "系统凭据库中已有密钥；留空即保留" : "只在需要时填写"}</small></span><input type="password" autoComplete="new-password" value={draft.api_key || ""} onChange={(event) => update("api_key", event.target.value)} placeholder={draft.api_key_set ? "••••••••（已安全保存）" : "粘贴你的 API Key"} /></label>{draft.protocol === "anthropic_messages" && <label className="field field-wide"><span>Anthropic Workspace ID <small>可选</small></span><input value={draft.anthropic_workspace_id || ""} onChange={(event) => update("anthropic_workspace_id", event.target.value)} placeholder="workspace_…" /></label>}</div><div className="form-actions"><button className="button button-secondary" onClick={test} disabled={busy || testState === "testing"}><RefreshCw size={14} className={testState === "testing" ? "spin" : ""} /> {testState === "testing" ? "测试中…" : "测试连接"}</button><button className="button button-primary" onClick={save} disabled={busy}><Save size={14} /> {busy ? "保存中…" : "保存配置"}</button>{!isNew && draft.id && <button className="button button-quiet-danger" onClick={remove} disabled={busy}><Trash2 size={14} /> 删除</button>}</div>{notice && <p className={`settings-notice ${testState === "error" ? "is-error" : ""}`} role="status">{notice}</p>}{!isNew && <div className="provider-editor-footer"><button className="text-button" onClick={() => void setAccountDefault(draft.id || "")} disabled={busy || draft.id === defaultProviderId}><CheckCircle2 size={14} /> {draft.id === defaultProviderId ? "当前账户默认 Provider" : "设为账户默认"}</button>{draft.api_key_set && <button className="text-button text-danger" onClick={clearKey} disabled={busy}><Trash2 size={14} /> 删除已保存密钥</button>}</div>}</div> : <div className="settings-card provider-editor-empty"><p className="eyebrow">SELECT A PROFILE</p><h2>选择一个 Provider 开始</h2><p>左侧列表会显示本账号的模型配置。没有默认 Provider 时，生成按钮会明确引导你完成设置。</p><button className="button button-secondary" onClick={beginNew}><Plus size={14} /> 新增 Provider</button></div>}
+             <div className="settings-card provider-list-card"><div className="settings-card-head"><div><h2>我的连接</h2><p>{providers.length ? `${providers.length} 个私有配置` : "尚未添加连接"}</p></div><button className="button button-secondary button-small" onClick={beginNew}><PlusCircle size={14} /> 新增</button></div>{providers.length ? <div className="provider-list">{providers.map((item) => { const isAccountDefault = defaultProviderId ? item.id === defaultProviderId : Boolean(item.is_default); const vision = Boolean(item.capabilities?.vision); return <div className="provider-list-row" key={item.id}><button className={`provider-list-item ${item.id === selectedId && !isNew ? "is-selected" : ""}`} onClick={() => { setIsNew(false); setSelectedId(item.id || ""); setNotice(""); setCapabilitySaveState("idle"); }}><span className="provider-list-icon"><ServerCog size={15} /></span><span><strong>{item.name}</strong><small>{item.protocol === "anthropic_messages" ? "Anthropic" : item.protocol === "responses" ? "Responses" : "Chat Completions"} · {vision ? "支持视觉" : "仅文本"}</small></span>{isAccountDefault && <em>账户默认</em>}<ChevronRight size={14} /></button>{item.id && <button className={`provider-default-action ${isAccountDefault ? "is-default" : ""}`} onClick={() => void setAccountDefault(item.id || "")} disabled={busy || isAccountDefault}>{isAccountDefault ? <><CheckCircle2 size={13} /> 当前账户默认</> : <><CheckCircle2 size={13} /> 设为账户默认</>}</button>}</div>; })}</div> : <div className="provider-empty"><div className="provider-empty-seal"><ServerCog size={20} /></div><strong>尚未添加连接</strong><p>先添加你自己的连接，章回不会自动创建内置配置或共享密钥。</p><button className="button button-primary" onClick={beginNew}><Plus size={14} /> 添加第一个连接</button></div>}</div>
+            {draft ? <div className="settings-card provider-editor-card"><div className="settings-card-head"><div><p className="eyebrow">{isNew ? "新增连接" : "编辑连接"}</p><h2>{isNew ? "新增连接" : draft.name || "编辑连接"}</h2><p>填写连接地址、默认模型和密钥；高级参数可以按需展开。</p></div>{!isNew && draft.id === defaultProviderId && <span className="connection-state"><span className="status-dot green" /> 账户默认使用中</span>}</div><div className="connection-section"><div className="connection-section-title"><strong>连接模型</strong><span>生成、摘要和 Agent 共用此连接</span></div><div className="form-grid"><label className="field"><span>显示名称</span><input value={draft.name} onChange={(event) => update("name", event.target.value)} placeholder="例如：我的 Claude" /></label><label className="field"><span>协议</span><select value={draft.protocol || "chat_completions"} onChange={(event) => switchProtocol(event.target.value as ProviderProfile["protocol"])}><option value="chat_completions">OpenAI Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></label><label className="field field-wide"><span>Base URL</span><input value={draft.base_url} onChange={(event) => update("base_url", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1"} /></label><label className="field"><span>默认模型</span><input value={draft.default_model || ""} onChange={(event) => update("default_model", event.target.value)} placeholder={draft.protocol === "anthropic_messages" ? "claude-sonnet-4-5" : "local-storyteller"} /></label><label className="field field-wide"><span>API Key <small>{draft.api_key_set ? "已有密钥；留空即保留" : "只在需要时填写"}</small></span><input type="password" autoComplete="new-password" value={draft.api_key || ""} onChange={(event) => update("api_key", event.target.value)} placeholder={draft.api_key_set ? "••••••••（已安全保存）" : "粘贴你的 API Key"} /></label></div></div><div className="advanced-parameters"><button type="button" className="advanced-toggle" onClick={() => setAdvancedOpen((open) => !open)} aria-expanded={advancedOpen}><span><ChevronDown size={14} /> 高级参数</span><small>{advancedOpen ? "收起" : "按需展开"}</small></button>{advancedOpen && <div className="form-grid advanced-parameters-grid"><PresetNumberField key={`${isNew ? "new" : draft.id || selectedId}-context-length`} label="上下文长度" value={draft.context_length ?? 32768} options={CONTEXT_LENGTH_PRESETS} min={1024} onChange={(value) => update("context_length", value)} /><PresetNumberField key={`${isNew ? "new" : draft.id || selectedId}-max-output`} label="最大输出 tokens" value={draft.max_output_tokens ?? 4096} options={MAX_OUTPUT_TOKENS_PRESETS} min={256} onChange={(value) => update("max_output_tokens", value)} /><label className="field"><span>请求超时（毫秒）</span><input type="number" min="1000" value={draft.timeout_ms || 60000} onChange={(event) => update("timeout_ms", Number(event.target.value))} /></label>{draft.protocol === "anthropic_messages" && <label className="field"><span>Anthropic API 版本</span><input value={draft.api_version || "2023-06-01"} onChange={(event) => update("api_version", event.target.value)} placeholder="2023-06-01" /></label>}{draft.protocol === "anthropic_messages" && <label className="field field-wide"><span>Anthropic Workspace ID <small>可选</small></span><input value={draft.anthropic_workspace_id || ""} onChange={(event) => update("anthropic_workspace_id", event.target.value)} placeholder="workspace_…" /></label>}</div>}</div><div className="form-actions"><button className="button button-secondary" onClick={test} disabled={busy || testState === "testing"}><RefreshCw size={14} className={testState === "testing" ? "spin" : ""} /> {testState === "testing" ? "测试中…" : "测试连接"}</button><button className="button button-primary" onClick={save} disabled={busy}><Save size={14} /> {busy ? "保存中…" : "保存连接"}</button>{!isNew && draft.id && <button className="button button-quiet-danger" onClick={remove} disabled={busy}><Trash2 size={14} /> 删除</button>}</div>{notice && <p className={`settings-notice ${testState === "error" || capabilitySaveState === "error" ? "is-error" : ""}`} role="status">{notice}</p>}{!isNew && <div className="provider-editor-footer"><button className="text-button" onClick={() => void setAccountDefault(draft.id || "")} disabled={busy || draft.id === defaultProviderId}><CheckCircle2 size={14} /> {draft.id === defaultProviderId ? "当前账户默认连接" : "设为账户默认"}</button>{draft.api_key_set && <button className="text-button text-danger" onClick={clearKey} disabled={busy}><Trash2 size={14} /> 删除已保存密钥</button>}</div>}</div> : <div className="settings-card provider-editor-empty"><p className="eyebrow">选择连接</p><h2>选择一个连接开始</h2><p>左侧列表显示本账号的连接配置。没有默认连接时，生成按钮会引导你完成设置。</p><button className="button button-secondary" onClick={beginNew}><Plus size={14} /> 新增连接</button></div>}
           </div>
-          {draft && <div className="settings-card"><div className="settings-card-head"><div><h2>Provider 内角色模型映射</h2><p>八个角色可以共用本 Provider 的默认模型，也可以分别指定；它们不改变账户默认 Provider。</p></div><span className="role-count">8 个角色</span></div><div className="role-grid">{roles.map(([key, label]) => <label className="role-field" key={key}><span>{label}</span><input value={draft.model_roles?.[key] || ""} placeholder={draft.default_model || "沿用 Provider 内默认模型"} onChange={(event) => setDraft({ ...draft, model_roles: { ...(draft.model_roles || {}), [key]: event.target.value } })} /><small>{key}</small></label>)}</div></div>}
-          {draft && <ProviderCapabilityCard draft={draft} onChange={(capabilities) => update("capabilities", capabilities)} />}
-          <div className="settings-card memory-preference-card"><div className="backup-icon"><Sparkles size={18} /></div><div><h2>故事记忆自动整理</h2><p>完成或导入章节后，自动生成章节摘要、人物关系和剧情线。关闭后仍可在设定工坊手动分析。</p></div><label className="toggle-control"><input type="checkbox" checked={autoSummaryEnabled} onChange={(event) => onChangeAutoSummary(event.target.checked)} /><span className="toggle-track" aria-hidden="true"><span /></span><strong>{autoSummaryEnabled ? "已开启" : "已关闭"}</strong></label></div>
-          <div className="settings-card backup-card"><div className="backup-icon"><FileArchive size={18} /></div><div><h2>完整备份</h2><p>导出正文、正典、修订、原始导入文件和 schema 版本。密钥永远不会包含在内。</p></div><button className="button button-secondary" onClick={onExport}><Download size={14} /> 导出项目 ZIP</button></div>
+          {draft && <details className="settings-card advanced-role-card"><summary className="advanced-role-summary"><div><h2>角色模型映射</h2><p>按工作指定模型；留空时沿用连接的默认模型。</p></div><ChevronDown size={16} /></summary><div className="role-grid">{roles.map(([key, label]) => <label className="role-field" key={key}><span>{label}</span><input value={draft.model_roles?.[key] || ""} placeholder={draft.default_model || "沿用默认模型"} onChange={(event) => setDraft({ ...draft, model_roles: { ...(draft.model_roles || {}), [key]: event.target.value } })} /></label>)}</div></details>}
+          {draft && <ProviderCapabilityCard draft={draft} onChange={(enabled) => void saveCapability(enabled)} saveState={capabilitySaveState} disabled={busy} />}
+          <div className="settings-card memory-preference-card"><div className="backup-icon"><Sparkles size={18} /></div><div><h2>故事记忆自动整理</h2><p>完成或导入章节后，自动生成章节摘要、人物关系和剧情线。关闭后仍可按需手动分析。</p></div><label className="toggle-control"><input type="checkbox" checked={autoSummaryEnabled} onChange={(event) => onChangeAutoSummary(event.target.checked)} /><span className="toggle-track" aria-hidden="true"><span /></span><strong>{autoSummaryEnabled ? "已开启" : "已关闭"}</strong></label></div>
+          <div className="settings-card backup-card"><div className="backup-icon"><FileArchive size={18} /></div><div><h2>完整备份</h2><p>导出正文、故事资料、修改历史和原始导入文件；密钥永远不会包含在内。</p></div><button className="button button-secondary" onClick={onExport}><Download size={14} /> 导出项目 ZIP</button></div>
         </section>
       </div>
     </div>
@@ -4447,6 +4908,85 @@ function CommandPalette({
           </span>
         </div>
       </div>
+    </div>
+  );
+}
+
+function AttentionPopover({
+  count,
+  attention,
+  onClose,
+  onItem,
+  busyId,
+  onReview,
+}: {
+  count: number;
+  attention?: ProjectAttention;
+  onClose: () => void;
+  onItem: (item: ProjectAttentionItem) => void;
+  busyId: string;
+  onReview: () => void;
+}) {
+  const items = attention?.items || [];
+  const reviewCount = attention
+    ? attention.reviews + attention.rechecks
+    : 0;
+  const firstReview = items.find(
+    (item) => item.kind === "review" || item.kind === "recheck",
+  );
+  return (
+    <div className="attention-popover" role="dialog" aria-label="待处理事项">
+      <div className="attention-popover-head">
+        <div>
+          <span className="eyebrow">当前工作</span>
+          <strong>{count ? `${count} 项待处理` : "暂时没有待处理事项"}</strong>
+        </div>
+        <button className="quiet-icon" onClick={onClose} aria-label="关闭待处理事项">
+          <X size={15} />
+        </button>
+      </div>
+      {items.length ? (
+        <div className="attention-list">
+          {items.slice(0, 5).map((item) => (
+            <button
+              className="attention-item"
+              key={`${item.kind}-${item.id}`}
+              onClick={() => onItem(item)}
+              disabled={Boolean(busyId)}
+            >
+              <span className={`attention-item-mark attention-${item.kind}`}>
+                {item.kind === "review" || item.kind === "recheck" ? <CircleAlert size={13} /> : <Clock3 size={13} />}
+              </span>
+              <span>
+                <strong>{item.title}</strong>
+                {item.detail && <small>{item.detail}</small>}
+              </span>
+              {busyId === item.id ? (
+                <Loader2 size={13} className="spin" />
+              ) : (
+                <ArrowRight size={13} />
+              )}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <p className="attention-empty">
+          {count
+            ? reviewCount > 0
+              ? "待处理数据正在同步，打开审核包查看当前详情。"
+              : "待处理数据正在同步，稍后可从对应工作区继续处理。"
+            : "可以继续写作；新的审核或 Agent 提案会出现在这里。"}
+        </p>
+      )}
+      {reviewCount > 0 && (
+        <button
+          className="attention-review-link"
+          onClick={() => (firstReview ? onItem(firstReview) : onReview())}
+          disabled={Boolean(busyId)}
+        >
+          查看审核包 <ArrowRight size={13} />
+        </button>
+      )}
     </div>
   );
 }

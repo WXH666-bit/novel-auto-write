@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import threading
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
@@ -10,15 +13,62 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, event, inspect, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
 from .config import DATABASE_URL
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
     """Base for all persisted application models."""
+
+
+def _env_int(*names: str, default: int, minimum: int = 1) -> int:
+    """Read a positive pool setting while keeping legacy env names working.
+
+    Deployments historically used both ``NOVEL_DB_*`` and
+    ``NOVEL_MYSQL_*`` prefixes in local manifests.  Supporting both here keeps
+    the engine configuration explicit without making a database URL carry
+    operational pool policy.  Invalid values fail at startup instead of being
+    silently coerced into an unsafe pool.
+    """
+
+    raw = next((os.getenv(name) for name in names if os.getenv(name) is not None), None)
+    if raw is None or not raw.strip():
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{names[0]} 必须是整数") from exc
+    if value < minimum:
+        raise ValueError(f"{names[0]} 必须大于等于 {minimum}")
+    return value
+
+
+def _sqlite_memory_url(url: str) -> bool:
+    """Return whether a SQLite URL points at process-local in-memory storage."""
+
+    # ``sqlite://`` and ``sqlite:///:memory:`` are both accepted by SQLAlchemy
+    # as memory databases.  Parse the URL rather than checking a suffix so URI
+    # forms such as ``file::memory:?mode=memory`` are classified correctly too.
+    try:
+        parsed = make_url(url)
+    except (TypeError, ValueError):
+        return False
+    if parsed.drivername.split("+", 1)[0].lower() != "sqlite":
+        return False
+    database = str(parsed.database or "").strip().lower()
+    query = {str(key).lower(): str(value).lower() for key, value in parsed.query.items()}
+    return (
+        not database
+        or database == ":memory:"
+        or database.startswith("file::memory:")
+        or query.get("mode") == "memory"
+    )
 
 
 def create_engine_for_url(url: str | None = None) -> Engine:
@@ -26,21 +76,81 @@ def create_engine_for_url(url: str | None = None) -> Engine:
     kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
     if url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}
-        if url.endswith(":memory:"):
+        if _sqlite_memory_url(url):
             kwargs["poolclass"] = StaticPool
+        else:
+            # A file-backed SQLite connection must not be held by a long-lived
+            # QueuePool checkout.  SSE polls, background jobs, and ordinary
+            # requests all get short-lived independent connections, while WAL
+            # and busy_timeout below provide the intended write coordination.
+            kwargs["poolclass"] = NullPool
     elif url.startswith("mysql"):
-        kwargs["pool_recycle"] = 1800
+        # Keep MySQL operational settings explicit and deployment-controlled.
+        # The defaults are conservative for a single app host, but every value
+        # can be overridden without changing application code or the URL.
+        kwargs.update(
+            {
+                "pool_size": _env_int(
+                    "NOVEL_DB_POOL_SIZE", "NOVEL_MYSQL_POOL_SIZE", default=10
+                ),
+                "max_overflow": _env_int(
+                    "NOVEL_DB_MAX_OVERFLOW",
+                    "NOVEL_MYSQL_MAX_OVERFLOW",
+                    default=20,
+                    minimum=0,
+                ),
+                "pool_timeout": _env_int(
+                    "NOVEL_DB_POOL_TIMEOUT", "NOVEL_MYSQL_POOL_TIMEOUT", default=30
+                ),
+                "pool_recycle": _env_int(
+                    "NOVEL_DB_POOL_RECYCLE", "NOVEL_MYSQL_POOL_RECYCLE", default=1800
+                ),
+            }
+        )
 
     db_engine = create_engine(url, **kwargs)
     if db_engine.dialect.name == "sqlite":
+        sqlite_wal_lock = threading.Lock()
+        sqlite_wal_configured = False
+        sqlite_file = not _sqlite_memory_url(url)
 
         @event.listens_for(db_engine, "connect")
         def _sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
+            nonlocal sqlite_wal_configured
             cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA busy_timeout=5000")
-            cursor.close()
+            try:
+                # Configure the low-cost connection-local pragmas first.  In
+                # particular, busy_timeout must be active before a competing
+                # connection can observe the file while WAL is negotiated.
+                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.execute("PRAGMA foreign_keys=ON")
+                try:
+                    if sqlite_file and not sqlite_wal_configured:
+                        # NullPool creates short-lived connections, so doing a
+                        # write-mode PRAGMA on every checkout can itself race
+                        # with another opener.  Probe/set WAL once per engine
+                        # and safely defer it when SQLite reports a transient
+                        # lock.  Failures in the two pragmas above are not
+                        # swallowed: a connection without those invariants is
+                        # not safe for application work.
+                        with sqlite_wal_lock:
+                            if not sqlite_wal_configured:
+                                cursor.execute("PRAGMA journal_mode")
+                                mode = cursor.fetchone()
+                                if not mode or str(mode[0]).lower() != "wal":
+                                    cursor.execute("PRAGMA journal_mode=WAL")
+                                sqlite_wal_configured = True
+                except Exception as exc:
+                    if sqlite_file:
+                        logger.warning(
+                            "SQLite WAL setup deferred",
+                            extra={
+                                "operation": "sqlite_wal_setup",
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+            finally:
+                cursor.close()
 
     if db_engine.dialect.name == "mysql":
 

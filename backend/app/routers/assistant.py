@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .. import db as db_module
@@ -25,6 +27,7 @@ from ..models import (
     MediaAsset,
     Project,
     Proposal,
+    ProviderProfile,
     User,
 )
 from ..schemas import (
@@ -42,14 +45,30 @@ from ..schemas import (
 )
 from ..security import get_current_user, user_id_of
 from ..services.assistant import (
+    add_event,
     apply_proposal,
     create_conversation,
     create_message_run,
     reject_proposal,
 )
+from ..services.providers import normalize_capabilities, parse_capability_bool
 from . import require_project
 
 router = APIRouter(prefix="/api", tags=["assistant"])
+logger = logging.getLogger(__name__)
+
+
+def _log_storage_failure(operation: str, exc: BaseException) -> None:
+    """Record a safe server-side diagnostic without SQL or credential data."""
+
+    logger.warning(
+        "assistant storage failure",
+        extra={
+            "operation": operation,
+            "error_type": type(exc).__name__,
+            "pool_timeout": type(exc).__name__ in {"TimeoutError", "QueuePoolTimeout"},
+        },
+    )
 
 
 def _conversation(db: Session, project: Project, conversation_id: str) -> AgentConversation:
@@ -97,8 +116,66 @@ def _message_payload(message: AgentMessage) -> AgentMessageRead:
     return AgentMessageRead.model_validate(message)
 
 
-def _conversation_payload(conversation: AgentConversation) -> AgentConversationRead:
-    return AgentConversationRead.model_validate(conversation)
+def _effective_provider(
+    db: Session,
+    conversation: AgentConversation,
+    user: User | None = None,
+) -> tuple[str | None, dict[str, bool]]:
+    """Resolve the provider actually available to this conversation's tenant.
+
+    Conversations normally persist the selected profile id.  Older rows may
+    have no id, so resolve the creator's current account default in that case.
+    Every lookup is owner-scoped; a profile id supplied by another tenant is
+    treated as unavailable rather than exposed through the response.
+    """
+
+    # Route authentication has already established the tenant.  Prefer that
+    # identity for profile ownership checks; the conversation creator is only
+    # a fallback for internal callers that do not have a request user.
+    owner_id = user_id_of(user) if user is not None else conversation.created_by_user_id
+    provider_id = conversation.provider_profile_id
+    if provider_id is None:
+        provider_id = (
+            user.default_provider_id
+            if user is not None
+            else db.scalar(select(User.default_provider_id).where(User.id == owner_id))
+        )
+    if not provider_id:
+        return None, {"vision": False}
+    profile = db.scalar(
+        select(ProviderProfile).where(
+            ProviderProfile.id == provider_id,
+            ProviderProfile.owner_id == owner_id,
+            ProviderProfile.enabled.is_(True),
+            ProviderProfile.deleted_at.is_(None),
+        )
+    )
+    if profile is None:
+        return None, {"vision": False}
+    normalized = normalize_capabilities(profile.capabilities, strict=False)
+    capabilities: dict[str, bool] = {}
+    for key, value in normalized.items():
+        try:
+            capabilities[str(key)] = parse_capability_bool(value, field=f"capabilities.{key}")
+        except ValueError:
+            # The provider contract permits non-flag metadata in this JSON;
+            # the assistant response advertises only effective boolean flags.
+            continue
+    capabilities.setdefault("vision", False)
+    return profile.name, capabilities
+
+
+def _conversation_payload(
+    conversation: AgentConversation,
+    db: Session | None = None,
+    user: User | None = None,
+) -> AgentConversationRead:
+    payload = AgentConversationRead.model_validate(conversation)
+    if db is not None:
+        provider_name, provider_capabilities = _effective_provider(db, conversation, user)
+        payload.provider_name = provider_name
+        payload.provider_capabilities = provider_capabilities
+    return payload
 
 
 def _verify_assets(
@@ -131,9 +208,21 @@ def create_assistant_conversation(
 ) -> AgentConversationRead:
     project = require_project(db, project_id, current_user)
     try:
-        return _conversation_payload(create_conversation(db, project, current_user, payload))
+        return _conversation_payload(
+            create_conversation(db, project, current_user, payload), db, current_user
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        _log_storage_failure("create_conversation", exc)
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "assistant_storage_unavailable",
+                "message": "助手暂时无法创建会话，请稍后重试",
+            },
+        ) from exc
 
 
 @router.get(
@@ -154,7 +243,7 @@ def list_assistant_conversations(
         )
         .order_by(AgentConversation.updated_at.desc())
     ).all()
-    return [_conversation_payload(row) for row in rows]
+    return [_conversation_payload(row, db, current_user) for row in rows]
 
 
 @router.get(
@@ -168,7 +257,7 @@ def get_assistant_conversation(
     db: Session = Depends(get_db),
 ) -> AgentConversationRead:
     project = require_project(db, project_id, current_user)
-    return _conversation_payload(_conversation(db, project, conversation_id))
+    return _conversation_payload(_conversation(db, project, conversation_id), db, current_user)
 
 
 @router.get(
@@ -236,12 +325,42 @@ def post_assistant_message(
             context_snapshot=payload.context_snapshot,
             authorized_asset_ids=payload.authorized_asset_ids,
         )
-    except (ValueError, IntegrityError) as exc:
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "assistant_message_conflict",
+                "message": "助手消息保存失败，请刷新后重试",
+            },
+        ) from exc
+    except SQLAlchemyError as exc:
+        _log_storage_failure("create_message", exc)
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "assistant_storage_unavailable",
+                "message": "助手暂时无法保存消息，请稍后重试",
+            },
+        ) from exc
+    except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        conversation_payload = _conversation_payload(conversation, db, current_user)
+    except SQLAlchemyError as exc:
+        _log_storage_failure("read_conversation_after_message", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "assistant_storage_unavailable",
+                "message": "助手暂时无法读取会话，请稍后重试",
+            },
+        ) from exc
     return {
         "created": created,
-        "conversation": _conversation_payload(conversation),
+        "conversation": conversation_payload,
         "message": _message_payload(message),
         "run": _run_payload(run),
     }
@@ -292,6 +411,16 @@ def retry_assistant_run(
     )
     if job is None:
         raise HTTPException(status_code=409, detail="助手运行缺少持久化任务")
+    next_attempt = int(job.attempts or 0) + 1
+    max_attempts = max(1, int(job.max_attempts or 3))
+    if next_attempt > max_attempts:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "assistant_retry_exhausted",
+                "message": "助手运行已达到最大重试次数",
+            },
+        )
     run.status = "queued"
     run.stage = "queued"
     run.error = None
@@ -301,6 +430,20 @@ def retry_assistant_run(
     job.last_error = None
     job.lease_owner = None
     job.lease_expires_at = None
+    run.input_snapshot = {**(run.input_snapshot or {}), "attempt": next_attempt}
+    add_event(
+        db,
+        conversation,
+        "run.stage",
+        {
+            "run_id": run.id,
+            "status": run.status,
+            "stage": run.stage,
+            "retry": True,
+            "attempt": next_attempt,
+        },
+        run_id=run.id,
+    )
     db.commit()
     db.refresh(run)
     return AgentRunRead.model_validate(run)
@@ -330,46 +473,376 @@ def list_assistant_events(
     return [AgentEventRead.model_validate(row) for row in _event_rows(db, conversation.id, after)]
 
 
-def _sse_events(session_factory: Any, conversation_id: str, after: int) -> Iterator[str]:
-    last = after
-    deadline = time.monotonic() + 60
-    event_type_map = {
-        "message.delta": "message_delta",
-        "message_delta": "message_delta",
-        "proposal.created": "proposal_created",
-        "proposal_created": "proposal_created",
-        "message.created": "status",
-        "message_created": "status",
-        "run.started": "status",
-        "run_started": "status",
-        "message.started": "status",
-        "message_started": "status",
-        "message.completed": "message_completed",
-        "message_completed": "message_completed",
-        "run.failed": "error",
-        "run_failed": "error",
+SSE_HEARTBEAT_SECONDS = 15.0
+SSE_POLL_SECONDS = 0.35
+SSE_MAX_SECONDS: float | None = None
+_SSE_END = object()
+
+
+def _wire_event_type(event_type: str) -> str:
+    """Map persisted legacy names to the dotted Agent wire protocol.
+
+    Early databases contain names such as ``message_delta``.  They remain
+    valid rows and are replayable; only the SSE representation is upgraded so
+    an existing client can reconnect across an application upgrade.
+    """
+
+    return {
+        "run.started": "run.started",
+        "run_started": "run.started",
+        "run.stage": "run.stage",
+        "run_stage": "run.stage",
+        "run.completed": "run.completed",
+        "run_completed": "run.completed",
+        "run.failed": "run.failed",
+        "run_failed": "run.failed",
+        "message.delta": "message.delta",
+        "message_delta": "message.delta",
+        "message.replace": "message.replace",
+        "message_replace": "message.replace",
+        "message.created": "message.created",
+        "message_created": "message.created",
+        "message.started": "message.started",
+        "message_started": "message.started",
+        "message.completed": "message.completed",
+        "message_completed": "message.completed",
+        "proposal.created": "proposal.created",
+        "proposal_created": "proposal.created",
+        "proposal.patch": "proposal.patch",
+        "proposal_patch": "proposal.patch",
+        "proposal.ready": "proposal.ready",
+        "proposal_ready": "proposal.ready",
+    }.get(event_type, event_type)
+
+
+def _safe_agent_error(value: Any) -> str:
+    """Keep database implementation details out of a user-visible SSE frame."""
+
+    text_value = str(value or "助手运行失败")
+    lowered = text_value.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "sqlalchemy",
+            "integrityerror",
+            "operationalerror",
+            "databaseerror",
+            "statementerror",
+            "(sqlite3.",
+            "pymysql",
+            "queuepool",
+            "pool timeout",
+            "pooltimeout",
+        )
+    ):
+        return "助手事件保存失败，请稍后重试。"
+    return text_value[:4000]
+
+
+def _redact_storage_details(value: Any) -> Any:
+    """Recursively redact SQLAlchemy/provider-driver diagnostics in failures."""
+
+    if isinstance(value, dict):
+        return {key: _redact_storage_details(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_storage_details(item) for item in value]
+    if isinstance(value, str):
+        lowered = value.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "sqlalchemy",
+                "integrityerror",
+                "operationalerror",
+                "databaseerror",
+                "statementerror",
+                "(sqlite3.",
+                "pymysql",
+                "queuepool",
+                "pool timeout",
+                "pooltimeout",
+            )
+        ):
+            return "助手事件保存失败，请稍后重试。"
+    return value
+
+
+def _sse_frame(row: AgentEvent) -> str:
+    """Encode one durable event without allowing payload keys to spoof metadata."""
+
+    event_type = _wire_event_type(str(row.event_type))
+    raw_payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+    payload_json = dict(raw_payload)
+    if event_type == "run.failed":
+        payload_json = _redact_storage_details(payload_json)
+        safe_error = _safe_agent_error(payload_json.get("message") or payload_json.get("error"))
+        payload_json["error"] = safe_error
+        payload_json["message"] = safe_error
+    nested_proposal = payload_json.get("proposal")
+    if not isinstance(nested_proposal, dict):
+        nested_proposal = {}
+    try:
+        attempt = max(1, int(payload_json.get("attempt", nested_proposal.get("attempt", 1))))
+    except (TypeError, ValueError):
+        attempt = 1
+    target = payload_json.get("target")
+    if not isinstance(target, dict):
+        target = nested_proposal.get("target")
+    if not isinstance(target, dict):
+        target = {}
+    base_version_value = payload_json.get("base_version", nested_proposal.get("base_version"))
+    if base_version_value is not None:
+        try:
+            base_version: int | None = int(base_version_value)
+        except (TypeError, ValueError):
+            base_version = None
+    else:
+        base_version = None
+    # The database sequence is the replay cursor.  It is independent from
+    # provider payload data so a model cannot spoof a reconnect position.
+    cursor = str(row.sequence)
+    payload: dict[str, Any] = {
+        "id": row.id,
+        "conversation_id": row.conversation_id,
+        "run_id": row.run_id,
+        "sequence": row.sequence,
+        "cursor": cursor,
+        "attempt": attempt,
+        "target": target,
+        "base_version": base_version,
+        "event_type": event_type,
+        "type": event_type,
+        "payload_json": payload_json,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
     }
-    while time.monotonic() < deadline:
-        with session_factory() as db:
-            rows = _event_rows(db, conversation_id, last)
-            for row in rows:
-                last = row.sequence
-                payload = {
-                    "id": row.id,
-                    "conversation_id": row.conversation_id,
-                    "run_id": row.run_id,
-                    "sequence": row.sequence,
-                    "type": event_type_map.get(row.event_type, row.event_type),
-                    "payload_json": row.payload_json,
-                    "created_at": row.created_at.isoformat() if row.created_at else None,
-                }
-                payload.update(row.payload_json or {})
-                if payload["type"] == "error" and "message" not in payload:
-                    payload["message"] = payload.get("error", "Agent 运行失败")
-                yield f"id: {row.sequence}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+    # Keep the historical flattened payload consumed by the original panel,
+    # but restore reserved protocol fields after flattening untrusted JSON.
+    payload.update(payload_json)
+    payload.update(
+        {
+            "id": row.id,
+            "conversation_id": row.conversation_id,
+            "run_id": row.run_id,
+            "sequence": row.sequence,
+            "cursor": cursor,
+            "attempt": attempt,
+            "target": target,
+            "base_version": base_version,
+            "event_type": event_type,
+            "type": event_type,
+            "payload_json": payload_json,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+    )
+    if event_type == "run.failed":
+        payload["message"] = payload_json["message"]
+        payload["error"] = payload_json["error"]
+    return f"id: {row.sequence}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+
+
+def _event_cursor(
+    db: Session,
+    conversation_id: str,
+    value: str | None,
+    fallback: int,
+) -> int:
+    """Accept sequence cursors and UUID cursors emitted by older assistants."""
+
+    if value is None:
+        return max(0, fallback)
+    candidate = value.strip()
+    try:
+        return max(0, int(candidate))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    if not candidate:
+        return max(0, fallback)
+    legacy_sequence = db.scalar(
+        select(AgentEvent.sequence).where(
+            AgentEvent.conversation_id == conversation_id,
+            AgentEvent.id == candidate,
+        )
+    )
+    return max(0, int(legacy_sequence or fallback))
+
+
+def _sse_events(
+    session_factory: Any,
+    conversation_id: str,
+    after: int,
+    *,
+    poll_seconds: float = SSE_POLL_SECONDS,
+    heartbeat_seconds: float = SSE_HEARTBEAT_SECONDS,
+    max_seconds: float | None = SSE_MAX_SECONDS,
+) -> Iterator[str]:
+    """Replay durable events with bounded polling and comment heartbeats.
+
+    A new SQLAlchemy session is opened for every poll and immediately closed.
+    The caller may wrap this iterator with an ASGI disconnect checker; keeping
+    the database loop synchronous also preserves the public helper used by
+    older tests and worker integrations.
+    """
+
+    last = max(0, int(after))
+    started = time.monotonic()
+    deadline = started + max_seconds if max_seconds is not None else None
+    last_emit = started
+    poll = max(0.01, float(poll_seconds))
+    heartbeat = float(heartbeat_seconds)
+    while deadline is None or time.monotonic() < deadline:
+        try:
+            with session_factory() as db:
+                rows = _event_rows(db, conversation_id, last)
+                frames: list[str] = []
+                for row in rows:
+                    last = row.sequence
+                    last_emit = time.monotonic()
+                    frames.append(_sse_frame(row))
+        except SQLAlchemyError as exc:
+            _log_storage_failure("stream_poll", exc)
+            # Headers are already committed once a StreamingResponse starts;
+            # terminate with a safe, id-less SSE error so clients can retry
+            # from their last durable cursor without seeing driver details.
+            error_payload = {
+                "code": "assistant_storage_unavailable",
+                "message": "助手事件暂时不可用，请稍后重试",
+                "cursor": str(last),
+                "attempt": 1,
+                "target": {},
+                "base_version": None,
+            }
+            yield f"event: error\ndata: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+            return
+        # Do not yield while the polling session is inside its context manager:
+        # a slow client must never keep a database connection checked out.
+        yield from frames
         if rows:
             continue
-        time.sleep(0.35)
+        now = time.monotonic()
+        if heartbeat > 0 and now - last_emit >= heartbeat:
+            # SSE comments are deliberately id-less: a heartbeat must never
+            # advance Last-Event-ID or cause a replay cursor to skip data.
+            yield ": heartbeat\n\n"
+            last_emit = now
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(poll, remaining))
+        else:
+            time.sleep(poll)
+
+
+async def _sse_events_async(
+    session_factory: Any,
+    conversation_id: str,
+    after: int,
+    *,
+    request: Request | None = None,
+    poll_seconds: float = SSE_POLL_SECONDS,
+    heartbeat_seconds: float = SSE_HEARTBEAT_SECONDS,
+    max_seconds: float | None = SSE_MAX_SECONDS,
+) -> AsyncIterator[str]:
+    """Production SSE loop using native async sleeps and short-lived sessions.
+
+    The synchronous ``_sse_events`` helper remains available for older tests
+    and integrations.  The HTTP endpoint uses this generator so cancellation
+    and disconnects do not race a worker-thread ``next()`` call.
+    """
+
+    last = max(0, int(after))
+    started = time.monotonic()
+    deadline = started + max_seconds if max_seconds is not None else None
+    last_emit = started
+    poll = max(0.01, float(poll_seconds))
+    heartbeat = float(heartbeat_seconds)
+    while deadline is None or time.monotonic() < deadline:
+        if request is not None and await request.is_disconnected():
+            return
+        try:
+            with session_factory() as db:
+                rows = _event_rows(db, conversation_id, last)
+                frames: list[str] = []
+                for row in rows:
+                    last = row.sequence
+                    last_emit = time.monotonic()
+                    frames.append(_sse_frame(row))
+        except SQLAlchemyError as exc:
+            _log_storage_failure("stream_poll", exc)
+            error_payload = {
+                "code": "assistant_storage_unavailable",
+                "message": "助手事件暂时不可用，请稍后重试",
+                "cursor": str(last),
+                "attempt": 1,
+                "target": {},
+                "base_version": None,
+            }
+            yield f"event: error\ndata: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+            return
+        # The session is closed before yielding, so a slow/cancelled client
+        # cannot pin a database connection for the lifetime of the stream.
+        for frame in frames:
+            if request is not None and await request.is_disconnected():
+                return
+            yield frame
+        if rows:
+            continue
+        now = time.monotonic()
+        if heartbeat > 0 and now - last_emit >= heartbeat:
+            if request is not None and await request.is_disconnected():
+                return
+            yield ": heartbeat\n\n"
+            last_emit = now
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(poll, remaining))
+        else:
+            await asyncio.sleep(poll)
+
+
+# Keep a stable identity so tests/integrations that monkeypatch the legacy
+# synchronous helper still receive their finite iterator without changing the
+# normal production path.
+_DEFAULT_SYNC_SSE_EVENTS = _sse_events
+
+
+def _next_sse_item(iterator: Iterator[str]) -> str | object:
+    try:
+        return next(iterator)
+    except StopIteration:
+        return _SSE_END
+
+
+async def _stream_until_disconnect(request: Request, iterator: Any):
+    """Consume a sync SSE iterator without retaining request-scoped resources."""
+
+    # ``_sse_events`` is intentionally kept as a sync helper for compatibility
+    # with integrations that call it directly.  ``to_thread`` keeps its SQLite
+    # polling sleep off the event loop, while ``is_disconnected`` is checked
+    # between polls and after every delivered frame.
+    try:
+        if hasattr(iterator, "__aiter__"):
+            async for item in iterator:
+                if await request.is_disconnected():
+                    return
+                yield item
+            return
+        sync_iterator = iter(iterator)
+        while True:
+            if await request.is_disconnected():
+                return
+            item = await asyncio.to_thread(_next_sse_item, sync_iterator)
+            if item is _SSE_END:
+                return
+            yield item
+            if await request.is_disconnected():
+                return
+    finally:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            close()
 
 
 @router.get(
@@ -379,26 +852,56 @@ def _sse_events(session_factory: Any, conversation_id: str, after: int) -> Itera
 def stream_assistant_events(
     project_id: str,
     conversation_id: str,
+    request: Request,
     after: int = Query(default=0, ge=0),
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
-    project = require_project(db, project_id, current_user)
-    _conversation(db, project, conversation_id)
-    # Browsers usually reconnect with Last-Event-ID while API clients may
-    # continue using the historical ?after= query parameter.  The header is
-    # authoritative when it is a valid sequence number.
-    effective_after = after
-    if last_event_id is not None:
-        try:
-            effective_after = max(0, int(last_event_id))
-        except ValueError:
-            effective_after = after
+    try:
+        project = require_project(db, project_id, current_user)
+        _conversation(db, project, conversation_id)
+        # Browsers usually reconnect with Last-Event-ID while API clients may
+        # continue using the historical ?after= query parameter.  The header
+        # is authoritative when it is a valid sequence number.
+        effective_after = _event_cursor(db, conversation_id, last_event_id, after)
+    except SQLAlchemyError as exc:
+        _log_storage_failure("stream_validation", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "assistant_storage_unavailable",
+                "message": "助手事件暂时不可用，请稍后重试",
+            },
+        ) from exc
+    finally:
+        # FastAPI finalises yield-dependencies only after a StreamingResponse
+        # finishes.  Close this validation session now so a client that leaves
+        # the stream open does not pin a request connection for its lifetime.
+        db.close()
+    if _sse_events is _DEFAULT_SYNC_SSE_EVENTS:
+        # Normal HTTP traffic uses the cancellable native-async loop.  The
+        # compatibility branch below is only for callers that replace the
+        # historic synchronous helper with a finite test/integration stream.
+        stream = _sse_events_async(
+            db_module.SessionLocal,
+            conversation_id,
+            effective_after,
+            request=request,
+        )
+    else:
+        stream = _stream_until_disconnect(
+            request,
+            _sse_events(db_module.SessionLocal, conversation_id, effective_after),
+        )
     return StreamingResponse(
-        _sse_events(db_module.SessionLocal, conversation_id, effective_after),
+        stream,
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -756,4 +1259,6 @@ def get_assistant_conversation_direct(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AgentConversationRead:
-    return _conversation_payload(_direct_conversation(db, conversation_id, current_user))
+    return _conversation_payload(
+        _direct_conversation(db, conversation_id, current_user), db, current_user
+    )

@@ -36,6 +36,13 @@ except Exception:  # pragma: no cover - platform-specific import
 PROMPT_VERSION = "workflow-v1"
 KEYRING_SERVICE = "novel-auto-write"
 SUPPORTED_PROTOCOLS = {"chat_completions", "responses", "anthropic_messages"}
+_VISION_ALIASES = ("image_input", "supports_vision", "multimodal")
+_TRUE_CAPABILITY_VALUES = frozenset(
+    {"1", "true", "yes", "y", "on", "t", "enabled", "enable", "是", "开启"}
+)
+_FALSE_CAPABILITY_VALUES = frozenset(
+    {"", "0", "false", "no", "n", "off", "f", "disabled", "disable", "否", "关闭"}
+)
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 T = TypeVar("T")
@@ -379,14 +386,94 @@ def _max_output_tokens(profile: Any) -> int:
         return 4096
 
 
+def parse_capability_bool(value: Any, *, field: str = "capabilities.vision") -> bool:
+    """Parse a capability flag without Python's unsafe truthiness coercion.
+
+    Provider capability JSON historically came from a few different clients,
+    some of which sent ``"false"`` or ``0`` as strings.  ``bool("false")``
+    would incorrectly advertise a capability, so only an explicit finite set
+    of boolean spellings is accepted here.
+    """
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, float) and value in (0.0, 1.0):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in _TRUE_CAPABILITY_VALUES:
+            return True
+        if normalized in _FALSE_CAPABILITY_VALUES:
+            return False
+    raise ValueError(
+        f"{field} 必须是布尔值或 0/1（可用 true/false、yes/no、on/off）"
+    )
+
+
+def normalize_capabilities(
+    value: Any,
+    *,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """Return one canonical capability object.
+
+    ``vision`` is the authoritative key.  The three keys used by older
+    clients are accepted as input and removed from the persisted/public form.
+    An explicit canonical value, including ``False``, always wins over legacy
+    aliases.  When no value is supplied, capabilities fail closed to
+    ``vision=False`` while unrelated capability fields are preserved.
+
+    ``strict=False`` is used only when reading legacy rows that predate this
+    contract; malformed flags then fail closed instead of making a provider
+    row unreadable.  API writes use the strict default and return a 422.
+    """
+
+    parsed = value
+    if parsed is None:
+        parsed = {}
+    elif isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except (TypeError, json.JSONDecodeError) as exc:
+            if strict:
+                raise ValueError("capabilities 必须是 JSON 对象") from exc
+            parsed = {}
+    if not isinstance(parsed, Mapping):
+        if strict:
+            raise ValueError("capabilities 必须是 JSON 对象")
+        parsed = {}
+
+    result = dict(parsed)
+    if "vision" in parsed:
+        try:
+            vision = parse_capability_bool(parsed["vision"])
+        except ValueError:
+            if strict:
+                raise
+            vision = False
+    else:
+        vision = False
+        for alias in _VISION_ALIASES:
+            if alias not in parsed:
+                continue
+            try:
+                vision = parse_capability_bool(parsed[alias], field=f"capabilities.{alias}")
+                break
+            except ValueError:
+                if strict:
+                    raise
+
+    for alias in _VISION_ALIASES:
+        result.pop(alias, None)
+    result["vision"] = vision
+    return result
+
+
 def _capabilities(profile: Any) -> dict[str, Any]:
     value = _profile_value(profile, "capabilities", {}) or {}
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            value = {}
-    return value if isinstance(value, dict) else {}
+    return normalize_capabilities(value, strict=False)
 
 
 def _json_schema_supported(profile: Any) -> bool:

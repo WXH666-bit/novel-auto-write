@@ -51,6 +51,16 @@ export const storyProjectFixture: JsonRecord = {
   source: "local",
 };
 
+export const emptyStoryProjectFixture: JsonRecord = {
+  ...storyProjectFixture,
+  id: "project-empty",
+  title: "空白灯塔",
+  current_chapter_id: null,
+  canon_version: 0,
+  memory_epoch: 0,
+  summary_status: "not_started",
+};
+
 function makeChapter(projectId: string, id: string, title = "第一章 · 灯塔亮起") {
   const content = "林渡在雾里看见灯塔亮起，决定查明这束不该出现的光。";
   return {
@@ -299,6 +309,17 @@ export async function mockStoryApi(
   const dataByProject = new Map<string, ProjectData>();
   initialProjects.forEach((project) => dataByProject.set(String(project.id), makeProjectData(project)));
   let projectSequence = 0;
+  let provider: JsonRecord = {
+    id: "provider-1",
+    name: "Mock Provider",
+    base_url: "http://mock",
+    protocol: "chat_completions",
+    context_length: 8192,
+    capabilities: { vision: true, image_input: true, tools: true },
+    enabled: true,
+    is_default: true,
+    api_key_set: true,
+  };
 
   const getData = (projectId: string) => {
     const existing = dataByProject.get(projectId);
@@ -345,13 +366,24 @@ export async function mockStoryApi(
       return;
     }
     if (path === "/providers" && method === "GET") {
-      await json(route, {
-        providers: [{ id: "provider-1", name: "Mock Provider", base_url: "http://mock", protocol: "chat_completions", context_length: 8192, capabilities: { vision: true, image_input: true }, enabled: true, is_default: true, api_key_set: true }],
-      });
+      await json(route, { providers: [clone(provider)] });
       return;
     }
     if (path === "/providers/default" && method === "GET") {
-      await json(route, { id: "provider-1", name: "Mock Provider", base_url: "http://mock", protocol: "chat_completions", capabilities: { vision: true }, enabled: true, api_key_set: true });
+      await json(route, clone(provider));
+      return;
+    }
+    if (parts[0] === "providers" && parts.length === 2 && method === "PATCH") {
+      const input = bodyRecord(body);
+      provider = {
+        ...provider,
+        ...input,
+        capabilities:
+          input.capabilities && typeof input.capabilities === "object"
+            ? clone(input.capabilities)
+            : provider.capabilities,
+      };
+      await json(route, clone(provider));
       return;
     }
     if (path === "/projects" && method === "GET") {

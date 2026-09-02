@@ -21,6 +21,7 @@ from ..services.providers import (
     ProviderError,
     delete_api_key,
     get_api_key,
+    normalize_capabilities,
     provider_for,
     set_api_key,
     validate_provider_url,
@@ -39,7 +40,7 @@ class ProviderPayload(BaseModel):
     model_role_mapping: dict[str, Any] = Field(default_factory=dict)
     context_length: int = Field(default=8192, ge=1)
     timeout_seconds: int = Field(default=120, ge=1, le=3600)
-    capabilities: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict, validate_default=True)
     enabled: bool = True
     # Empty string is accepted from edit forms to mean "keep the saved key".
     api_key: str | None = None
@@ -55,6 +56,11 @@ class ProviderPayload(BaseModel):
         if normalized not in SUPPORTED_PROTOCOLS:
             raise ValueError("protocol 必须是 chat_completions、responses 或 anthropic_messages")
         return normalized
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return normalize_capabilities(value)
 
 
 class ProviderPatch(BaseModel):
@@ -74,6 +80,13 @@ class ProviderPatch(BaseModel):
     default_model: str | None = None
     model_roles: dict[str, str] | None = None
     timeout_ms: int | None = Field(default=None, ge=1000, le=3_600_000)
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return normalize_capabilities(value)
 
 
 class APIKeyPayload(BaseModel):
@@ -143,7 +156,9 @@ def _public(profile: ProviderProfile) -> dict[str, Any]:
         "context_length": profile.context_length,
         "timeout_seconds": profile.timeout_seconds,
         "timeout_ms": profile.timeout_seconds * 1000,
-        "capabilities": profile.capabilities or {},
+        # Runtime normalization also keeps old rows readable before the
+        # canonicalizing migration has been applied to an existing database.
+        "capabilities": normalize_capabilities(profile.capabilities, strict=False),
         "enabled": profile.enabled,
         "has_api_key": key_set,
         "api_key_set": key_set,
@@ -206,10 +221,15 @@ def _apply_payload(profile: ProviderProfile, payload: ProviderPayload | Provider
         profile.timeout_seconds = max(1, int(timeout_ms / 1000))
     elif timeout_seconds is not None:
         profile.timeout_seconds = timeout_seconds
-    if getattr(payload, "capabilities", None) is not None:
-        profile.capabilities = payload.capabilities  # type: ignore[union-attr]
     if getattr(payload, "enabled", None) is not None:
         profile.enabled = payload.enabled  # type: ignore[union-attr]
+    # Always persist the canonical representation, including for a PATCH that
+    # only changes an unrelated field.  This cleans legacy aliases on the next
+    # successful write while preserving all unrelated capability keys.
+    incoming_capabilities = getattr(payload, "capabilities", None)
+    profile.capabilities = normalize_capabilities(profile.capabilities, strict=False)
+    if incoming_capabilities is not None:
+        profile.capabilities = normalize_capabilities(incoming_capabilities)
     validate_provider_url(profile.base_url)
 
 

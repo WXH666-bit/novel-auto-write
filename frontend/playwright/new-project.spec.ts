@@ -39,7 +39,12 @@ test.describe("新建小说向导", () => {
         await expect(page.getByRole("dialog", { name: "导入旧稿" })).toBeVisible();
       }
       if (scenario.mode === "setup") {
-        await expect(page.getByRole("heading", { name: "设定工坊" })).toBeVisible();
+        await expect(
+          page.getByRole("heading", { name: /林渡|选择一位人物|新增人物卷宗/ }),
+        ).toBeVisible();
+        await expect(
+          page.getByRole("heading", { name: "和 Agent 一起写" }),
+        ).toBeVisible();
       }
     });
   }

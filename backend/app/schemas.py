@@ -795,6 +795,12 @@ class AgentConversationRead(ORMModel):
     purpose: str
     apply_mode: str
     provider_profile_id: str | None = None
+    # Resolved at read time from the tenant-owned profile actually selected
+    # for this conversation.  Keeping these fields separate from the stored
+    # snapshot lets clients display the effective provider without trusting a
+    # caller-supplied fallback.
+    provider_name: str | None = None
+    provider_capabilities: dict[str, bool] = Field(default_factory=dict)
     status: str
     version: int
     created_at: datetime

@@ -11,14 +11,16 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool, StaticPool
 
 from backend.app import db as db_module
 from backend.app import models
@@ -122,6 +124,31 @@ def _confirmed_chapter(
     db.refresh(chapter)
     db.refresh(revision)
     return chapter, revision
+
+
+def test_sqlite_pool_modes_survive_concurrent_short_connections(tmp_path: Path) -> None:
+    """File SQLite uses short-lived pools without racing WAL initialization."""
+
+    file_engine = create_engine_for_url(f"sqlite:///{(tmp_path / 'short.sqlite3').as_posix()}")
+    memory_engine = create_engine_for_url("sqlite:///:memory:")
+    try:
+        assert isinstance(file_engine.pool, NullPool)
+        assert isinstance(memory_engine.pool, StaticPool)
+
+        def read_pragmas(_index: int) -> tuple[Any, Any, Any]:
+            with file_engine.connect() as connection:
+                return (
+                    connection.execute(text("PRAGMA journal_mode")).scalar(),
+                    connection.execute(text("PRAGMA busy_timeout")).scalar(),
+                    connection.execute(text("PRAGMA foreign_keys")).scalar(),
+                )
+
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            values = list(executor.map(read_pragmas, range(48)))
+        assert all(mode == "wal" and timeout == 5000 and foreign_keys == 1 for mode, timeout, foreign_keys in values)
+    finally:
+        memory_engine.dispose()
+        file_engine.dispose()
 
 
 def _wait_until(predicate: Any, timeout: float = 3.0) -> bool:
@@ -336,6 +363,40 @@ def test_durable_runner_recovers_orphaned_assistant_claim(store: tuple[Any, Any]
         assert run.stage == "queued"
         assert job.state == "queued"
         assert job.attempts == 1
+
+
+def test_assistant_claim_repairs_run_without_job(store: tuple[Any, Any]) -> None:
+    """Legacy AgentRuns acquire a lease only after a durable Job is created."""
+
+    _engine, factory = store
+    with factory() as db:
+        user, _profile = seed_tenant(db)
+        project = _project(db, user.id, "助手孤儿运行")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            title="无任务会话",
+        )
+        db.add(conversation)
+        db.flush()
+        run = models.AgentRun(
+            project_id=project.id,
+            conversation_id=conversation.id,
+            idempotency_key="orphan-agent-run",
+            status="queued",
+            stage="queued",
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+        claimed = assistant_service._claim_agent_run(db, run_id)
+        assert claimed is not None
+        _run, _conversation, claimed_project, _user, job, _lease_owner = claimed
+        assert job is not None
+        assert claimed_project.id == project.id
+        assert job.resource_id == run_id
+        assert job.state == "running"
 
 
 def test_assistant_claim_serializes_sibling_projects_across_sessions(
@@ -755,6 +816,14 @@ def _new_conversation(client: TestClient, project_id: str) -> dict[str, Any]:
     return response.json()
 
 
+def test_assistant_conversation_reports_effective_provider(api) -> None:
+    client, _factory, _owner_id = api
+    project = _new_project(client, "会话 Provider 展示")
+    conversation = _new_conversation(client, project["id"])
+    assert conversation["provider_name"] == "测试模型"
+    assert conversation["provider_capabilities"]["vision"] is False
+
+
 def test_assistant_message_idempotency_and_last_event_id_resume(api, monkeypatch) -> None:
     client, factory, _owner_id = api
     project = _new_project(client)
@@ -862,10 +931,144 @@ def test_assistant_stream_batch_allocates_distinct_event_sequences(store) -> Non
         assert [row.payload_json.get("index") for row in rows[1:]] == [1, 2, 3, 4]
 
 
+def test_sqlite_concurrent_assistant_messages_keep_sequences_unique(store) -> None:
+    """SQLite's process guard covers the row-lock semantics it does not provide."""
+
+    _engine, factory = store
+    with factory() as db:
+        user, _profile = seed_tenant(db)
+        project = _project(db, user.id, "并发会话序号")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            title="并发写入",
+        )
+        db.add(conversation)
+        db.commit()
+        user_id = user.id
+        conversation_id = conversation.id
+
+    workers = 8
+    barrier = threading.Barrier(workers)
+
+    def submit(index: int) -> tuple[int, int]:
+        with factory() as db:
+            user = db.get(models.User, user_id)
+            conversation = db.get(models.AgentConversation, conversation_id)
+            assert user is not None and conversation is not None
+            barrier.wait(timeout=5)
+            message, run, created = assistant_service.create_message_run(
+                db,
+                conversation,
+                user,
+                f"并发消息 {index}",
+                idempotency_key=f"concurrent-message-{index}",
+            )
+            assert created is True
+            return message.sequence, int((run.input_snapshot or {}).get("attempt", 1))
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(submit, range(workers)))
+
+    assert sorted(sequence for sequence, _attempt in results) == list(
+        range(1, workers + 1)
+    )
+    with factory() as db:
+        messages = db.scalars(
+            select(models.AgentMessage)
+            .where(
+                models.AgentMessage.conversation_id == conversation_id,
+                models.AgentMessage.role == "user",
+            )
+            .order_by(models.AgentMessage.sequence)
+        ).all()
+        events = db.scalars(
+            select(models.AgentEvent)
+            .where(models.AgentEvent.conversation_id == conversation_id)
+            .order_by(models.AgentEvent.sequence)
+        ).all()
+        assert [message.sequence for message in messages] == list(
+            range(1, workers + 1)
+        )
+        assert [event.sequence for event in events] == list(range(1, workers + 1))
+
+
+def test_sqlite_worker_event_and_new_message_share_transaction_guard(store) -> None:
+    """A worker's uncommitted event must serialize with an incoming message."""
+
+    _engine, factory = store
+    with factory() as db:
+        user, _profile = seed_tenant(db)
+        project = _project(db, user.id, "运行中并发会话")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            title="运行中继续对话",
+        )
+        db.add(conversation)
+        db.commit()
+        user_id = user.id
+        conversation_id = conversation.id
+
+    worker_allocated = threading.Event()
+    allow_worker_commit = threading.Event()
+    api_started = threading.Event()
+
+    def persist_worker_event() -> int:
+        with factory() as db:
+            conversation = db.get(models.AgentConversation, conversation_id)
+            assert conversation is not None
+            event = assistant_service.add_event(
+                db,
+                conversation,
+                "message.delta",
+                {"delta": "worker"},
+            )
+            worker_allocated.set()
+            assert allow_worker_commit.wait(timeout=5)
+            db.commit()
+            return event.sequence
+
+    def submit_message() -> int:
+        with factory() as db:
+            user = db.get(models.User, user_id)
+            conversation = db.get(models.AgentConversation, conversation_id)
+            assert user is not None and conversation is not None
+            api_started.set()
+            message, _run, created = assistant_service.create_message_run(
+                db,
+                conversation,
+                user,
+                "运行中追加的消息",
+                idempotency_key="worker-api-overlap",
+            )
+            assert created is True
+            return message.sequence
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        worker_future = executor.submit(persist_worker_event)
+        assert worker_allocated.wait(timeout=5)
+        api_future = executor.submit(submit_message)
+        assert api_started.wait(timeout=5)
+        time.sleep(0.1)
+        assert not api_future.done()
+        allow_worker_commit.set()
+        assert worker_future.result(timeout=5) == 1
+        assert api_future.result(timeout=5) == 1
+
+    with factory() as db:
+        events = db.scalars(
+            select(models.AgentEvent)
+            .where(models.AgentEvent.conversation_id == conversation_id)
+            .order_by(models.AgentEvent.sequence)
+        ).all()
+        assert [event.sequence for event in events] == [1, 2]
+
+
 def test_assistant_stream_persists_four_deltas_without_sequence_conflict(
     store: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Exercise the real worker path, including its four-token commit batch."""
+    """Exercise coalesced streaming persistence and contiguous event ids."""
 
     _engine, factory = store
 
@@ -925,7 +1128,426 @@ def test_assistant_stream_persists_four_deltas_without_sequence_conflict(
         finished_run = db.get(models.AgentRun, run.id)
         assert finished_run is not None and finished_run.status == "completed"
         assert [row.sequence for row in rows] == list(range(1, len(rows) + 1))
-        assert [row.payload_json.get("index") for row in rows if row.event_type == "message_delta"] == [1, 2, 3, 4]
+        delta_rows = [row for row in rows if row.event_type == "message.delta"]
+        assert len(delta_rows) == 1
+        assert delta_rows[0].payload_json["delta"] == "目前没有收到具体的修改需求，请你"
+        assert delta_rows[0].payload_json["start_index"] == 1
+        assert delta_rows[0].payload_json["end_index"] == 4
+        assistant_message = db.scalar(
+            select(models.AgentMessage).where(
+                models.AgentMessage.conversation_id == conversation.id,
+                models.AgentMessage.role == "assistant",
+            )
+        )
+        assert assistant_message is not None
+        assert assistant_message.content == "目前没有收到具体的修改需求，请你"
+
+
+def test_assistant_stream_coalesces_many_small_deltas(
+    store: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hundreds of provider chunks become a small, complete durable log."""
+
+    _engine, factory = store
+
+    class SmallChunkProvider:
+        async def stream(self, _messages: list[dict[str, Any]], **_kwargs: Any):
+            for _index in range(448):
+                yield "字"
+
+        async def structured(
+            self,
+            _messages: list[dict[str, Any]],
+            _schema: dict[str, Any],
+            **_kwargs: Any,
+        ) -> tuple[dict[str, Any], ProviderResponse]:
+            return (
+                {"reply": "提取完成", "proposals": []},
+                ProviderResponse(
+                    content="{}",
+                    raw={},
+                    model="small-chunk-fake",
+                    usage={},
+                    request_id="small-chunk-fake",
+                ),
+            )
+
+    monkeypatch.setattr(assistant_service, "provider_for", lambda _profile: SmallChunkProvider())
+    with factory() as db:
+        user, profile = seed_tenant(db)
+        assert profile is not None
+        project = _project(db, user.id, "流式合并压力")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            provider_profile_id=profile.id,
+        )
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+        _message, run, _created = assistant_service.create_message_run(
+            db,
+            conversation,
+            user,
+            "请写一段连续回复",
+            idempotency_key="coalesced-small-chunks",
+        )
+
+        assistant_service.execute_agent_run(db, run.id)
+        rows = db.scalars(
+            select(models.AgentEvent)
+            .where(models.AgentEvent.conversation_id == conversation.id)
+            .order_by(models.AgentEvent.sequence)
+        ).all()
+        delta_rows = [row for row in rows if row.event_type == "message.delta"]
+        assert 1 <= len(delta_rows) <= 8
+        assert "".join(row.payload_json["delta"] for row in delta_rows) == "字" * 448
+        assert [row.sequence for row in rows] == list(range(1, len(rows) + 1))
+        assistant_message = db.scalar(
+            select(models.AgentMessage).where(
+                models.AgentMessage.run_id == run.id,
+                models.AgentMessage.role == "assistant",
+            )
+        )
+        assert assistant_message is not None
+        assert assistant_message.content == "字" * 448
+
+
+def test_assistant_plain_reply_keeps_markdown_list_as_prose() -> None:
+    """A leading Markdown list is not mistaken for a JSON machine envelope."""
+
+    assert assistant_service._plain_reply("[第一项]\n[第二项]") == "[第一项]\n[第二项]"
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected", "expected_status"),
+    [
+        (
+            ['{"reply":"安全', '回复","proposals":[]}'],
+            "安全回复",
+            "completed",
+        ),
+        (
+            ["```text\n", "安全回复", "\n```"],
+            "安全回复",
+            "completed",
+        ),
+        (
+            ["```json\n{\"reply\":\"安全回复\",\"proposals\":[}", "\n```"],
+            "安全回复",
+            "completed",
+        ),
+        (
+            ['{"reply":"半'],
+            assistant_service.INCOMPLETE_REPLY_MESSAGE,
+            "needs_retry",
+        ),
+    ],
+)
+def test_assistant_stream_machine_wrappers_never_become_delta_text(
+    store: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    chunks: list[str],
+    expected: str,
+    expected_status: str,
+) -> None:
+    """JSON/fence streams are normalized before any durable delta is sent."""
+
+    _engine, factory = store
+
+    class WrappedStreamingProvider:
+        async def stream(self, _messages: list[dict[str, Any]], **_kwargs: Any):
+            for chunk in chunks:
+                yield chunk
+
+        async def structured(
+            self,
+            _messages: list[dict[str, Any]],
+            _schema: dict[str, Any],
+            **_kwargs: Any,
+        ) -> tuple[dict[str, Any], ProviderResponse]:
+            return (
+                {"reply": "结构化提取结果", "proposals": []},
+                ProviderResponse(
+                    content="{}",
+                    raw={},
+                    model="wrapped-stream-fake",
+                    usage={},
+                    request_id="wrapped-stream-fake",
+                ),
+            )
+
+    monkeypatch.setattr(
+        assistant_service, "provider_for", lambda _profile: WrappedStreamingProvider()
+    )
+    with factory() as db:
+        user, profile = seed_tenant(db)
+        assert profile is not None
+        project = _project(db, user.id, "流式包装门禁")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            provider_profile_id=profile.id,
+        )
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+        _message, run, _created = assistant_service.create_message_run(
+            db,
+            conversation,
+            user,
+            "请返回安全文本",
+            idempotency_key=f"wrapped-stream-{expected_status}",
+        )
+        assistant_service.execute_agent_run(db, run.id)
+        db.refresh(run)
+        rows = db.scalars(
+            select(models.AgentEvent)
+            .where(models.AgentEvent.conversation_id == conversation.id)
+            .order_by(models.AgentEvent.sequence)
+        ).all()
+        assert run.status == expected_status
+        assert not [row for row in rows if row.event_type == "message.delta"]
+        assistant_message = db.scalar(
+            select(models.AgentMessage).where(
+                models.AgentMessage.run_id == run.id,
+                models.AgentMessage.role == "assistant",
+            )
+        )
+        assert assistant_message is not None
+        assert assistant_message.content == expected
+        if expected_status == "completed":
+            replacements = [row for row in rows if row.event_type == "message.replace"]
+            assert replacements
+            assert replacements[-1].payload_json["content"] == expected
+
+
+def test_assistant_non_stream_uses_prose_then_structured_extraction(
+    store: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Structured extraction is a second call and cannot replace prose."""
+
+    _engine, factory = store
+    calls: list[tuple[str, str]] = []
+
+    class NonStreamingProvider:
+        async def complete(self, messages: list[dict[str, Any]], **_kwargs: Any) -> ProviderResponse:
+            calls.append(("complete", str(messages[-1]["role"])))
+            return ProviderResponse(
+                content="先给用户的普通中文回复",
+                raw={},
+                model="non-stream-fake",
+                usage={},
+                request_id="non-stream-fake",
+            )
+
+        async def structured(
+            self,
+            messages: list[dict[str, Any]],
+            _schema: dict[str, Any],
+            **_kwargs: Any,
+        ) -> tuple[dict[str, Any], ProviderResponse]:
+            calls.append(("structured", str(messages[-2]["content"])))
+            return (
+                {"reply": "提取器不应覆盖普通回复", "proposals": []},
+                ProviderResponse(
+                    content="{}",
+                    raw={},
+                    model="extractor-fake",
+                    usage={},
+                    request_id="extractor-fake",
+                ),
+            )
+
+    monkeypatch.setattr(assistant_service, "provider_for", lambda _profile: NonStreamingProvider())
+    with factory() as db:
+        user, profile = seed_tenant(db)
+        assert profile is not None
+        project = _project(db, user.id, "非流式双通道")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            provider_profile_id=profile.id,
+        )
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+        _message, run, _created = assistant_service.create_message_run(
+            db,
+            conversation,
+            user,
+            "请解释当前设定",
+            idempotency_key="non-stream-two-step",
+        )
+        assistant_service.execute_agent_run(db, run.id)
+        assert calls[0] == ("complete", "user")
+        assert calls[1] == ("structured", "先给用户的普通中文回复")
+        assistant_message = db.scalar(
+            select(models.AgentMessage).where(
+                models.AgentMessage.run_id == run.id,
+                models.AgentMessage.role == "assistant",
+            )
+        )
+        assert assistant_message is not None
+        assert assistant_message.content == "先给用户的普通中文回复"
+
+
+def test_assistant_retry_carries_attempt_into_new_events(
+    store: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable retry advances the event attempt without changing run id."""
+
+    _engine, factory = store
+    calls = 0
+
+    class RetryProvider:
+        async def complete(self, _messages: list[dict[str, Any]], **_kwargs: Any) -> ProviderResponse:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ProviderError("临时模型错误", retryable=True)
+            return ProviderResponse(
+                content="重试后的普通中文回复",
+                raw={},
+                model="retry-fake",
+                usage={},
+                request_id="retry-fake",
+            )
+
+        async def structured(
+            self,
+            _messages: list[dict[str, Any]],
+            _schema: dict[str, Any],
+            **_kwargs: Any,
+        ) -> tuple[dict[str, Any], ProviderResponse]:
+            return (
+                {"reply": "重试后的普通中文回复", "proposals": []},
+                ProviderResponse(
+                    content="{}",
+                    raw={},
+                    model="retry-extractor",
+                    usage={},
+                    request_id="retry-extractor",
+                ),
+            )
+
+    provider = RetryProvider()
+    monkeypatch.setattr(assistant_service, "provider_for", lambda _profile: provider)
+    with factory() as db:
+        user, profile = seed_tenant(db)
+        assert profile is not None
+        project = _project(db, user.id, "助手重试事件")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            provider_profile_id=profile.id,
+        )
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+        _message, run, _created = assistant_service.create_message_run(
+            db,
+            conversation,
+            user,
+            "请稍后重试",
+            idempotency_key="attempt-protocol",
+        )
+        assistant_service.execute_agent_run(db, run.id)
+        db.refresh(run)
+        job = db.get(models.Job, run.job_id)
+        assert job is not None and run.status == "needs_retry" and job.attempts == 1
+        assistant_rows = db.scalars(
+            select(models.AgentMessage).where(
+                models.AgentMessage.run_id == run.id,
+                models.AgentMessage.role == "assistant",
+            )
+        ).all()
+        assert len(assistant_rows) == 1
+        first_last_sequence = db.scalar(
+            select(func.max(models.AgentEvent.sequence)).where(
+                models.AgentEvent.conversation_id == conversation.id
+            )
+        )
+
+        run.status = "queued"
+        run.stage = "queued"
+        job.state = "queued"
+        job.current_stage = "queued"
+        db.commit()
+        assistant_service.execute_agent_run(db, run.id)
+        rows = db.scalars(
+            select(models.AgentEvent)
+            .where(
+                models.AgentEvent.conversation_id == conversation.id,
+                models.AgentEvent.sequence > int(first_last_sequence or 0),
+            )
+            .order_by(models.AgentEvent.sequence)
+        ).all()
+        assert rows
+        assert {row.payload_json.get("attempt") for row in rows} == {2}
+        assistant_rows = db.scalars(
+            select(models.AgentMessage).where(
+                models.AgentMessage.run_id == run.id,
+                models.AgentMessage.role == "assistant",
+            )
+        ).all()
+        assert len(assistant_rows) == 1
+        assert assistant_rows[0].content == "重试后的普通中文回复"
+
+
+def test_assistant_incomplete_json_reply_is_retryable_and_safe(
+    store: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial reply string is hidden behind a retry-safe Chinese message."""
+
+    _engine, factory = store
+
+    class MalformedProvider:
+        async def complete(self, _messages: list[dict[str, Any]], **_kwargs: Any) -> ProviderResponse:
+            return ProviderResponse(
+                content='{"reply":"\\u4f60',
+                raw={},
+                model="malformed-fake",
+                usage={},
+                request_id="malformed-fake",
+            )
+
+        async def structured(self, *_args: Any, **_kwargs: Any):
+            raise AssertionError("不应在普通回复格式错误后调用提取器")
+
+    monkeypatch.setattr(assistant_service, "provider_for", lambda _profile: MalformedProvider())
+    with factory() as db:
+        user, profile = seed_tenant(db)
+        assert profile is not None
+        project = _project(db, user.id, "助手格式恢复")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            provider_profile_id=profile.id,
+        )
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+        _message, run, _created = assistant_service.create_message_run(
+            db,
+            conversation,
+            user,
+            "请回答",
+            idempotency_key="incomplete-json",
+        )
+        assistant_service.execute_agent_run(db, run.id)
+        db.refresh(run)
+        assert run.status == "needs_retry"
+        assert run.error == assistant_service.INCOMPLETE_REPLY_MESSAGE
+        assistant_message = db.scalar(
+            select(models.AgentMessage).where(
+                models.AgentMessage.run_id == run.id,
+                models.AgentMessage.role == "assistant",
+            )
+        )
+        assert assistant_message is not None
+        assert assistant_message.content == assistant_service.INCOMPLETE_REPLY_MESSAGE
+        assert "proposals" not in assistant_message.content
 
 
 def test_assistant_chapter_context_uses_server_authoritative_hashes(
@@ -1256,7 +1878,7 @@ def test_minimal_0002_sqlite_migrates_to_story_workspace_head(tmp_path: Path) ->
         }
         with engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                "20260901_0004"
+                "20260902_0005"
             )
     finally:
         engine.dispose()

@@ -1,10 +1,23 @@
 import { useEffect, useState } from "react";
-import { LayoutGrid, MessageCircle, Network } from "lucide-react";
+import { CircleAlert, FileText, MessageCircle } from "lucide-react";
 
-export type MobileWorkshopPanel = "agent" | "dossier" | "graph";
+/**
+ * The narrow workspace only needs two readable surfaces.  Keep the former
+ * dossier/graph names accepted so deep links and older callers do not break;
+ * both now resolve to the content surface.
+ */
+export type MobileWorkshopPanel = "agent" | "content" | "dossier" | "graph";
+
+type ActiveMobileWorkshopPanel = "agent" | "content";
 
 interface MobileWorkshopTabsProps {
   initialPanel?: MobileWorkshopPanel;
+  attentionCount?: number;
+  onAttention?: () => void;
+}
+
+function normalizePanel(panel: MobileWorkshopPanel): ActiveMobileWorkshopPanel {
+  return panel === "agent" ? "agent" : "content";
 }
 
 /**
@@ -15,10 +28,14 @@ interface MobileWorkshopTabsProps {
  */
 export default function MobileWorkshopTabs({
   initialPanel = "dossier",
+  attentionCount = 0,
+  onAttention,
 }: MobileWorkshopTabsProps) {
-  const [panel, setPanel] = useState<MobileWorkshopPanel>(initialPanel);
+  const [panel, setPanel] = useState<ActiveMobileWorkshopPanel>(() =>
+    normalizePanel(initialPanel),
+  );
 
-  const activate = (next: MobileWorkshopPanel) => {
+  const activate = (next: ActiveMobileWorkshopPanel) => {
     if (next !== panel) {
       setPanel(next);
       return;
@@ -26,12 +43,16 @@ export default function MobileWorkshopTabs({
     // Re-dispatch the selected tab as an explicit navigation command.  This
     // keeps the internal studio mode in sync after a desktop-to-mobile resize.
     document.documentElement.dataset.mobileWorkshopPanel = next;
-    window.dispatchEvent(new CustomEvent("story-studio-mobile-panel", { detail: next }));
+    window.dispatchEvent(
+      new CustomEvent("story-studio-mobile-panel", { detail: next }),
+    );
   };
 
   useEffect(() => {
     document.documentElement.dataset.mobileWorkshopPanel = panel;
-    window.dispatchEvent(new CustomEvent("story-studio-mobile-panel", { detail: panel }));
+    window.dispatchEvent(
+      new CustomEvent("story-studio-mobile-panel", { detail: panel }),
+    );
     return () => {
       if (document.documentElement.dataset.mobileWorkshopPanel === panel) {
         delete document.documentElement.dataset.mobileWorkshopPanel;
@@ -39,8 +60,30 @@ export default function MobileWorkshopTabs({
     };
   }, [panel]);
 
+  useEffect(() => {
+    const handlePanelRequest = (event: Event) => {
+      const requested = (event as CustomEvent<"agent" | "content">).detail;
+      if (requested === "agent" || requested === "content") {
+        setPanel(requested);
+      }
+    };
+    window.addEventListener("story-studio-mobile-panel", handlePanelRequest);
+    return () =>
+      window.removeEventListener("story-studio-mobile-panel", handlePanelRequest);
+  }, []);
+
   return (
-    <nav className="studio-mobile-tabs" aria-label="移动端工作区" role="tablist">
+    <nav className="studio-mobile-tabs" aria-label="移动端工作区">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={panel === "content"}
+        className={panel === "content" ? "is-active" : ""}
+        onClick={() => activate("content")}
+      >
+        <FileText size={14} aria-hidden="true" />
+        内容
+      </button>
       <button
         type="button"
         role="tab"
@@ -49,27 +92,18 @@ export default function MobileWorkshopTabs({
         onClick={() => activate("agent")}
       >
         <MessageCircle size={14} aria-hidden="true" />
-        对话
+        Agent
       </button>
       <button
         type="button"
-        role="tab"
-        aria-selected={panel === "dossier"}
-        className={panel === "dossier" ? "is-active" : ""}
-        onClick={() => activate("dossier")}
+        className={`mobile-attention-tab ${attentionCount > 0 ? "has-items" : ""}`}
+        onClick={onAttention}
+        aria-haspopup="dialog"
+        aria-label={attentionCount > 0 ? `打开待处理事项，${attentionCount} 项` : "打开待处理事项"}
       >
-        <LayoutGrid size={14} aria-hidden="true" />
-        资料
-      </button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={panel === "graph"}
-        className={panel === "graph" ? "is-active" : ""}
-        onClick={() => activate("graph")}
-      >
-        <Network size={14} aria-hidden="true" />
-        图谱
+        <CircleAlert size={14} aria-hidden="true" />
+        <span>待处理</span>
+        {attentionCount > 0 && <b>{attentionCount}</b>}
       </button>
     </nav>
   );
