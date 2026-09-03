@@ -839,15 +839,29 @@ def _responses_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 class _ProviderBase:
     """Shared lifecycle and HTTP error handling for protocol adapters."""
 
-    def __init__(self, profile: Any, *, client: httpx.AsyncClient | None = None):
+    def __init__(
+        self,
+        profile: Any,
+        *,
+        client: httpx.AsyncClient | None = None,
+        request_timeout_seconds: float | None = None,
+    ):
         self.profile = profile
         self._client = client
         self._owns_client = client is None
+        self._request_timeout_seconds = (
+            max(1.0, float(request_timeout_seconds))
+            if request_timeout_seconds is not None
+            else None
+        )
+
+    def _request_timeout(self) -> float:
+        return self._request_timeout_seconds or _timeout(self.profile)
 
     async def __aenter__(self) -> _ProviderBase:
         if self._client is None:
             self._client = httpx.AsyncClient(
-                timeout=_timeout(self.profile), follow_redirects=False
+                timeout=self._request_timeout(), follow_redirects=False
             )
         return self
 
@@ -859,7 +873,7 @@ class _ProviderBase:
     def _client_or_new(self) -> tuple[httpx.AsyncClient, bool]:
         if self._client is not None:
             return self._client, False
-        return httpx.AsyncClient(timeout=_timeout(self.profile), follow_redirects=False), True
+        return httpx.AsyncClient(timeout=self._request_timeout(), follow_redirects=False), True
 
     async def _close_if_owned(self, client: httpx.AsyncClient, owns: bool) -> None:
         if owns:
@@ -1460,15 +1474,25 @@ class AnthropicMessagesProvider(_ProviderBase):
         }
 
 
-def provider_for(profile: Any | None) -> OpenAICompatibleProvider | AnthropicMessagesProvider:
+def provider_for(
+    profile: Any | None,
+    *,
+    request_timeout_seconds: float | None = None,
+) -> OpenAICompatibleProvider | AnthropicMessagesProvider:
     """Construct exactly the configured provider; never silently use a demo."""
 
     if profile is None:
         raise ProviderRequired("尚未配置模型 Provider")
     protocol = _protocol(profile)
     if protocol == "anthropic_messages":
-        return AnthropicMessagesProvider(profile)
-    return OpenAICompatibleProvider(profile)
+        return AnthropicMessagesProvider(
+            profile,
+            request_timeout_seconds=request_timeout_seconds,
+        )
+    return OpenAICompatibleProvider(
+        profile,
+        request_timeout_seconds=request_timeout_seconds,
+    )
 
 
 def provider_config_snapshot(profile: Any) -> dict[str, Any]:

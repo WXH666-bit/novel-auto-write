@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -20,7 +21,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .common import assign, mapped_kwargs, safe_text, utcnow
 from .importer import content_hash
-from .providers import PROMPT_VERSION, ProviderError, provider_config_snapshot, provider_for
+from .providers import (
+    PROMPT_VERSION,
+    ProviderError,
+    StructuredOutputError,
+    provider_config_snapshot,
+    provider_for,
+)
 
 SUMMARY_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -46,6 +53,9 @@ SUMMARY_SCHEMA: dict[str, Any] = {
 
 MEMORY_LEASE_TTL = timedelta(minutes=10)
 MEMORY_LEASE_HEARTBEAT_SECONDS = 30.0
+MEMORY_PROVIDER_TIMEOUT_SECONDS = 180.0
+MEMORY_PROVIDER_MAX_ATTEMPTS = 3
+MEMORY_PROVIDER_RETRY_DELAYS = (1.0, 3.0)
 
 
 class MemoryRunNotFound(LookupError):
@@ -88,18 +98,7 @@ def memory_run_snapshot(run: Any) -> dict[str, Any]:
     }
 
 
-def _memory_progress(run: Any) -> tuple[int, str]:
-    status = str(getattr(run, "status", "queued") or "queued")
-    stage = str(getattr(run, "stage", "queued") or "queued")
-    if status in {"current", "completed"}:
-        return 100, "新版本已发布"
-    if status in {"failed", "stale", "cancelled"}:
-        label = {
-            "failed": "整理失败，旧版记忆仍在使用",
-            "stale": "正文已变化，等待重新整理",
-            "cancelled": "整理已取消",
-        }.get(status, "整理已停止")
-        return 0, label
+def _stage_progress(stage: str) -> tuple[int, str]:
     if stage == "queued":
         return 3, "等待后台整理"
     if stage == "collecting":
@@ -120,6 +119,30 @@ def _memory_progress(run: Any) -> tuple[int, str]:
     if stage == "summarizing":
         return 18, "正在整理故事记忆"
     return 6, "正在准备故事记忆"
+
+
+def _memory_progress(run: Any) -> tuple[int, str]:
+    status = str(getattr(run, "status", "queued") or "queued")
+    stage = str(getattr(run, "stage", "queued") or "queued")
+    if status in {"current", "completed"}:
+        return 100, "新版本已发布"
+    if status in {"failed", "stale", "cancelled"}:
+        label = {
+            "failed": "整理失败，旧版记忆仍在使用",
+            "stale": "正文已变化，等待重新整理",
+            "cancelled": "整理已取消",
+        }.get(status, "整理已停止")
+        return 0, label
+    if stage.startswith("retrying:"):
+        try:
+            _prefix, current, total, resume_stage = stage.split(":", 3)
+            attempt = max(1, int(current))
+            maximum = max(attempt, int(total))
+        except (TypeError, ValueError):
+            attempt, maximum, resume_stage = 2, MEMORY_PROVIDER_MAX_ATTEMPTS, "summarizing"
+        progress, _label = _stage_progress(resume_stage)
+        return progress, f"模型响应异常，正在后台自动重试（{attempt}/{maximum}）"
+    return _stage_progress(stage)
 
 
 def _publish_stage(session: Session, run: Any, stage: str) -> None:
@@ -194,6 +217,74 @@ def _structured(provider: Any, messages: list[dict[str, str]]) -> tuple[dict[str
         role="summarizer",
     )
     return _normalise_summary(data), response
+
+
+def _structured_with_retry(
+    session: Session,
+    run: Any,
+    provider: Any,
+    messages: list[dict[str, str]],
+    *,
+    resume_stage: str,
+    lease_owner: str | None,
+) -> tuple[dict[str, Any], Any]:
+    """Retry safe memory inference without tying it to the browser connection."""
+
+    job = _job_for_run(session, run)
+    maximum = max(
+        1,
+        int(getattr(job, "max_attempts", MEMORY_PROVIDER_MAX_ATTEMPTS) or 0),
+    )
+    maximum = min(MEMORY_PROVIDER_MAX_ATTEMPTS, maximum)
+    for attempt in range(1, maximum + 1):
+        _assert_memory_lease(session, run, lease_owner)
+        try:
+            payload, response = _structured(provider, messages)
+        except ProviderError as exc:
+            retryable = bool(exc.retryable or exc.uncertain) or isinstance(
+                exc, StructuredOutputError
+            )
+            if not retryable or attempt >= maximum:
+                raise
+            next_attempt = attempt + 1
+            retry_stage = f"retrying:{next_attempt}:{maximum}:{resume_stage}"
+            assign(run, "stage", retry_stage)
+            assign(run, "error", str(exc)[:4000])
+            if job is not None:
+                retry_payload = dict(job.payload or {})
+                retry_payload.update(
+                    {
+                        "memory_model_attempt": next_attempt,
+                        "memory_model_max_attempts": maximum,
+                        "memory_resume_stage": resume_stage,
+                        "memory_model_retry_total": int(
+                            retry_payload.get("memory_model_retry_total", 0) or 0
+                        )
+                        + 1,
+                    }
+                )
+                job.payload = retry_payload
+                job.current_stage = retry_stage
+                job.last_error = str(exc)[:4000]
+            _renew_lease(session, run, retry_stage)
+            session.commit()
+            delay_index = min(attempt - 1, len(MEMORY_PROVIDER_RETRY_DELAYS) - 1)
+            if MEMORY_PROVIDER_RETRY_DELAYS:
+                time.sleep(max(0.0, MEMORY_PROVIDER_RETRY_DELAYS[delay_index]))
+            continue
+        assign(run, "stage", resume_stage)
+        assign(run, "error", None)
+        if job is not None:
+            retry_payload = dict(job.payload or {})
+            retry_payload["memory_model_attempt"] = attempt
+            retry_payload["memory_model_max_attempts"] = maximum
+            job.payload = retry_payload
+            job.current_stage = resume_stage
+            job.last_error = None
+        _renew_lease(session, run, resume_stage)
+        session.commit()
+        return payload, response
+    raise RuntimeError("记忆整理重试状态异常")
 
 
 def _summary_messages(label: str, text: str) -> list[dict[str, str]]:
@@ -844,6 +935,7 @@ def _summarize_chapter(
         raise ValueError("章节缺少确认正文")
     profile = _provider_profile(session, project)
     max_chars = max(4_000, min(16_000, int(getattr(profile, "context_length", 8192)) * 2))
+    visible_stage = str(getattr(run, "stage", "summarizing") or "summarizing")
     parts: list[dict[str, Any]] = []
     last_response: Any | None = None
     for index, chunk in enumerate(_split_text(revision.content, max_chars), start=1):
@@ -851,9 +943,13 @@ def _summarize_chapter(
         stage = f"chapter:{chapter.id}:chunk:{index}"
         payload = _checkpoint(session, run, stage=stage, source=chunk)
         if payload is None:
-            payload, last_response = _structured(
+            payload, last_response = _structured_with_retry(
+                session,
+                run,
                 provider,
                 _summary_messages(f"chapter_part_{index}", chunk),
+                resume_stage=visible_stage,
+                lease_owner=lease_owner,
             )
             _assert_memory_lease(session, run, lease_owner)
             _checkpoint(session, run, stage=stage, source=chunk, payload=payload)
@@ -867,9 +963,13 @@ def _summarize_chapter(
         stage = f"chapter:{chapter.id}:aggregate"
         final = _checkpoint(session, run, stage=stage, source=combined)
         if final is None:
-            final, last_response = _structured(
+            final, last_response = _structured_with_retry(
+                session,
+                run,
                 provider,
                 _summary_messages("chapter_part_summaries", combined),
+                resume_stage=visible_stage,
+                lease_owner=lease_owner,
             )
             _assert_memory_lease(session, run, lease_owner)
             _checkpoint(session, run, stage=stage, source=combined, payload=final)
@@ -907,6 +1007,11 @@ def _summarize_project(
 ) -> None:
     from ..models import Chapter
 
+    # SessionLocal deliberately disables autoflush.  A chapter summary may
+    # have been promoted immediately before this roll-up, so make that state
+    # visible to the SQL filter before deciding whether project material
+    # exists.
+    session.flush()
     chapters = session.scalars(
         select(Chapter)
         .where(
@@ -931,9 +1036,13 @@ def _summarize_project(
     if payload is None:
         _assert_memory_lease(session, run, lease_owner)
         _publish_stage(session, run, "project:compose")
-        payload, response = _structured(
+        payload, response = _structured_with_retry(
+            session,
+            run,
             provider,
             _project_summary_messages(combined),
+            resume_stage="project:compose",
+            lease_owner=lease_owner,
         )
         _assert_memory_lease(session, run, lease_owner)
         _checkpoint(session, run, stage="project:aggregate", source=combined, payload=payload)
@@ -989,7 +1098,13 @@ def execute_memory_run(session: Session, run_id: str) -> Any:
             chapter.summary_status = "running"
         session.commit()
         profile = _provider_profile(session, project)
-        provider = provider_for(profile)
+        provider = provider_for(
+            profile,
+            request_timeout_seconds=max(
+                MEMORY_PROVIDER_TIMEOUT_SECONDS,
+                float(getattr(profile, "timeout_seconds", 0) or 0),
+            ),
+        )
         if chapter is not None:
             _publish_stage(session, run, "chapters:1:1")
             _summarize_chapter(

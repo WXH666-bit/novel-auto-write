@@ -31,7 +31,11 @@ from backend.app.services import assistant as assistant_service
 from backend.app.services import generation as generation_service
 from backend.app.services import memory as memory_service
 from backend.app.services.memory import create_memory_run, execute_memory_run
-from backend.app.services.providers import ProviderError, ProviderResponse
+from backend.app.services.providers import (
+    ProviderError,
+    ProviderResponse,
+    StructuredOutputError,
+)
 from backend.app.services.tasks import DurableTaskRunner
 from backend.tests.helpers import authenticate_client, install_fake_provider, seed_tenant
 
@@ -577,6 +581,31 @@ class _CheckpointProvider:
         )
 
 
+class _RetryingMemoryProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def structured(
+        self,
+        _messages: list[dict[str, str]],
+        _schema: dict[str, Any],
+        **_kwargs: Any,
+    ) -> tuple[dict[str, Any], ProviderResponse]:
+        self.calls += 1
+        if self.calls <= 2:
+            raise StructuredOutputError("模拟结构化输出解析失败")
+        return (
+            _memory_payload("自动重试后的记忆摘要"),
+            ProviderResponse(
+                content="{}",
+                raw={"fake": True},
+                model="memory-retry-test",
+                usage={},
+                request_id=f"memory-retry-{self.calls}",
+            ),
+        )
+
+
 def _memory_payload(summary: str = "记忆摘要") -> dict[str, Any]:
     return {
         "summary": summary,
@@ -587,6 +616,44 @@ def _memory_payload(summary: str = "记忆摘要") -> dict[str, Any]:
         "characters": [],
         "plot_threads": [],
     }
+
+
+def test_memory_model_errors_retry_in_background_and_keep_progress(
+    store: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _engine, factory = store
+    provider = _RetryingMemoryProvider()
+    observed_timeout: dict[str, float] = {}
+
+    def fake_provider_for(_profile: Any, **kwargs: Any) -> _RetryingMemoryProvider:
+        observed_timeout["seconds"] = float(kwargs["request_timeout_seconds"])
+        return provider
+
+    monkeypatch.setattr(memory_service, "provider_for", fake_provider_for)
+    monkeypatch.setattr(memory_service, "MEMORY_PROVIDER_RETRY_DELAYS", (0.0, 0.0))
+    with factory() as db:
+        user, _profile = seed_tenant(db)
+        project = _project(db, user.id, "后台自动重试")
+        chapter, _revision = _confirmed_chapter(db, project, "雨夜里灯塔重新亮起。")
+        created = create_memory_run(db, project, chapter=chapter, actor_user_id=user.id)
+
+        result = execute_memory_run(db, created.run.id)
+
+        assert result.status == "current"
+        assert result.error is None
+        assert provider.calls == 4  # chapter: 3 attempts; project roll-up: 1 attempt
+        assert observed_timeout["seconds"] >= 180
+        job = db.scalar(select(models.Job).where(models.Job.resource_id == created.run.id))
+        assert job is not None
+        assert job.state == "completed"
+        assert job.payload["memory_model_retry_total"] == 2
+        assert memory_service._memory_progress(
+            type(
+                "RetryingRun",
+                (),
+                {"status": "running", "stage": "retrying:2:3:chapters:1:4"},
+            )()
+        ) == (26, "模型响应异常，正在后台自动重试（2/3）")
 
 
 def test_project_memory_ignores_confirmed_chapters_without_acceptance_pointer(
@@ -606,7 +673,11 @@ def test_project_memory_ignores_confirmed_chapters_without_acceptance_pointer(
         )
 
     monkeypatch.setattr(memory_service, "_structured", fake_structured)
-    monkeypatch.setattr(memory_service, "provider_for", lambda _profile: object())
+    monkeypatch.setattr(
+        memory_service,
+        "provider_for",
+        lambda _profile, **_kwargs: object(),
+    )
     with factory() as db:
         user, _profile = seed_tenant(db)
         project = _project(db, user.id, "只读确认正文")
@@ -671,7 +742,11 @@ def test_memory_final_cas_does_not_promote_result_after_epoch_change(
         )
 
     monkeypatch.setattr(memory_service, "_structured", fake_structured)
-    monkeypatch.setattr(memory_service, "provider_for", lambda _profile: object())
+    monkeypatch.setattr(
+        memory_service,
+        "provider_for",
+        lambda _profile, **_kwargs: object(),
+    )
     with factory() as db:
         user, _profile = seed_tenant(db)
         project = _project(db, user.id, "记忆 CAS")
@@ -744,7 +819,11 @@ def test_memory_long_text_checkpoints_and_resume_skips_completed_stage(
 ) -> None:
     _engine, factory = store
     provider = _CheckpointProvider()
-    monkeypatch.setattr(memory_service, "provider_for", lambda _profile: provider)
+    monkeypatch.setattr(
+        memory_service,
+        "provider_for",
+        lambda _profile, **_kwargs: provider,
+    )
     with factory() as db:
         user, profile = seed_tenant(db)
         assert profile is not None
