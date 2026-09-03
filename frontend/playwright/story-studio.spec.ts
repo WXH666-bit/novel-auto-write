@@ -352,6 +352,50 @@ test.describe("双栏协作台核心流程", () => {
     await expect(page.getByRole("textbox", { name: "发送给 Agent 的消息" })).toBeVisible();
   });
 
+  test("Agent 对话固定所选模型，切换模型会开始新对话", async ({ page }) => {
+    const mock = await mockStoryApi(page, {
+      initialProjects: [storyProjectFixture],
+      assistantProposals: [],
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "打开雾中灯塔" }).click();
+
+    const modelSelector = page.getByRole("combobox", {
+      name: "选择 Agent 模型",
+    });
+    await expect(modelSelector).toHaveValue("provider-1");
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("先检查本章节奏");
+    await page.getByRole("button", { name: "发送" }).click();
+    await expect(page.getByText("已整理人物设定。", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "查看历史对话" }).click();
+    const history = page.getByRole("dialog", { name: "历史 Agent 会话" });
+    await expect(history.getByText("Mock Provider · mock-model", { exact: true })).toBeVisible();
+    await history.getByRole("button", { name: "关闭历史对话" }).click();
+
+    await modelSelector.selectOption("provider-2");
+    await expect(page.getByLabel("Agent 当前状态")).toContainText(
+      "原对话仍保留在历史记录中",
+    );
+    await expect(modelSelector).toHaveValue("provider-2");
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("再精修结尾的悬念");
+    await page.getByRole("button", { name: "发送" }).click();
+    await expect(page.getByText("再精修结尾的悬念", { exact: true })).toBeVisible();
+
+    const creates = mock.requests.filter(
+      (request) =>
+        request.method === "POST" &&
+        request.path === "/projects/project-1/assistant/conversations",
+    );
+    expect(creates).toHaveLength(2);
+    expect(creates[0]?.body).toMatchObject({ provider_profile_id: "provider-1" });
+    expect(creates[1]?.body).toMatchObject({ provider_profile_id: "provider-2" });
+  });
+
   test("不新建对话时连续消息留在同一个章节会话", async ({ page }) => {
     const mock = await mockStoryApi(page, {
       initialProjects: [storyProjectFixture],

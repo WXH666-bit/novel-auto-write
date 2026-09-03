@@ -31,6 +31,7 @@ import {
   CheckCircle2,
   CircleAlert,
   Clock3,
+  Cpu,
   FileText,
   FileDiff,
   ImagePlus,
@@ -213,6 +214,22 @@ function conversationWorkMode(purpose?: string): AgentWorkMode {
     : "chapter";
 }
 
+function providerModelName(profile?: ProviderProfile | null) {
+  return (
+    profile?.model_roles?.assistant ||
+    profile?.model_roles?.default ||
+    profile?.model_roles?.writer ||
+    profile?.default_model ||
+    ""
+  );
+}
+
+function providerDisplayName(profile?: ProviderProfile | null) {
+  if (!profile) return "尚未添加模型";
+  const model = providerModelName(profile);
+  return model ? `${profile.name} · ${model}` : profile.name;
+}
+
 interface StoryStudioProps {
   project: Project;
   storyMap: StoryMap;
@@ -220,6 +237,7 @@ interface StoryStudioProps {
   activeChapter: Chapter | null;
   activeContent: string;
   assistantProvider?: ProviderProfile | null;
+  assistantProviders?: ProviderProfile[];
   memoryRun: MemoryRun | null;
   projectMemory?: ProjectMemory | null;
   initialMode?: StudioMode;
@@ -3198,6 +3216,7 @@ function AgentDock({
   activeContent,
   onChapter,
   assistantProvider,
+  assistantProviders = [],
   onProposalPreview,
   onProposalDismiss,
   onFollowProposal,
@@ -3219,6 +3238,7 @@ function AgentDock({
   activeContent: string;
   onChapter: (chapter: Chapter) => void;
   assistantProvider?: ProviderProfile | null;
+  assistantProviders?: ProviderProfile[];
   onProposalPreview: (proposal: AssistantProposal) => void;
   onProposalDismiss: (proposalId: string) => void;
   onFollowProposal?: (proposal: AssistantProposal) => void;
@@ -3237,10 +3257,43 @@ function AgentDock({
   const queryClient = useQueryClient();
   const [conversation, setConversation] =
     useState<AssistantConversation | null>(null);
+  const selectableProviders = useMemo(
+    () =>
+      assistantProviders.filter(
+        (profile) =>
+          Boolean(profile.id) &&
+          profile.enabled !== false &&
+          !profile.deleted_at,
+      ),
+    [assistantProviders],
+  );
+  const defaultAssistantProvider =
+    selectableProviders.find((profile) => profile.id === assistantProvider?.id) ||
+    selectableProviders.find((profile) => profile.is_default) ||
+    selectableProviders[0] ||
+    null;
+  const [selectedProviderId, setSelectedProviderId] = useState(
+    assistantProvider?.id || "",
+  );
+  const providerProjectRef = useRef("");
   const conversationRef = useRef<AssistantConversation | null>(null);
   useEffect(() => {
     conversationRef.current = conversation;
   }, [conversation]);
+  useEffect(() => {
+    const fallbackId = defaultAssistantProvider?.id || "";
+    if (providerProjectRef.current !== project.id) {
+      providerProjectRef.current = project.id;
+      setSelectedProviderId(fallbackId);
+      return;
+    }
+    if (conversationRef.current) return;
+    setSelectedProviderId((current) =>
+      selectableProviders.some((profile) => profile.id === current)
+        ? current
+        : fallbackId,
+    );
+  }, [defaultAssistantProvider?.id, project.id, selectableProviders]);
   const [messages, setMessages] = useState<AssistantConversation["messages"]>(
     [],
   );
@@ -3385,7 +3438,11 @@ function AgentDock({
       }
       return (
         !query ||
-        (row.title || "新的写作对话").toLocaleLowerCase().includes(query)
+        [
+          row.title || "新的写作对话",
+          row.provider_name || "",
+          row.provider_model || "",
+        ].some((value) => value.toLocaleLowerCase().includes(query))
       );
     });
   }, [conversationRows, historyMode, historySearch]);
@@ -3420,6 +3477,9 @@ function AgentDock({
         };
         conversationRef.current = loaded;
         setConversation(loaded);
+        setSelectedProviderId(
+          loaded.provider_profile_id || defaultAssistantProvider?.id || "",
+        );
         onWorkModeChange(conversationWorkMode(loaded.purpose));
         setMessages(loadedMessages);
         streamingMessageIdRef.current = "";
@@ -3489,7 +3549,15 @@ function AgentDock({
         );
       }
     },
-    [onNotice, onProposalDismiss, onProposalPreview, onWorkModeChange, project.id, target],
+    [
+      defaultAssistantProvider?.id,
+      onNotice,
+      onProposalDismiss,
+      onProposalPreview,
+      onWorkModeChange,
+      project.id,
+      target,
+    ],
   );
 
   useEffect(() => {
@@ -3854,7 +3922,10 @@ function AgentDock({
     return cleanup;
   }, [conversation?.id, loadConversation, onProposalPreview, project.id]);
 
-  const startNewConversation = (nextMode: AgentWorkMode = workMode) => {
+  const startNewConversation = (
+    nextMode: AgentWorkMode = workMode,
+    nextProviderId: string = selectedProviderId,
+  ) => {
     proposals.forEach((proposal) => onProposalDismiss(proposal.id));
     setConversation(null);
     conversationRef.current = null;
@@ -3875,11 +3946,15 @@ function AgentDock({
     knownRunIdsRef.current = new Set();
     liveSendRef.current = null;
     conversationCursorIdRef.current = "";
+    setSelectedProviderId(nextProviderId);
     onWorkModeChange(nextMode);
+    const nextProvider = selectableProviders.find(
+      (profile) => profile.id === nextProviderId,
+    );
     setNotice(
       nextMode === "global"
-        ? "新的全书协作已准备好。改动会按章节进入左侧 Diff。"
-        : "新的章节对话已准备好。Agent 会自动跟随当前章节。",
+        ? `新的全书协作已准备好${nextProvider ? `，将使用 ${providerDisplayName(nextProvider)}` : ""}。改动会按章节进入左侧 Diff。`
+        : `新的章节对话已准备好${nextProvider ? `，将使用 ${providerDisplayName(nextProvider)}` : ""}。Agent 会自动跟随当前章节。`,
     );
     setHistoryOpen(false);
     setHistorySearch("");
@@ -3898,6 +3973,8 @@ function AgentDock({
       target: conversationTarget,
       purpose: workMode,
       title: "新的写作对话",
+      provider_profile_id:
+        selectedProviderId || defaultAssistantProvider?.id || null,
     });
     const loaded = {
       ...created,
@@ -3945,6 +4022,21 @@ function AgentDock({
   const send = async () => {
     const content = message.trim();
     if (!content || agentIsBusy) return;
+    const currentConversation = conversationRef.current || conversation;
+    if (
+      currentConversation?.id &&
+      currentConversation.provider_available === false
+    ) {
+      setNotice("原对话使用的模型已不可用，请先从上方选择一个模型继续。");
+      return;
+    }
+    if (
+      !currentConversation?.id &&
+      !(selectedProviderId || defaultAssistantProvider?.id)
+    ) {
+      setNotice("尚未配置可用模型，请先到工作室设置中添加并启用模型。");
+      return;
+    }
     const writeIntent =
       workMode === "chapter" && shouldAutoCreateChapterDraft(content);
     let workingChapter = writeIntent
@@ -4324,13 +4416,48 @@ function AgentDock({
       startNewConversation(nextMode);
     }
   };
+  const selectedProvider = selectableProviders.find(
+    (profile) => profile.id === selectedProviderId,
+  );
   const hasConversationProvider = Boolean(conversation?.id);
+  const conversationProviderUnavailable = Boolean(
+    conversation?.id && conversation.provider_available === false,
+  );
   const effectiveProviderName = hasConversationProvider
-    ? conversation?.provider_name || "当前会话连接"
-    : assistantProvider?.name || "尚未添加模型";
+    ? conversation?.provider_name || "原模型"
+    : (selectedProvider || defaultAssistantProvider)?.name || "尚未添加模型";
+  const effectiveProviderModel = hasConversationProvider
+    ? conversation?.provider_model || ""
+    : providerModelName(selectedProvider || defaultAssistantProvider);
+  const effectiveProviderLabel = effectiveProviderModel
+    ? `${effectiveProviderName} · ${effectiveProviderModel}`
+    : effectiveProviderName;
   const canSeeImage = hasConversationProvider
     ? conversation?.provider_capabilities?.vision === true
-    : assistantProvider?.capabilities?.vision === true;
+    : (selectedProvider || defaultAssistantProvider)?.capabilities?.vision === true;
+  const providerSelectValue = hasConversationProvider
+    ? conversation?.provider_profile_id ||
+      (conversationProviderUnavailable ? "__unavailable__" : selectedProviderId)
+    : selectedProviderId || defaultAssistantProvider?.id || "";
+  const boundProviderIsSelectable = selectableProviders.some(
+    (profile) => profile.id === providerSelectValue,
+  );
+  const changeConversationProvider = (nextProviderId: string) => {
+    if (!nextProviderId || nextProviderId === providerSelectValue) return;
+    const nextProvider = selectableProviders.find(
+      (profile) => profile.id === nextProviderId,
+    );
+    if (!nextProvider) return;
+    if (conversation?.id) {
+      startNewConversation(workMode, nextProviderId);
+      setNotice(
+        `已切换到 ${providerDisplayName(nextProvider)}，原对话仍保留在历史记录中。`,
+      );
+      return;
+    }
+    setSelectedProviderId(nextProviderId);
+    setNotice(`新对话将使用 ${providerDisplayName(nextProvider)}。`);
+  };
   const targetLabel =
     workMode === "global"
       ? project.title
@@ -4453,13 +4580,42 @@ function AgentDock({
         </div>
       </div>
       <div className="agent-session-meta" aria-label="当前 Agent 会话信息">
-        <small className="agent-provider-state">
+        <label
+          className={`agent-model-ticket ${conversationProviderUnavailable ? "is-unavailable" : ""}`}
+        >
+          <Cpu size={12} aria-hidden="true" />
+          <span>
+            <small>{conversation?.id ? "本对话模型" : "新对话模型"}</small>
+            <select
+              value={providerSelectValue}
+              onChange={(event) => changeConversationProvider(event.target.value)}
+              disabled={agentIsBusy || selectableProviders.length === 0}
+              aria-label="选择 Agent 模型"
+              title={effectiveProviderLabel}
+            >
+              {!providerSelectValue && (
+                <option value="">尚未添加模型</option>
+              )}
+              {providerSelectValue && !boundProviderIsSelectable && (
+                <option value={providerSelectValue} disabled>
+                  {effectiveProviderLabel} · 不可用
+                </option>
+              )}
+              {selectableProviders.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {providerDisplayName(profile)}
+                </option>
+              ))}
+            </select>
+          </span>
+        </label>
+        <span
+          className="agent-session-memory"
+          aria-label={`已记住 ${rememberedTurns} 轮对话`}
+        >
           <span className={`status-dot ${canSeeImage ? "green" : ""}`} />
-          {effectiveProviderName}
-          {canSeeImage ? " · 可看图" : ""}
-        </small>
-        <span aria-label={`已记住 ${rememberedTurns} 轮对话`}>
           {rememberedTurns ? `记忆 ${rememberedTurns} 轮` : "新对话"}
+          {canSeeImage ? " · 可看图" : ""}
         </span>
       </div>
       <div
@@ -4526,7 +4682,7 @@ function AgentDock({
               <input
                 value={historySearch}
                 onChange={(event) => setHistorySearch(event.target.value)}
-                placeholder="搜索对话名称"
+                placeholder="搜索对话或模型"
                 aria-label="搜索历史对话"
                 autoFocus
               />
@@ -4585,6 +4741,12 @@ function AgentDock({
                             : "当前章节"}
                           {selected ? " · 当前对话" : ""}
                           {row.updated_at ? ` · ${formatDate(row.updated_at)}` : ""}
+                        </small>
+                        <small className="agent-history-model">
+                          <Cpu size={9} aria-hidden="true" />
+                          {row.provider_name || "原模型"}
+                          {row.provider_model ? ` · ${row.provider_model}` : ""}
+                          {row.provider_available === false ? " · 已不可用" : ""}
                         </small>
                       </span>
                       {selected && <i>正在使用</i>}
@@ -4841,6 +5003,7 @@ export default function StoryStudio({
   activeChapter,
   activeContent,
   assistantProvider,
+  assistantProviders = [],
   memoryRun,
   projectMemory,
   initialMode = "characters",
@@ -5671,6 +5834,7 @@ export default function StoryStudio({
             activeContent={activeContent}
             onChapter={onChapter}
             assistantProvider={assistantProvider}
+            assistantProviders={assistantProviders}
             onProposalPreview={handleProposalPreview}
             onProposalDismiss={dismissProposalPreview}
             onFollowProposal={followAgentProposal}

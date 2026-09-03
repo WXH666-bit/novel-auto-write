@@ -840,6 +840,8 @@ class AgentConversationRead(ORMModel):
     # snapshot lets clients display the effective provider without trusting a
     # caller-supplied fallback.
     provider_name: str | None = None
+    provider_model: str | None = None
+    provider_available: bool = False
     provider_capabilities: dict[str, bool] = Field(default_factory=dict)
     status: str
     version: int

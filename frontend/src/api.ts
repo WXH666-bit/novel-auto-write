@@ -966,6 +966,7 @@ export async function createAssistantConversation(
     target: AgentTarget;
     title?: string;
     purpose?: "global" | "chapter";
+    provider_profile_id?: string | null;
   },
 ): Promise<AssistantConversation> {
   return normalizeAssistantConversation(
@@ -979,6 +980,7 @@ export async function createAssistantConversation(
             input.purpose ||
             (input.target.type === "character" ? "setup_character" : "chapter"),
           apply_mode: "auto_draft",
+          provider_profile_id: input.provider_profile_id || null,
           target: input.target,
         }),
       },
@@ -2679,6 +2681,11 @@ function normalizeAssistantConversation(
           (raw.provider as Record<string, unknown> | undefined)?.name ??
           "",
       ) || undefined,
+    provider_model:
+      String(raw.provider_model ?? raw.providerModel ?? "") || undefined,
+    provider_available: Boolean(
+      raw.provider_available ?? raw.providerAvailable ?? raw.provider_name,
+    ),
     provider_capabilities: normalizeProviderCapabilities(
       raw.provider_capabilities ??
         (raw.provider as Record<string, unknown> | undefined)?.capabilities,

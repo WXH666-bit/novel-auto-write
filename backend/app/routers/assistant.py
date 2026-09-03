@@ -129,7 +129,7 @@ def _effective_provider(
     db: Session,
     conversation: AgentConversation,
     user: User | None = None,
-) -> tuple[str | None, dict[str, bool]]:
+) -> tuple[str | None, str | None, bool, dict[str, bool]]:
     """Resolve the provider actually available to this conversation's tenant.
 
     Conversations normally persist the selected profile id.  Older rows may
@@ -149,8 +149,23 @@ def _effective_provider(
             if user is not None
             else db.scalar(select(User.default_provider_id).where(User.id == owner_id))
         )
+    snapshot = (
+        dict(conversation.provider_snapshot or {})
+        if isinstance(conversation.provider_snapshot, dict)
+        else {}
+    )
+
+    def selected_model(value: dict[str, Any]) -> str | None:
+        roles = value.get("model_role_mapping")
+        if not isinstance(roles, dict):
+            return None
+        model = roles.get("assistant") or roles.get("default") or roles.get("writer")
+        if isinstance(model, dict):
+            model = model.get("model")
+        return str(model).strip() if model else None
+
     if not provider_id:
-        return None, {"vision": False}
+        return None, None, False, {"vision": False}
     profile = db.scalar(
         select(ProviderProfile).where(
             ProviderProfile.id == provider_id,
@@ -160,7 +175,8 @@ def _effective_provider(
         )
     )
     if profile is None:
-        return None, {"vision": False}
+        snapshot_name = str(snapshot.get("name") or "").strip() or None
+        return snapshot_name, selected_model(snapshot), False, {"vision": False}
     normalized = normalize_capabilities(profile.capabilities, strict=False)
     capabilities: dict[str, bool] = {}
     for key, value in normalized.items():
@@ -171,7 +187,10 @@ def _effective_provider(
             # the assistant response advertises only effective boolean flags.
             continue
     capabilities.setdefault("vision", False)
-    return profile.name, capabilities
+    model = selected_model(snapshot) or selected_model(
+        {"model_role_mapping": profile.model_role_mapping or {}}
+    )
+    return profile.name, model, True, capabilities
 
 
 def _conversation_payload(
@@ -193,8 +212,15 @@ def _conversation_payload(
             )
             if first_user_message:
                 payload.title = conversation_title_from_content(first_user_message)
-        provider_name, provider_capabilities = _effective_provider(db, conversation, user)
+        (
+            provider_name,
+            provider_model,
+            provider_available,
+            provider_capabilities,
+        ) = _effective_provider(db, conversation, user)
         payload.provider_name = provider_name
+        payload.provider_model = provider_model
+        payload.provider_available = provider_available
         payload.provider_capabilities = provider_capabilities
     return payload
 

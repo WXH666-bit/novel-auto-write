@@ -346,6 +346,30 @@ def _provider(db: Session, user: User, provider_id: str | None) -> ProviderProfi
     )
 
 
+class _ConversationProviderProfile:
+    """Read-through profile that keeps a conversation's selected models fixed."""
+
+    def __init__(self, profile: ProviderProfile, model_role_mapping: dict[str, Any]):
+        self._profile = profile
+        self.model_role_mapping = model_role_mapping
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._profile, name)
+
+
+def _runtime_provider_profile(
+    conversation: AgentConversation,
+    profile: ProviderProfile,
+) -> ProviderProfile | _ConversationProviderProfile:
+    snapshot = conversation.provider_snapshot
+    if not isinstance(snapshot, dict):
+        return profile
+    roles = snapshot.get("model_role_mapping")
+    if not isinstance(roles, dict) or not roles:
+        return profile
+    return _ConversationProviderProfile(profile, dict(roles))
+
+
 def create_conversation(
     db: Session, project: Project, user: User, payload: AgentConversationCreate
 ) -> AgentConversation:
@@ -3190,9 +3214,10 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
         profile = _provider(db, user, conversation.provider_profile_id)
         if profile is None:
             raise ProviderError("尚未配置模型 Provider")
-        provider = provider_for(profile)
+        runtime_profile = _runtime_provider_profile(conversation, profile)
+        provider = provider_for(runtime_profile)
         messages, authorised_asset_ids = _provider_messages(
-            db, conversation, run, project, user, profile
+            db, conversation, run, project, user, runtime_profile
         )
         target_context = (
             dict((run.input_snapshot or {}).get("target") or {})

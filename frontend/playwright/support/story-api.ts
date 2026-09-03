@@ -391,6 +391,19 @@ export async function mockStoryApi(
     is_default: true,
     api_key_set: true,
   };
+  const secondaryProvider: JsonRecord = {
+    id: "provider-2",
+    name: "章节精修",
+    base_url: "http://mock-editor",
+    protocol: "chat_completions",
+    default_model: "editor-model",
+    model_roles: { assistant: "editor-model", default: "editor-model" },
+    context_length: 32768,
+    capabilities: { vision: false, tools: true },
+    enabled: true,
+    is_default: false,
+    api_key_set: true,
+  };
 
   const getData = (projectId: string) => {
     const existing = dataByProject.get(projectId);
@@ -467,7 +480,7 @@ export async function mockStoryApi(
       return;
     }
     if (path === "/providers" && method === "GET") {
-      await json(route, { providers: [clone(provider)] });
+      await json(route, { providers: [clone(provider), clone(secondaryProvider)] });
       return;
     }
     if (parts[0] === "memory-runs" && parts[1]) {
@@ -758,12 +771,20 @@ export async function mockStoryApi(
         }
         if (assistantPart === "conversations" && parts.length === 4 && method === "POST") {
           const input = bodyRecord(body);
+          const selectedProfile = [provider, secondaryProvider].find(
+            (item) => item.id === input.provider_profile_id,
+          ) || provider;
           data.conversation = {
             id: "assistant-1",
             project_id: projectId,
             target: input.target || { type: "project", id: projectId },
             title: String(input.title || "新的写作对话"),
             purpose: String(input.purpose || "chapter"),
+            provider_profile_id: selectedProfile.id,
+            provider_name: selectedProfile.name,
+            provider_model: selectedProfile.default_model,
+            provider_available: true,
+            provider_capabilities: selectedProfile.capabilities,
             status: "idle",
             version: 1,
           };

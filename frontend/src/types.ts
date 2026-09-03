@@ -439,6 +439,8 @@ export interface AssistantConversation {
   version?: number;
   provider_profile_id?: string | null;
   provider_name?: string;
+  provider_model?: string;
+  provider_available?: boolean;
   provider_capabilities?: Record<string, boolean>;
   updated_at?: string;
 }

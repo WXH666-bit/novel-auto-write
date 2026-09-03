@@ -1905,7 +1905,12 @@ function Workspace({
             chapters={chapters}
             activeChapter={activeChapter}
             activeContent={activeContent}
-            assistantProvider={provider}
+            assistantProvider={
+              providers.find((item) => item.id === defaultProviderId) ||
+              providers.find((item) => item.is_default) ||
+              provider
+            }
+            assistantProviders={providers}
             memoryRun={memoryRun}
             projectMemory={projectMemory}
             initialMode={studioMode}

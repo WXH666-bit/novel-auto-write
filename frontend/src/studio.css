@@ -459,24 +459,93 @@
 }
 
 .agent-session-meta {
-  min-height: 30px;
+  min-height: 48px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 15px 9px;
+  padding: 6px 15px 8px;
   color: var(--muted);
   border-bottom: 1px solid rgba(74, 84, 78, .14);
   background: #f8f7f0;
 }
 
-.agent-session-meta > span {
+.agent-session-memory {
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   padding: 3px 6px;
   color: #536a62;
   background: #e8eee8;
   font-size: 8px;
   letter-spacing: .04em;
+  white-space: nowrap;
+}
+
+.agent-model-ticket {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 4px 7px 4px 5px;
+  color: var(--teal);
+  border: 1px solid #c0cbc4;
+  border-left: 3px solid var(--teal);
+  background: #fffef9;
+}
+
+.agent-model-ticket:focus-within {
+  border-color: #6d9387;
+  box-shadow: 0 0 0 2px rgba(79, 117, 107, .1);
+}
+
+.agent-model-ticket.is-unavailable {
+  color: var(--red);
+  border-color: #d5afa7;
+  border-left-color: var(--red);
+  background: #fff8f3;
+}
+
+.agent-model-ticket > svg {
+  justify-self: center;
+}
+
+.agent-model-ticket > span {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.agent-model-ticket small {
+  color: #748078;
+  font-size: 6px;
+  font-weight: 700;
+  letter-spacing: .14em;
+}
+
+.agent-model-ticket select {
+  min-width: 0;
+  width: 100%;
+  height: 18px;
+  padding: 0 17px 0 0;
+  overflow: hidden;
+  color: var(--ink);
+  border: 0;
+  outline: 0;
+  background-color: transparent;
+  font-family: var(--serif);
+  font-size: 9px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.agent-model-ticket select:disabled {
+  cursor: not-allowed;
+  opacity: .68;
 }
 
 .agent-provider-state {
@@ -920,6 +989,13 @@
   font-size: 8px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.agent-history-copy .agent-history-model {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: #4f756b;
 }
 
 .agent-history-list > button > i {

@@ -900,7 +900,65 @@ def test_assistant_conversation_reports_effective_provider(api) -> None:
     project = _new_project(client, "会话 Provider 展示")
     conversation = _new_conversation(client, project["id"])
     assert conversation["provider_name"] == "测试模型"
+    assert conversation["provider_model"] == "fake-model"
+    assert conversation["provider_available"] is True
     assert conversation["provider_capabilities"]["vision"] is False
+
+
+def test_assistant_conversation_keeps_selected_model_identity_when_disabled(api) -> None:
+    client, factory, owner_id = api
+    with factory() as db:
+        profile = models.ProviderProfile(
+            owner_id=owner_id,
+            name="章节精修模型",
+            base_url="http://127.0.0.1:9999/v1",
+            protocol="chat_completions",
+            model_role_mapping={"assistant": "editor-model"},
+            enabled=True,
+        )
+        db.add(profile)
+        db.commit()
+        db.refresh(profile)
+        profile_id = profile.id
+
+    project = _new_project(client, "指定会话模型")
+    created = client.post(
+        f"/api/projects/{project['id']}/assistant/conversations",
+        json={"purpose": "chapter", "provider_profile_id": profile_id},
+    )
+    assert created.status_code == 201, created.text
+    conversation = created.json()
+    assert conversation["provider_profile_id"] == profile_id
+    assert conversation["provider_name"] == "章节精修模型"
+    assert conversation["provider_model"] == "editor-model"
+    assert conversation["provider_available"] is True
+
+    with factory() as db:
+        stored = db.get(models.ProviderProfile, profile_id)
+        assert stored is not None
+        stored.model_role_mapping = {"assistant": "replacement-model"}
+        stored.enabled = False
+        db.commit()
+
+    loaded = client.get(
+        f"/api/projects/{project['id']}/assistant/conversations/{conversation['id']}"
+    )
+    assert loaded.status_code == 200, loaded.text
+    assert loaded.json()["provider_name"] == "章节精修模型"
+    assert loaded.json()["provider_model"] == "editor-model"
+    assert loaded.json()["provider_available"] is False
+
+    with factory() as db:
+        stored_conversation = db.get(models.AgentConversation, conversation["id"])
+        stored_profile = db.get(models.ProviderProfile, profile_id)
+        assert stored_conversation is not None
+        assert stored_profile is not None
+        runtime_profile = assistant_service._runtime_provider_profile(
+            stored_conversation,
+            stored_profile,
+        )
+        assert runtime_profile.model_role_mapping["assistant"] == "editor-model"
+        assert runtime_profile.base_url == stored_profile.base_url
 
 
 def test_first_user_turn_names_default_conversation(api) -> None:
