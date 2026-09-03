@@ -396,6 +396,37 @@ test.describe("双栏协作台核心流程", () => {
     expect(creates[1]?.body).toMatchObject({ provider_profile_id: "provider-2" });
   });
 
+  test("HTTP 环境缺少 randomUUID 时仍能发送 Agent 消息", async ({ page }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(Crypto.prototype, "randomUUID", {
+        configurable: true,
+        value: undefined,
+      });
+    });
+    const mock = await mockStoryApi(page, {
+      initialProjects: [storyProjectFixture],
+      assistantProposals: [],
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "打开雾中灯塔" }).click();
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("检查 HTTP 部署兼容性");
+    await page.getByRole("button", { name: "发送" }).click();
+    await expect(page.getByText("检查 HTTP 部署兼容性", { exact: true })).toBeVisible();
+    await expect(page.getByText("已整理人物设定。", { exact: true })).toBeVisible();
+
+    const messageRequest = mock.requests.find(
+      (request) =>
+        request.method === "POST" && request.path.endsWith("/messages"),
+    );
+    expect(messageRequest?.body).toMatchObject({
+      idempotency_key: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      ),
+    });
+  });
+
   test("不新建对话时连续消息留在同一个章节会话", async ({ page }) => {
     const mock = await mockStoryApi(page, {
       initialProjects: [storyProjectFixture],

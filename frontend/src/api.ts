@@ -41,6 +41,35 @@ const API_ROOT = (import.meta.env.VITE_API_BASE_URL || "/api").replace(
   "",
 );
 
+type ClientCrypto = Pick<Crypto, "getRandomValues"> &
+  Partial<Pick<Crypto, "randomUUID">>;
+
+/** Generate browser-side identifiers without requiring an HTTPS context. */
+export function createClientId(
+  source: ClientCrypto | null =
+    typeof crypto === "undefined" ? null : crypto,
+): string {
+  if (typeof source?.randomUUID === "function") {
+    return source.randomUUID();
+  }
+  if (typeof source?.getRandomValues === "function") {
+    const bytes = source.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (value) =>
+      value.toString(16).padStart(2, "0"),
+    ).join("");
+    return [
+      hex.slice(0, 8),
+      hex.slice(8, 12),
+      hex.slice(12, 16),
+      hex.slice(16, 20),
+      hex.slice(20),
+    ].join("-");
+  }
+  return `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
 type AuthListener = (status: "unauthorized") => void;
 const authListeners = new Set<AuthListener>();
 
@@ -1060,7 +1089,7 @@ export async function sendAssistantMessage(
       method: "POST",
       body: JSON.stringify({
         content,
-        idempotency_key: options.idempotency_key || crypto.randomUUID(),
+        idempotency_key: options.idempotency_key || createClientId(),
         target: options.target || {},
         context_snapshot: options.context_snapshot || {},
         authorized_asset_ids: options.authorized_asset_ids || [],
@@ -1297,7 +1326,7 @@ export async function createGeneration(
   const body = {
     chapter_id: input.chapter_id || null,
     provider_id: input.provider_id ? String(input.provider_id) : null,
-    idempotency_key: input.idempotency_key || crypto.randomUUID(),
+    idempotency_key: input.idempotency_key || createClientId(),
     chapter_count: chapterCount,
     target_word_count: Number(
       input.target_word_count ?? input.word_target ?? 3500,
@@ -1646,7 +1675,7 @@ export function normalizeProject(value: unknown): Project {
       source.targetWordCount,
   );
   return {
-    id: String(source.id ?? source.project_id ?? crypto.randomUUID()),
+    id: String(source.id ?? source.project_id ?? createClientId()),
     title: String(source.title ?? source.name ?? "未命名项目"),
     logline: String(
       source.logline ?? source.summary ?? source.description ?? "",
@@ -1719,7 +1748,7 @@ export function normalizeChapter(value: unknown): Chapter {
       "",
   );
   return {
-    id: String(source.id ?? source.chapter_id ?? crypto.randomUUID()),
+    id: String(source.id ?? source.chapter_id ?? createClientId()),
     project_id: String(source.project_id ?? source.projectId ?? ""),
     number: Number(
       source.number ??
@@ -1762,7 +1791,7 @@ export function normalizeCanon(value: unknown): CanonItem {
     source.value_text ?? source.value ?? source.description ?? "";
   return {
     ...source,
-    id: String(source.id ?? source.canon_id ?? crypto.randomUUID()),
+    id: String(source.id ?? source.canon_id ?? createClientId()),
     category: (source.category ??
       source.type ??
       "setting") as CanonItem["category"],
@@ -1812,7 +1841,7 @@ export function normalizeJob(value: unknown): GenerationJob {
   const derivedProgress =
     (Math.max(0, stages.indexOf(status)) / (stages.length - 1)) * 100;
   return {
-    id: String(source.id ?? source.job_id ?? crypto.randomUUID()),
+    id: String(source.id ?? source.job_id ?? createClientId()),
     project_id: String(source.project_id ?? source.projectId ?? ""),
     chapter_id: source.chapter_id as string | undefined,
     status,
@@ -1927,7 +1956,7 @@ export function normalizeReview(value: unknown): ReviewBundle {
     ? ((source.source_context ?? source.sourceContext) as unknown[])
     : [];
   return {
-    id: String(source.id ?? source.review_id ?? crypto.randomUUID()),
+    id: String(source.id ?? source.review_id ?? createClientId()),
     project_id: String(source.project_id ?? source.projectId ?? ""),
     chapter_id: String(source.chapter_id ?? source.chapterId ?? ""),
     revision_id:
@@ -1979,7 +2008,7 @@ function normalizePlotThread(value: unknown): PlotThread {
     ? ((source.points ?? extra.points) as Array<Record<string, unknown>>)
     : [];
   return {
-    id: String(source.id ?? crypto.randomUUID()),
+    id: String(source.id ?? createClientId()),
     title: String(source.title ?? source.name ?? "未命名剧情线"),
     kind: (source.kind ?? source.thread_type ?? "main") as PlotThread["kind"],
     status: (source.status ?? "active") as PlotThread["status"],
@@ -2001,7 +2030,7 @@ function normalizeTimeline(
   const chapterId = String(source.chapter_id ?? "") || undefined;
   const rawStatus = String(source.status ?? "confirmed");
   return {
-    id: String(source.id ?? crypto.randomUUID()),
+    id: String(source.id ?? createClientId()),
     title: String(source.title ?? "未命名事件"),
     date_label: String(source.date_label ?? source.story_time ?? "时间未定"),
     chapter_id: chapterId,
@@ -2041,7 +2070,7 @@ export function normalizeMemoryRun(value: unknown): MemoryRun {
     ? (rawStatus as MemoryRun["status"])
     : "queued";
   return {
-    id: String(source.id ?? source.run_id ?? crypto.randomUUID()),
+    id: String(source.id ?? source.run_id ?? createClientId()),
     project_id: String(source.project_id ?? source.projectId ?? ""),
     status,
     scope:
@@ -2097,7 +2126,7 @@ function normalizeStorySummary(value: unknown, projectId = ""): StorySummary {
   ]) || {}) as Record<string, unknown>;
   const structured = source.structured_json ?? source.structuredJson;
   return {
-    id: String(source.id ?? source.summary_id ?? crypto.randomUUID()),
+    id: String(source.id ?? source.summary_id ?? createClientId()),
     project_id: String(source.project_id ?? source.projectId ?? projectId),
     scope: String(source.scope ?? "project"),
     chapter_id:
@@ -2147,7 +2176,7 @@ function normalizePortrait(value: unknown, projectId = ""): PortraitAsset {
         ? (raw.portrait as Record<string, unknown>)
         : raw;
   return {
-    id: String(source.id ?? source.asset_id ?? crypto.randomUUID()),
+    id: String(source.id ?? source.asset_id ?? createClientId()),
     project_id: String(source.project_id ?? source.projectId ?? projectId),
     filename:
       String(
@@ -2224,7 +2253,7 @@ export function normalizeCharacter(
         )
       : null;
   return {
-    id: String(raw.id ?? raw.character_id ?? crypto.randomUUID()),
+    id: String(raw.id ?? raw.character_id ?? createClientId()),
     project_id: String(raw.project_id ?? raw.projectId ?? projectId),
     name: String(
       raw.name ?? raw.key ?? raw.subject ?? profile.name ?? "未命名人物",
@@ -2310,7 +2339,7 @@ function normalizeStoryGraphNode(value: unknown): StoryGraphNode | null {
       ? (raw.position as Record<string, unknown>)
       : {};
   return {
-    id: String(raw.id ?? crypto.randomUUID()),
+    id: String(raw.id ?? createClientId()),
     type,
     label: String(raw.label ?? raw.name ?? data.label ?? "未命名节点"),
     subtitle: String(raw.subtitle ?? data.subtitle ?? "") || undefined,
@@ -2400,7 +2429,7 @@ function normalizeStoryGraphEdge(value: unknown): StoryGraphEdge {
         | "needs_review")
     : "pending";
   return {
-    id: String(raw.id ?? crypto.randomUUID()),
+    id: String(raw.id ?? createClientId()),
     source: String(raw.source ?? raw.source_node_id ?? raw.sourceId ?? ""),
     target: String(raw.target ?? raw.target_node_id ?? raw.targetId ?? ""),
     label: String(raw.label ?? raw.name ?? "") || undefined,
@@ -2548,7 +2577,7 @@ function normalizeAssistantMessage(value: unknown): AssistantMessage {
   const raw = (value || {}) as Record<string, unknown>;
   const role = String(raw.role ?? "assistant");
   return {
-    id: String(raw.id ?? raw.message_id ?? crypto.randomUUID()),
+    id: String(raw.id ?? raw.message_id ?? createClientId()),
     run_id:
       raw.run_id === null
         ? null
@@ -2609,7 +2638,7 @@ function normalizeAssistantProposal(value: unknown): AssistantProposal {
   const operation = String(raw.operation ?? "").trim();
   const operationLabel = operation.replaceAll("_", " ").trim();
   return {
-    id: String(raw.id ?? raw.proposal_id ?? crypto.randomUUID()),
+    id: String(raw.id ?? raw.proposal_id ?? createClientId()),
     conversation_id: String(raw.conversation_id ?? raw.conversationId ?? ""),
     target: normalizeAgentTarget(
       raw.target ?? { target_type: raw.target_type, target_id: raw.target_id },
@@ -2658,7 +2687,7 @@ function normalizeAssistantConversation(
     "session",
   ]) || {}) as Record<string, unknown>;
   return {
-    id: String(raw.id ?? raw.conversation_id ?? crypto.randomUUID()),
+    id: String(raw.id ?? raw.conversation_id ?? createClientId()),
     project_id: String(raw.project_id ?? raw.projectId ?? projectId),
     target: normalizeAgentTarget(raw.target),
     status: String(raw.status ?? "idle") as AssistantConversation["status"],
