@@ -17,6 +17,8 @@ export interface MockStoryApiOptions {
   assistantProposals?: JsonRecord[];
   /** Optional wait before the first live Agent event, used to assert thinking UI. */
   assistantEventDelayMs?: number;
+  /** Keep the mocked run active so stop/resume controls can be exercised. */
+  assistantHoldRun?: boolean;
 }
 
 export interface MockStoryApiState {
@@ -259,10 +261,10 @@ function assistantConversation(data: ProjectData, projectId: string) {
     project_id: projectId,
     target: data.conversation?.target || { type: "project", id: projectId },
     status: "idle",
-    title: "故事设定助手",
-    purpose: "setup_character",
-    apply_mode: "preview",
-    version: 1,
+    title: String(data.conversation?.title || "故事设定助手"),
+    purpose: String(data.conversation?.purpose || "setup_character"),
+    apply_mode: String(data.conversation?.apply_mode || "preview"),
+    version: Number(data.conversation?.version || 1),
     messages: clone(data.messages),
     proposals: clone(data.proposals),
     updated_at: now,
@@ -277,11 +279,27 @@ async function assistantEvents(
   route: Route,
   data: ProjectData,
   delayMs = 0,
+  holdRun = false,
 ) {
   if (delayMs > 0) {
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
   const messageId = "assistant-message-1";
+  if (holdRun) {
+    const cancelled = data.conversation?.run_cancelled === true;
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      headers: { "cache-control": "no-cache" },
+      body: sseEvent(1, cancelled ? "run.cancelled" : "run.started", {
+        run_id: "assistant-run-1",
+        status: cancelled ? "cancelled" : "running",
+        stage: cancelled ? "cancelled" : "calling_model",
+        ...(cancelled ? { message: "已停止本次任务，已生成的内容仍保留在对话中。" } : {}),
+      }),
+    });
+    return;
+  }
   const proposals = data.proposals.length
     ? data.proposals
     : [
@@ -360,11 +378,13 @@ export async function mockStoryApi(
   const dataByProject = new Map<string, ProjectData>();
   initialProjects.forEach((project) => dataByProject.set(String(project.id), makeProjectData(project)));
   let projectSequence = 0;
+  let memoryRun: JsonRecord | null = null;
   let provider: JsonRecord = {
     id: "provider-1",
     name: "Mock Provider",
     base_url: "http://mock",
     protocol: "chat_completions",
+    default_model: "mock-model",
     context_length: 8192,
     capabilities: { vision: true, image_input: true, tools: true },
     enabled: true,
@@ -394,6 +414,14 @@ export async function mockStoryApi(
       await json(route, {}, 204);
       return;
     }
+    if (path === "/auth/config" && method === "GET") {
+      await json(route, {
+        mode: "username",
+        verification_required: false,
+        password_reset_available: false,
+      });
+      return;
+    }
     if (path === "/auth/me" && method === "GET") {
       await json(route, {
         user: {
@@ -408,7 +436,29 @@ export async function mockStoryApi(
       });
       return;
     }
-    if (path === "/preferences") {
+    if (path === "/auth/change-password" && method === "POST") {
+      await json(route, {
+        user: {
+          id: "user-1",
+          email: "writer@example.test",
+          display_name: "测试作者",
+          is_email_verified: true,
+          is_active: true,
+          default_provider_id: "provider-1",
+        },
+        csrf_token: "test-csrf",
+      });
+      return;
+    }
+    if (["/auth/logout", "/auth/logout-all"].includes(path) && method === "POST") {
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    if (path === "/auth/account" && method === "DELETE") {
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    if (path === "/preferences" || path === "/account/preferences") {
       if (method === "PATCH") {
         await json(route, { auto_summary_enabled: Boolean(bodyRecord(body).auto_summary_enabled), default_start_mode: "blank", preferences_version: 2, updated_at: now });
       } else {
@@ -420,7 +470,78 @@ export async function mockStoryApi(
       await json(route, { providers: [clone(provider)] });
       return;
     }
+    if (parts[0] === "memory-runs" && parts[1]) {
+      if (parts[2] === "events" && method === "GET") {
+        const run = memoryRun || {
+          id: parts[1],
+          project_id: "project-1",
+          scope: "project",
+          status: "running",
+          stage: "project:compose",
+          progress: 48,
+          phase_label: "正在编排 6000–8000 字全书记忆",
+        };
+        await route.fulfill({
+          status: 200,
+          contentType: "text/event-stream",
+          headers: { "cache-control": "no-cache", connection: "keep-alive" },
+          body: `event: progress\ndata: ${JSON.stringify(run)}\n\n`,
+        });
+        return;
+      }
+      if (method === "GET") {
+        await json(route, memoryRun || { id: parts[1], status: "running", progress: 48 });
+        return;
+      }
+    }
+    if (path === "/providers" && method === "POST") {
+      const input = bodyRecord(body);
+      provider = {
+        ...provider,
+        ...input,
+        id: "provider-created",
+        enabled: true,
+        is_default: false,
+        api_key_set: Boolean(input.api_key),
+      };
+      await json(route, clone(provider), 201);
+      return;
+    }
+    if (path === "/providers/test" && method === "POST") {
+      const input = bodyRecord(body);
+      await json(route, { ok: true, model: input.default_model || "mock-model" });
+      return;
+    }
     if (path === "/providers/default" && method === "GET") {
+      await json(route, clone(provider));
+      return;
+    }
+    if (
+      parts[0] === "providers" &&
+      parts.length === 3 &&
+      parts[2] === "test" &&
+      method === "POST"
+    ) {
+      await json(route, { ok: true, model: provider.default_model || "mock-model" });
+      return;
+    }
+    if (
+      parts[0] === "providers" &&
+      parts.length === 3 &&
+      parts[2] === "key" &&
+      method === "DELETE"
+    ) {
+      provider = { ...provider, api_key_set: false };
+      await route.fulfill({ status: 204 });
+      return;
+    }
+    if (
+      parts[0] === "providers" &&
+      parts.length === 3 &&
+      parts[2] === "default" &&
+      method === "PUT"
+    ) {
+      provider = { ...provider, is_default: true };
       await json(route, clone(provider));
       return;
     }
@@ -435,6 +556,10 @@ export async function mockStoryApi(
             : provider.capabilities,
       };
       await json(route, clone(provider));
+      return;
+    }
+    if (parts[0] === "providers" && parts.length === 2 && method === "DELETE") {
+      await route.fulfill({ status: 204 });
       return;
     }
     if (path === "/projects" && method === "GET") {
@@ -498,6 +623,42 @@ export async function mockStoryApi(
           await json(route, chapter, 201);
           return;
         }
+      }
+      if (parts[2] === "import" && parts[3] === "preview" && method === "POST") {
+        await json(route, {
+          file_name: "旧稿.txt",
+          file_hash: "mock-import-hash",
+          source_hash: "mock-import-hash",
+          encoding: "UTF-8",
+          warnings: [],
+          chapters: [
+            {
+              key: "import-1",
+              number: 1,
+              title: "第一章 · 旧港",
+              content: "潮声漫过旧港。",
+              selected: true,
+              source_start: 0,
+              source_end: 8,
+            },
+          ],
+        });
+        return;
+      }
+      if (parts[2] === "import" && parts[3] === "commit" && method === "POST") {
+        const input = bodyRecord(body);
+        const rows = Array.isArray(input.chapters) ? input.chapters : [];
+        const imported = rows.map((row, index) => {
+          const item = bodyRecord(row);
+          return makeChapter(
+            projectId,
+            `${projectId}-import-${index + 1}`,
+            String(item.title || `导入章节 ${index + 1}`),
+          );
+        });
+        data.chapters.push(...imported);
+        await json(route, { chapters: imported }, 201);
+        return;
       }
       if (parts[2] === "canon" && method === "GET") {
         await json(route, { canon_items: clone(data.canon) });
@@ -597,7 +758,15 @@ export async function mockStoryApi(
         }
         if (assistantPart === "conversations" && parts.length === 4 && method === "POST") {
           const input = bodyRecord(body);
-          data.conversation = { id: "assistant-1", project_id: projectId, target: input.target || { type: "project", id: projectId }, title: String(input.title || "故事设定助手"), status: "idle", version: 1 };
+          data.conversation = {
+            id: "assistant-1",
+            project_id: projectId,
+            target: input.target || { type: "project", id: projectId },
+            title: String(input.title || "新的写作对话"),
+            purpose: String(input.purpose || "chapter"),
+            status: "idle",
+            version: 1,
+          };
           data.messages = [];
           data.proposals = [];
           await json(route, assistantConversation(data, projectId), 201);
@@ -617,7 +786,7 @@ export async function mockStoryApi(
             const input = bodyRecord(body);
             const content = String(input.content || "");
             const target = input.target || data.conversation?.target || { type: "project", id: projectId };
-            const configuredProposals = options.assistantProposals?.length
+            const configuredProposals = options.assistantProposals
               ? options.assistantProposals
               : options.assistantProposal
                 ? [options.assistantProposal]
@@ -638,19 +807,93 @@ export async function mockStoryApi(
               created_at: now,
             }));
             const proposalIds = data.proposals.map((proposal) => String(proposal.id));
-            const userMessage = { id: "user-message-1", role: "user", content, target, context_snapshot: input.context_snapshot || {}, authorized_asset_ids: input.authorized_asset_ids || [], proposal_ids: proposalIds, created_at: now };
-            const assistantMessage = { id: "assistant-message-1", role: "assistant", content: "已整理人物设定。", proposal_ids: proposalIds, created_at: now };
-            data.messages = [userMessage, assistantMessage];
-            await json(route, { message: userMessage, run: { id: "assistant-run-1", status: "running" } }, 202);
+            const turn = data.messages.filter((item) => item.role === "user").length + 1;
+            const userMessage = { id: `user-message-${turn}`, role: "user", content, target, context_snapshot: input.context_snapshot || {}, authorized_asset_ids: input.authorized_asset_ids || [], proposal_ids: proposalIds, created_at: now };
+            const assistantMessage = { id: `assistant-message-${turn}`, role: "assistant", content: "已整理人物设定。", proposal_ids: proposalIds, created_at: now };
+            data.messages = [...data.messages, userMessage, assistantMessage];
+            if (data.conversation) {
+              if (["故事设定助手", "新的写作对话"].includes(String(data.conversation.title || ""))) {
+                data.conversation.title = content.length > 22 ? `${content.slice(0, 22)}…` : content;
+              }
+              data.conversation.version = Number(data.conversation.version || 1) + 1;
+            }
+            await json(route, {
+              conversation: assistantConversation(data, projectId),
+              message: userMessage,
+              run: { id: `assistant-run-${turn}`, status: "running", stage: "streaming" },
+            }, 202);
+            return;
+          }
+          if (parts[5] === "runs" && parts.length === 6 && method === "GET") {
+            const turn = data.messages.filter((item) => item.role === "user").length;
+            const cancelled = data.conversation?.run_cancelled === true;
+            await json(route, {
+              runs: turn
+                ? [{ id: `assistant-run-${turn}`, status: cancelled ? "cancelled" : "completed", stage: cancelled ? "cancelled" : "completed" }]
+                : [],
+            });
+            return;
+          }
+          if (parts[5] === "runs" && parts[7] === "cancel" && method === "POST") {
+            if (data.conversation) data.conversation.run_cancelled = true;
+            await json(route, {
+              id: parts[6],
+              project_id: projectId,
+              conversation_id: conversationId,
+              status: "cancelled",
+              stage: "cancelled",
+            });
             return;
           }
           if (parts[5] === "events" && parts[6] === "stream" && method === "GET") {
-            await assistantEvents(route, data, options.assistantEventDelayMs);
+            await assistantEvents(
+              route,
+              data,
+              options.assistantEventDelayMs,
+              options.assistantHoldRun,
+            );
             return;
           }
         }
         if (assistantPart === "proposals" && parts.length === 4 && method === "GET") {
           await json(route, { proposals: clone(data.proposals) });
+          return;
+        }
+        if (
+          assistantPart === "proposals" &&
+          parts.length === 5 &&
+          method === "POST" &&
+          ["apply-batch", "reject-batch"].includes(parts[4])
+        ) {
+          const proposalIds = Array.isArray(bodyRecord(body).proposal_ids)
+            ? (bodyRecord(body).proposal_ids as unknown[]).map(String)
+            : [];
+          const nextStatus = parts[4] === "apply-batch" ? "applied" : "rejected";
+          const changed = data.proposals.filter((proposal) =>
+            proposalIds.includes(String(proposal.id)),
+          );
+          changed.forEach((proposal) => {
+            proposal.status = nextStatus;
+          });
+          if (
+            nextStatus === "applied" &&
+            String(data.conversation?.purpose || "") === "global"
+          ) {
+            memoryRun = {
+              id: `memory-global-${projectId}`,
+              project_id: projectId,
+              scope: "project",
+              status: "running",
+              stage: "project:compose",
+              progress: 48,
+              phase_label: "正在编排 6000–8000 字全书记忆",
+            };
+          }
+          await json(route, {
+            status: nextStatus,
+            proposals: clone(changed),
+            memory_run: memoryRun ? clone(memoryRun) : null,
+          });
           return;
         }
         if (assistantPart === "proposals" && parts.length === 5 && method === "PATCH") {

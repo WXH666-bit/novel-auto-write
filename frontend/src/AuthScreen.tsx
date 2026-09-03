@@ -354,13 +354,13 @@ export default function AuthScreen({
         <div className="auth-manuscript-copy">
           <p className="eyebrow">正文 · 人物 · 情节 · 仅你可见</p>
           <h1>让每一章，<em>有来处。</em></h1>
-          <p>从人物第一次出现，到一条尚未回收的线索，所有已确认的事实都会留下来源。你拒绝的草稿，不会偷偷改写故事。</p>
+          <p>从人物第一次出现，到一条尚未回收的线索，Agent 会沿着章节与全书记忆持续协作，改动始终有迹可循。</p>
         </div>
         <div className="auth-timeline">
           <div className="auth-timeline-line" />
           <div className="auth-timeline-item"><i /> <span>{verificationRequired ? "邮箱验证" : "账号密码"}</span><small>{verificationRequired ? "确认这本手稿属于你" : "按部署方式保护工作区"}</small></div>
           <div className="auth-timeline-item"><i /> <span>添加 Provider</span><small>模型密钥只进你的凭据库</small></div>
-          <div className="auth-timeline-item"><i /> <span>确认建议</span><small>只有接受的内容才用于后续写作</small></div>
+          <div className="auth-timeline-item"><i /> <span>分层协作</span><small>当前章自动保存，跨章改动集中校样</small></div>
         </div>
         <span className="auth-page-mark">写作 / 资料</span>
       </div>

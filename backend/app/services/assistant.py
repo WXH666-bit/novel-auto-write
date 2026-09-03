@@ -42,7 +42,6 @@ from ..models import (
     Project,
     Proposal,
     ProviderProfile,
-    ReviewBundle,
     StoryGraphEdge,
     StoryGraphNode,
     User,
@@ -59,8 +58,13 @@ except ImportError:  # pragma: no cover - exercised in minimal deployments
 
 logger = logging.getLogger(__name__)
 
-ASSISTANT_PROMPT_VERSION = "assistant-setup-v1"
-MAX_CONTEXT_MESSAGES = 30
+ASSISTANT_PROMPT_VERSION = "assistant-continuous-v3"
+# Keep the latest turns verbatim and compact the earlier ones into a durable
+# conversation notebook.  This mirrors a long-running agent: old decisions do
+# not abruptly disappear just because the provider context window is finite.
+MAX_CONTEXT_MESSAGES = 48
+RECENT_CONTEXT_MESSAGES = 18
+MAX_CONVERSATION_MEMORY_CHARS = 6_000
 AGENT_LEASE_TTL = timedelta(minutes=10)
 AGENT_LEASE_HEARTBEAT_SECONDS = 30.0
 # Provider chunks are intentionally coalesced before they become durable
@@ -269,7 +273,7 @@ ASSISTANT_SCHEMA: dict[str, Any] = {
 }
 
 ASSISTANT_EXTRACTION_INSTRUCTION = (
-    "把上一条回复中用户明确要求的新建或修改整理成待审核提案。"
+    "把上一条回复中用户明确要求的新建或修改整理成可自动执行的结构化变更。"
     "只返回一个 JSON 对象，形状必须是 "
     '{"reply":"","proposals":[{"operation":"create_character",'
     '"target_type":"character","target_id":null,"patch":{},"reason":""}]}。'
@@ -278,13 +282,14 @@ ASSISTANT_EXTRACTION_INSTRUCTION = (
     "人物关系必须单独输出 upsert_graph_edge，target_type=character_relation，"
     "patch 至少包含 source_name、target_name、relation_type，可带 label。"
     "如果回复里有两个人物和一条关系，就必须输出三条独立提案，不能把关系埋在人物背景里。"
-    "章节修改使用 edit_chapter 或 edit_chapter_selection；全局故事设定使用 "
+    "章节修改统一使用 edit_chapter；跨章节请求按章节顺序输出多条提案，"
+    "target_id 使用上下文来源中的章节 id，replacement 必须是修改后的完整章节正文。全局故事设定使用 "
     "update_project_settings。只有确实没有任何具体变更时 proposals 才能为空。"
     "不要 Markdown、YAML、解释文字，也不要使用 create_setting_entry 或 replace。"
 )
 
 ASSISTANT_LIVE_EXTRACTION_INSTRUCTION = (
-    "把上一条回复中用户明确要求的新建或修改整理成待审核提案，并使用 JSONL 逐行输出。"
+    "把上一条回复中用户明确要求的新建或修改整理成可自动执行的结构化变更，并使用 JSONL 逐行输出。"
     "不要输出 Markdown 围栏、数组、说明文字或空行。每个提案先输出一行 "
     '{"event":"proposal_start","key":"p1","operation":"create_character",'
     '"target_type":"character","target_id":null,"reason":"新增人物"}，'
@@ -293,7 +298,8 @@ ASSISTANT_LIVE_EXTRACTION_INSTRUCTION = (
     '完成该提案后输出 {"event":"proposal_end","key":"p1"}。'
     "人物字段必须先输出 name；人物关系必须作为独立 upsert_graph_edge 提案，"
     "并依次输出 source_name、target_name、relation_type，可再输出 label。"
-    "章节修改使用 edit_chapter 或 edit_chapter_selection；全局故事设定使用 "
+    "章节修改统一使用 edit_chapter；跨章节请求按章节顺序输出多条提案，"
+    "target_id 使用上下文来源中的章节 id，replacement 必须是修改后的完整章节正文。全局故事设定使用 "
     "update_project_settings。key 在同一次回复中必须唯一。没有具体变更时不要输出任何内容。"
 )
 
@@ -370,6 +376,72 @@ def create_conversation(
     db.commit()
     db.refresh(conversation)
     return conversation
+
+
+def conversation_title_from_content(content: str) -> str:
+    """Create a quiet, useful history label from the first user instruction."""
+
+    clean = re.sub(r"\s+", " ", str(content or "")).strip()
+    clean = clean.lstrip("#*-：:，,。.!！？? ")
+    if not clean:
+        return "新的写作对话"
+    # Prefer a complete opening phrase, while keeping the history rail compact.
+    opening = re.split(r"[。！？!?\n]", clean, maxsplit=1)[0].strip() or clean
+    return opening if len(opening) <= 22 else f"{opening[:22].rstrip()}…"
+
+
+def _conversation_context_rows(
+    db: Session,
+    conversation: AgentConversation,
+) -> tuple[list[AgentMessage], str]:
+    """Return recent verbatim turns plus a durable compact notebook.
+
+    The notebook is intentionally extractive rather than another model call:
+    it is deterministic, cheap, tenant-local, and remains available after a
+    restart. Confirmed story facts continue to come from ``build_context``;
+    this text only preserves conversational intent and decisions.
+    """
+
+    rows = db.scalars(
+        select(AgentMessage)
+        .where(
+            AgentMessage.conversation_id == conversation.id,
+            AgentMessage.status == "completed",
+        )
+        .order_by(AgentMessage.sequence.desc())
+        .limit(MAX_CONTEXT_MESSAGES)
+    ).all()
+    rows.reverse()
+    if len(rows) <= RECENT_CONTEXT_MESSAGES:
+        return rows, str((conversation.context_snapshot or {}).get("conversation_memory") or "")
+
+    older = rows[:-RECENT_CONTEXT_MESSAGES]
+    recent = rows[-RECENT_CONTEXT_MESSAGES:]
+    snapshot = dict(conversation.context_snapshot or {})
+    try:
+        remembered_through = int(snapshot.get("memory_through_sequence") or 0)
+    except (TypeError, ValueError):
+        remembered_through = 0
+    additions = [row for row in older if int(row.sequence) > remembered_through]
+    memory = str(snapshot.get("conversation_memory") or "").strip()
+    if additions:
+        lines = []
+        for row in additions:
+            role = "用户" if row.role == "user" else "Agent"
+            compact = re.sub(r"\s+", " ", row.content or "").strip()
+            if compact:
+                lines.append(f"{role}：{compact[:420]}")
+        memory = "\n".join(part for part in (memory, *lines) if part)
+        if len(memory) > MAX_CONVERSATION_MEMORY_CHARS:
+            memory = "…较早对话已压缩…\n" + memory[-(MAX_CONVERSATION_MEMORY_CHARS - 12) :]
+        snapshot.update(
+            {
+                "conversation_memory": memory,
+                "memory_through_sequence": int(older[-1].sequence),
+            }
+        )
+        conversation.context_snapshot = snapshot
+    return recent, memory
 
 
 def next_message_sequence(db: Session, conversation_id: str) -> int:
@@ -757,6 +829,18 @@ def _create_message_run(
         if message.content != content:
             raise ValueError("幂等键已用于另一条助手消息")
         return message, existing, False
+    has_user_turn = db.scalar(
+        select(func.count(AgentMessage.id)).where(
+            AgentMessage.conversation_id == conversation.id,
+            AgentMessage.role == "user",
+        )
+    )
+    if not has_user_turn and conversation.title in {
+        "故事设定助手",
+        "和 Agent 一起写",
+        "新的写作对话",
+    }:
+        conversation.title = conversation_title_from_content(content)
     message = AgentMessage(
         project_id=conversation.project_id,
         conversation_id=conversation.id,
@@ -827,6 +911,94 @@ def _create_message_run(
     db.refresh(message)
     db.refresh(run)
     return message, run, True
+
+
+def cancel_assistant_run(
+    db: Session,
+    conversation: AgentConversation,
+    run: AgentRun,
+    user: User,
+) -> AgentRun:
+    """Cooperatively stop a queued or running assistant execution.
+
+    Clearing the durable job lease fences the provider callback immediately;
+    its next chunk/final write observes ``AgentLeaseLost`` and cannot overwrite
+    the cancelled state. Any prose already streamed remains inspectable as an
+    incomplete turn, just like a stopped Codex task.
+    """
+
+    db.scalar(select(Project.id).where(Project.id == conversation.project_id).with_for_update())
+    locked_run = db.scalar(
+        select(AgentRun)
+        .where(
+            AgentRun.id == run.id,
+            AgentRun.conversation_id == conversation.id,
+        )
+        .with_for_update()
+    )
+    if locked_run is None:
+        raise LookupError("助手运行不存在")
+    if locked_run.status == "cancelled":
+        return locked_run
+    if locked_run.status in {"completed", "failed"}:
+        raise ValueError("当前助手运行已经结束")
+    if locked_run.status not in {"queued", "running", "needs_retry"}:
+        raise ValueError("当前助手运行不能停止")
+
+    locked_run.status = "cancelled"
+    locked_run.stage = "cancelled"
+    locked_run.error = None
+    locked_run.finished_at = utcnow()
+    assistant_rows = db.scalars(
+        select(AgentMessage).where(
+            AgentMessage.run_id == locked_run.id,
+            AgentMessage.role == "assistant",
+            AgentMessage.status == "streaming",
+        )
+    ).all()
+    for message in assistant_rows:
+        message.status = "partial" if message.content.strip() else "cancelled"
+        message.metadata_json = {
+            **(message.metadata_json or {}),
+            "stopped_by_user": True,
+        }
+    job = db.scalar(
+        select(Job)
+        .where(Job.resource_id == locked_run.id, Job.kind == "assistant")
+        .with_for_update()
+    )
+    if job is not None:
+        job.state = "cancelled"
+        job.current_stage = "cancelled"
+        job.last_error = None
+        job.lease_owner = None
+        job.lease_expires_at = None
+    add_event(
+        db,
+        conversation,
+        "run.cancelled",
+        {
+            "run_id": locked_run.id,
+            "status": "cancelled",
+            "stage": "cancelled",
+            "message": "已停止本次任务，已生成的内容仍保留在对话中。",
+        },
+        run_id=locked_run.id,
+    )
+    conversation.version += 1
+    db.add(
+        AuditLog(
+            project_id=conversation.project_id,
+            actor_user_id=user.id,
+            actor=user.username or user.email or user.id,
+            action="assistant.run_cancelled",
+            entity_type="agent_run",
+            entity_id=locked_run.id,
+        )
+    )
+    db.commit()
+    db.refresh(locked_run)
+    return locked_run
 
 
 def _assistant_messages(db: Session, conversation_id: str) -> list[dict[str, Any]]:
@@ -903,16 +1075,7 @@ def _provider_messages(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Build model context and attach only explicitly authorised image blocks."""
 
-    rows = db.scalars(
-        select(AgentMessage)
-        .where(
-            AgentMessage.conversation_id == conversation.id,
-            AgentMessage.status == "completed",
-        )
-        .order_by(AgentMessage.sequence.desc())
-        .limit(MAX_CONTEXT_MESSAGES)
-    ).all()
-    rows.reverse()
+    rows, conversation_memory = _conversation_context_rows(db, conversation)
     current = db.get(AgentMessage, run.message_id) if run.message_id else None
     asset_ids = list(current.authorized_asset_ids or []) if current is not None else []
     image_urls = _authorised_image_urls(db, project, user, profile, asset_ids)
@@ -1015,12 +1178,21 @@ def _provider_messages(
             )
     from .context import build_context
 
+    conversation_mode = (
+        "global"
+        if str(conversation.purpose or "").lower() in {"global", "global_story", "setup_global"}
+        else "chapter"
+    )
+    authoritative_context["agent_mode"] = conversation_mode
     server_context = build_context(
         db,
         project,
         chapter,
         budget=getattr(profile, "context_length", None),
         query=(current.content[:500] if current is not None else ""),
+        recent_chapter_content_count=10 if conversation_mode == "chapter" else 2,
+        include_change_overlay=True,
+        include_search_chapter_bodies=conversation_mode == "global",
     )
     run.input_snapshot = {
         **(run.input_snapshot or {}),
@@ -1032,29 +1204,68 @@ def _provider_messages(
             "token_count": server_context.get("token_count", 0),
         },
     }
-    turn_prompt = (
-        "这是本次对话的首轮回复：请先用普通、自然的中文回答用户，"
-        "禁止输出 JSON、YAML、Markdown 代码围栏、XML 标签或工具调用格式；"
-        "不要在普通回复末尾打印 proposals:/changes:；"
-        "如需变更，只在独立的结构化提取步骤中返回 proposals。"
-        if not any(row.role == "assistant" for row in rows)
-        else "回复仍应以清晰的普通中文为主，不要把结构化 JSON 或代码围栏直接展示给用户。"
+    chapter_write_requested = (
+        authoritative_context.get("agent_write_intent") is True and chapter is not None
     )
+    if chapter_write_requested:
+        turn_prompt = (
+            "本轮用户明确要求创作或续写当前章节。你的回复只能包含可直接写入稿纸的小说正文，"
+            "从场景、动作或叙事本身开始；禁止写完成说明、创作总结、提纲、字数汇报、"
+            "寒暄或‘下面是正文’之类的引导语。不要输出 JSON、YAML、Markdown 代码围栏、"
+            "XML 标签或工具调用格式。结合已确认的故事上下文写完整、连贯的文学正文。"
+        )
+    elif conversation_mode == "global":
+        turn_prompt = (
+            "这是全书协作会话。先结合稳定版全书摘要与摘要之后的最新变更账本理解用户意图，"
+            "再检索受影响章节。需要改动多个章节时，可以在同一轮生成多个 edit_chapter 提案；"
+            "必须按照章节顺序输出，每个 replacement 都必须是该章修改后的完整正文，而不是工作说明或局部摘录。"
+            "这些跨章节改动会先进入全书 Diff，未经作者整批接受不得声称已经生效。"
+            "普通回复应说明将影响哪些章节以及处理顺序，不要输出 JSON、YAML 或代码围栏。"
+        )
+    else:
+        turn_prompt = (
+            "这是本次对话的首轮回复：请先用普通、自然的中文回答用户，"
+            "禁止输出 JSON、YAML、Markdown 代码围栏、XML 标签或工具调用格式；"
+            "不要在普通回复末尾打印 proposals:/changes:；"
+            "如需变更，只在独立的结构化提取步骤中返回 proposals。"
+            if not any(row.role == "assistant" for row in rows)
+            else "回复仍应以清晰的普通中文为主，不要把结构化 JSON 或代码围栏直接展示给用户。"
+        )
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
             "content": (
-                "你是小说设定助手。请理解用户意图，并只提出可审核的结构化变更。"
-                "不要声称已经写入数据库。保持回复简洁，proposals 只使用允许的操作。"
+                (
+                    "你是小说正文写作智能体。先完成本章可直接发表前继续打磨的正文。"
+                    if chapter_write_requested
+                    else "你是小说设定助手。请理解用户意图，并提出准确的结构化变更。"
+                )
+                + ("" if chapter_write_requested else "不要声称已经写入数据库。保持回复简洁，proposals 只使用允许的操作。")
                 + turn_prompt
-                + "若目标是章节正文，单次只能修改一个章节或一个连续选区，"
+                + (
+                    "若目标是章节正文，可以按章节顺序修改多个章节，"
+                    if conversation_mode == "global"
+                    else "若目标是章节正文，单次只能修改当前章节，"
+                )
                 + "必须在 patch 中保留 base_revision_id、base_content_hash、"
                 + "selection_start、selection_end、selection_hash，并用 replacement 表示替换文本。"
+                + "当前选区不是可用工作模式；replacement 必须是完整章节正文。"
                 + "若服务器标记 empty_chapter_baseline=true，必须按整章空白基线生成 replacement，"
                 + "不要伪造 revision_id、选区范围或 hash。"
             ),
         }
     ]
+    if conversation_memory:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "以下是本会话较早轮次的压缩协作记录。它只用于保持称谓、意图和已讨论决定的连续性；"
+                    "若与当前数据库中已确认的故事资料冲突，以数据库资料和用户最新指令为准：\n"
+                    + conversation_memory
+                ),
+            }
+        )
     if server_context.get("text"):
         messages.append(
             {
@@ -2279,12 +2490,91 @@ def _normalise_provider_output(
     return reply[:100_000], proposals
 
 
+_CHAPTER_META_REPLY = re.compile(
+    r"^(?:好的[，。！]|可以[，。！]|当然[，。！]|我(?:会|将|已经)|已(?:经|按|为|将)|"
+    r"下面(?:是|给出)|以下(?:是|为)|根据.{0,40}(?:完成|撰写)|按照.{0,40}(?:完成|撰写))",
+    re.IGNORECASE,
+)
+
+
+def _chapter_reply_is_work_report(value: str) -> bool:
+    """Detect a model's work report before it can become manuscript prose."""
+
+    content = str(value or "").strip()
+    if not content:
+        return True
+    opening = content[:500]
+    if _CHAPTER_META_REPLY.search(opening):
+        return True
+    return len(content) < 900 and any(
+        phrase in opening
+        for phrase in (
+            "符合开篇",
+            "符合定位",
+            "保留原意",
+            "核心设定",
+            "完成第一章",
+            "完成本章",
+            "章节草稿如下",
+        )
+    )
+
+
+def _chapter_reply_fallback(
+    reply: str,
+    *,
+    target: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Turn an explicitly requested chapter-writing reply into a safe draft.
+
+    Some providers produce good prose but return no structured extraction.
+    The client marks only genuine write/rewrite requests, and the server still
+    pins the resulting proposal to its authoritative chapter baseline through
+    the ordinary normaliser.  Advice and critique therefore remain chat-only.
+    """
+
+    authoritative = context if isinstance(context, dict) else {}
+    target_value = target if isinstance(target, dict) else {}
+    chapter_id = (
+        _context_value(authoritative, "chapter_id")
+        or target_value.get("chapter_id")
+        or (
+            target_value.get("id")
+            if str(target_value.get("type") or "").lower() == "chapter"
+            else None
+        )
+    )
+    content = str(reply or "").strip()
+    if authoritative.get("agent_write_intent") is not True or not chapter_id or not content:
+        return []
+    return _normalise_proposal_item(
+        {
+            "operation": "edit_chapter",
+            "target_type": "chapter",
+            "target_id": str(chapter_id),
+            "patch": {"replacement": content},
+            "reason": "写入 Agent 生成的章节草稿",
+        },
+        target=target_value,
+        context=authoritative,
+    )
+
+
 def _proposal_scope_chapter_id(
     db: Session,
     project: Project,
     item: dict[str, Any],
 ) -> str | None:
-    value = item.get("scope_chapter_id") or project.current_chapter_id
+    value = (
+        item.get("scope_chapter_id")
+        or (
+            item.get("target_id")
+            if item.get("operation") in {"edit_chapter", "edit_chapter_selection"}
+            else None
+        )
+        or project.current_chapter_id
+    )
     if not value:
         return None
     chapter_id = str(value)
@@ -2296,6 +2586,89 @@ def _proposal_scope_chapter_id(
     ) is None:
         raise ValueError("提案关联的章节不存在或不属于当前项目")
     return chapter_id
+
+
+def _authorise_chapter_proposal(
+    db: Session,
+    project: Project,
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    """Pin an Agent chapter edit to a server-owned whole-document baseline.
+
+    A global Agent may discover a chapter by UUID, number, or title.  The
+    provider is allowed to choose *which* in-project chapter it proposes to
+    change, but it is never trusted to choose the revision/hash/range used by
+    CAS.  The Diff therefore always represents a complete, replayable chapter
+    replacement and batch acceptance cannot accidentally overwrite a newer
+    draft.
+    """
+
+    if item.get("operation") not in {"edit_chapter", "edit_chapter_selection"}:
+        return item
+    patch = dict(item.get("patch") or {})
+    chapter_id = str(item.get("target_id") or patch.get("chapter_id") or "")
+    chapter: Chapter | None = None
+    if chapter_id:
+        chapter = db.scalar(
+            select(Chapter).where(
+                Chapter.id == chapter_id,
+                Chapter.project_id == project.id,
+            )
+        )
+    if chapter is None and patch.get("chapter_number") not in (None, ""):
+        try:
+            chapter_number = int(patch["chapter_number"])
+        except (TypeError, ValueError):
+            chapter_number = -1
+        chapter = db.scalar(
+            select(Chapter).where(
+                Chapter.project_id == project.id,
+                Chapter.chapter_number == chapter_number,
+            )
+        )
+    if chapter is None and str(patch.get("chapter_title") or "").strip():
+        chapter = db.scalar(
+            select(Chapter).where(
+                Chapter.project_id == project.id,
+                Chapter.title == str(patch["chapter_title"]).strip(),
+            )
+        )
+    if chapter is None:
+        raise ValueError("正文提案没有指向当前项目中的有效章节")
+    replacement = patch.get("replacement")
+    if replacement is None:
+        replacement = patch.get("new_content", patch.get("content"))
+    if not isinstance(replacement, str) or not replacement.strip():
+        raise ValueError("正文提案必须包含修改后的完整章节正文")
+    revision = (
+        db.scalar(
+            select(ChapterRevision).where(
+                ChapterRevision.id == chapter.current_revision_id,
+                ChapterRevision.chapter_id == chapter.id,
+            )
+        )
+        if chapter.current_revision_id
+        else None
+    )
+    base_content = revision.content if revision is not None else ""
+    base_hash = _hash_text(base_content)
+    authorised = dict(item)
+    authorised["operation"] = "edit_chapter"
+    authorised["target_type"] = "chapter"
+    authorised["target_id"] = chapter.id
+    authorised["scope_chapter_id"] = chapter.id
+    authorised["patch"] = {
+        **patch,
+        "chapter_id": chapter.id,
+        "base_revision_id": revision.id if revision is not None else None,
+        "base_content_hash": base_hash,
+        "selection_start": 0,
+        "selection_end": len(base_content),
+        "selection_hash": base_hash,
+        "replacement": replacement,
+        **({"empty_chapter_baseline": True} if revision is None else {}),
+    }
+    return authorised
 
 
 def _proposal_base_version(
@@ -2484,7 +2857,11 @@ class _LiveProposalWriter:
         )
         if not normalised or not _live_proposal_is_complete(normalised[0]):
             return
-        item = normalised[0]
+        item = _authorise_chapter_proposal(
+            self.db,
+            self.project,
+            normalised[0],
+        )
         proposal = self.rows.get(key)
         if proposal is None:
             change_set = self._ensure_change_set()
@@ -2672,7 +3049,8 @@ def _make_proposals(
     db.add(change_set)
     db.flush()
     result: list[Proposal] = []
-    for item in proposals:
+    for raw_item in proposals:
+        item = _authorise_chapter_proposal(db, project, raw_item)
         target_id = item.get("target_id")
         base_version = _proposal_base_version(db, project, item)
         proposal = Proposal(
@@ -3079,6 +3457,41 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
             )
             reply = _plain_reply(completion_content)
 
+        chapter_write_requested = (
+            authoritative_context.get("agent_write_intent") is True
+            and bool(authoritative_context.get("chapter_id"))
+        )
+        if chapter_write_requested and _chapter_reply_is_work_report(reply):
+            # A few gateways ignore the specialised chapter-writing system
+            # prompt and answer with a status report.  Run one narrow repair
+            # turn and keep that prose separate from the conversational
+            # acknowledgement so a report can never become manuscript text.
+            correction_messages = [
+                *messages,
+                {"role": "assistant", "content": reply},
+                {
+                    "role": "user",
+                    "content": (
+                        "上一条是工作说明，不是小说正文。现在只输出可直接写入当前章节的完整小说正文。"
+                        "从故事场景本身开始，不要标题、说明、总结、提纲、字数或任何前后引导语。"
+                    ),
+                },
+            ]
+            corrected_response = _run_async(
+                provider.complete(correction_messages, role="assistant", temperature=0.55)
+            )
+            corrected_content = (
+                corrected_response
+                if isinstance(corrected_response, str)
+                else getattr(corrected_response, "content", "")
+            )
+            corrected_reply = _plain_reply(corrected_content)
+            if corrected_reply and not _chapter_reply_is_work_report(corrected_reply):
+                reply = corrected_reply
+                response = corrected_response
+            else:
+                raise ProviderError("模型没有返回可写入稿纸的小说正文，请重试本次写作。")
+
         # The extraction call has its own transport. Its JSONL protocol is
         # persisted field by field, so character cards and chapter graph
         # drafts change while the model is still producing them. Providers
@@ -3174,6 +3587,30 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
             # preview events. Never duplicate them through legacy parsing of
             # the visible assistant reply.
             proposal_values = []
+        chapter_body_reply = reply
+        has_chapter_draft = any(
+            str(item.get("operation") or "")
+            in {"edit_chapter", "edit_chapter_selection"}
+            for item in proposal_values
+        ) or any(
+            proposal.operation in {"edit_chapter", "edit_chapter_selection"}
+            for proposal in live_proposals
+        )
+        if not has_chapter_draft:
+            proposal_values.extend(
+                _chapter_reply_fallback(
+                    chapter_body_reply,
+                    target=target_context,
+                    context=authoritative_context,
+                )
+            )
+            has_chapter_draft = any(
+                str(item.get("operation") or "")
+                in {"edit_chapter", "edit_chapter_selection"}
+                for item in proposal_values
+            )
+        if chapter_write_requested and has_chapter_draft:
+            reply = f"本章正文已写入当前稿纸，共 {len(chapter_body_reply)} 字，并会自动保存。"
         reply = reply[:100_000]
         previous_content = assistant_message.content
         assistant_message.content = reply
@@ -3201,14 +3638,17 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                 },
                 run_id=run.id,
             )
-        persisted_proposals = live_proposals or _make_proposals(
-            db,
-            conversation,
-            run,
-            project,
-            user,
-            proposal_values,
-        )
+        persisted_proposals = [
+            *live_proposals,
+            *_make_proposals(
+                db,
+                conversation,
+                run,
+                project,
+                user,
+                proposal_values,
+            ),
+        ]
         _assert_agent_lease(db, run.id, lease_owner)
         _stop_agent_lease_heartbeat(heartbeat)
         heartbeat = None
@@ -3703,12 +4143,13 @@ def _patch_int(patch: dict[str, Any], *names: str, default: int | None = None) -
 
 def _apply_chapter_edit(
     db: Session, project: Project, user: User, proposal: Proposal
-) -> tuple[ReviewBundle, int | None]:
-    """Apply an assistant's immutable chapter/selection edit as a review draft.
+) -> tuple[ChapterRevision, int | None]:
+    """Apply an assistant's immutable chapter/selection edit as a saved draft.
 
     The assistant is never allowed to mutate a confirmed revision in place.
     Every edit names the exact base revision and hashes the selected source
     text; a concurrent edit therefore becomes an explicit 409 at the router.
+    The author performs the only explicit gate by clicking ``完成本章``.
     """
 
     patch = dict(proposal.patch_json or {})
@@ -3844,39 +4285,17 @@ def _apply_chapter_edit(
     db.add(revision)
     db.flush()
     chapter.current_revision_id = revision.id
-    chapter.status = "needs_review"
-    chapter.summary_status = "needs_review"
-    bundle = ReviewBundle(
-        project_id=project.id,
-        chapter_id=chapter.id,
-        generation_run_id=None,
-        base_canon_version=int(project.canon_version or 0),
-        base_memory_epoch=int(project.memory_epoch or 0),
-        status="pending",
-        draft_revision_id=revision.id,
-        canon_changes=[],
-        summary_candidate=None,
-        structured_candidates={},
-        audit_issues=[],
-        source_context=[
-            {
-                "source": "assistant",
-                "proposal_id": str(proposal.id),
-                "base_revision_id": base_revision.id if base_revision is not None else None,
-                "empty_chapter_baseline": empty_baseline,
-            }
-        ],
-    )
-    db.add(bundle)
-    db.flush()
+    chapter.status = "draft"
+    chapter.summary_status = "unprocessed"
+    chapter.confirmed_at = None
     db.add(
         AuditLog(
             project_id=project.id,
             actor_user_id=user.id,
             actor=user.username or user.email or user.id,
-            action="assistant.chapter_edit_created",
-            entity_type="review_bundle",
-            entity_id=bundle.id,
+            action="assistant.chapter_draft_written",
+            entity_type="chapter_revision",
+            entity_id=revision.id,
             after_json={
                 "chapter_id": chapter.id,
                 "draft_revision_id": revision.id,
@@ -3885,7 +4304,7 @@ def _apply_chapter_edit(
             },
         )
     )
-    return bundle, None
+    return revision, None
 
 
 _PROPOSAL_EDITABLE_STATUSES = {"pending", "proposed"}
@@ -4418,9 +4837,8 @@ def apply_proposal(
         if all(item.status in {"applied", "rejected", "conflict"} for item in siblings):
             change_set.status = "applied" if all(item.status == "applied" for item in siblings) else "partially_applied"
             change_set.applied_at = utcnow()
-    # A prose edit is still a review draft.  Its memory/canon epoch must stay
-    # at the bundle baseline until the user accepts the review; otherwise the
-    # very bundle created here would be stale before it can be confirmed.
+    # Prose remains a draft until the author clicks ``完成本章``. Its
+    # memory/canon epoch therefore stays unchanged until that single gate.
     if proposal.operation not in {"edit_chapter", "edit_chapter_selection"}:
         project.memory_epoch = int(project.memory_epoch or 0) + 1
         # Proposals emitted by one model turn share a single validated memory
@@ -4450,37 +4868,6 @@ def apply_proposal(
         )
     )
     db.commit()
-    if proposal.operation in {"edit_chapter", "edit_chapter_selection"}:
-        # Reuse the established continuity + style audit path.  A project
-        # without a configured provider still gets a durable pending review;
-        # the user can retry the normal review endpoint after configuring one.
-        profile = _provider(db, user, None)
-        if profile is not None:
-            from .reviews import reaudit_review_bundle
-
-            try:
-                reaudit_review_bundle(
-                    db,
-                    str(entity.id),
-                    actor="assistant",
-                    actor_user_id=user.id,
-                )
-            except ProviderError as exc:
-                # The proposal and immutable draft are already committed.  Do
-                # not turn that successful write into a phantom CAS conflict;
-                # retain a pending bundle with an explicit audit diagnostic.
-                db.rollback()
-                bundle = db.get(ReviewBundle, entity.id)
-                if bundle is not None:
-                    bundle.audit_issues = [
-                        {
-                            "code": "reaudit_unavailable",
-                            "message": str(exc)[:1000],
-                            "severity": "warning",
-                        }
-                    ]
-                    bundle.status = "pending"
-                    db.commit()
     db.refresh(proposal)
     return proposal
 

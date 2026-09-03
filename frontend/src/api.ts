@@ -899,7 +899,10 @@ export async function saveStoryGraph(
       },
       status: edge.status || "active",
     };
-    if (!edge.id.startsWith("edge-") && edge.version !== undefined) {
+    // The server version is the durable marker. Imported/backfilled records
+    // may legitimately use IDs such as "edge-1"; an ID-prefix check would
+    // POST a duplicate instead of applying the user's edit.
+    if (edge.version !== undefined) {
       await apiRequest<unknown>(
         `/projects/${projectId}/story-graph/edges/${encodeURIComponent(edge.id)}`,
         {
@@ -959,7 +962,11 @@ export async function saveStoryGraphLayout(
 
 export async function createAssistantConversation(
   projectId: string,
-  input: { target: AgentTarget; title?: string },
+  input: {
+    target: AgentTarget;
+    title?: string;
+    purpose?: "global" | "chapter";
+  },
 ): Promise<AssistantConversation> {
   return normalizeAssistantConversation(
     await apiRequest<unknown>(
@@ -969,8 +976,9 @@ export async function createAssistantConversation(
         body: JSON.stringify({
           title: input.title || "故事设定助手",
           purpose:
-            input.target.type === "character" ? "setup_character" : "setup",
-          apply_mode: "preview",
+            input.purpose ||
+            (input.target.type === "character" ? "setup_character" : "chapter"),
+          apply_mode: "auto_draft",
           target: input.target,
         }),
       },
@@ -1039,7 +1047,11 @@ export async function sendAssistantMessage(
     expected_version?: number;
     idempotency_key?: string;
   } = {},
-): Promise<{ message: AssistantMessage; run: AssistantRun }> {
+): Promise<{
+  message: AssistantMessage;
+  run: AssistantRun;
+  conversation?: AssistantConversation;
+}> {
   const payload = await apiRequest<unknown>(
     `/projects/${projectId}/assistant/conversations/${conversationId}/messages`,
     {
@@ -1062,6 +1074,10 @@ export async function sendAssistantMessage(
   return {
     message: normalizeAssistantMessage(record.message),
     run: normalizeAssistantRun(record.run),
+    conversation:
+      record.conversation && typeof record.conversation === "object"
+        ? normalizeAssistantConversation(record.conversation, projectId)
+        : undefined,
   };
 }
 
@@ -1137,7 +1153,7 @@ export async function applyAssistantProposals(
     expected_versions?: Record<string, number>;
     reason?: string;
   } = {},
-): Promise<AssistantProposal[]> {
+): Promise<{ proposals: AssistantProposal[]; memory_run: MemoryRun | null }> {
   const payload = await apiRequest<Record<string, unknown>>(
     `/projects/${projectId}/assistant/proposals/apply-batch`,
     {
@@ -1155,7 +1171,12 @@ export async function applyAssistantProposals(
     },
   );
   const rows = unwrap<unknown>(payload, ["proposals", "items", "data"]);
-  return (Array.isArray(rows) ? rows : []).map(normalizeAssistantProposal);
+  return {
+    proposals: (Array.isArray(rows) ? rows : []).map(normalizeAssistantProposal),
+    memory_run: payload.memory_run
+      ? normalizeMemoryRun(payload.memory_run)
+      : null,
+  };
 }
 
 export async function rejectAssistantProposals(
@@ -1196,6 +1217,19 @@ export async function retryAssistantRun(
   return normalizeAssistantRun(
     await apiRequest<unknown>(
       `/projects/${projectId}/assistant/conversations/${conversationId}/runs/${runId}/retry`,
+      { method: "POST" },
+    ),
+  );
+}
+
+export async function cancelAssistantRun(
+  projectId: string,
+  conversationId: string,
+  runId: string,
+): Promise<AssistantRun> {
+  return normalizeAssistantRun(
+    await apiRequest<unknown>(
+      `/projects/${projectId}/assistant/conversations/${conversationId}/runs/${runId}/cancel`,
       { method: "POST" },
     ),
   );
@@ -2087,6 +2121,18 @@ function normalizeStorySummary(value: unknown, projectId = ""): StorySummary {
       String(source.created_at ?? source.createdAt ?? "") || undefined,
     updated_at:
       String(source.updated_at ?? source.updatedAt ?? "") || undefined,
+    revisions: Array.isArray(source.revisions)
+      ? source.revisions.map((revision) => {
+          const row = (revision || {}) as Record<string, unknown>;
+          return {
+            id: String(row.id ?? ""),
+            memory_epoch:
+              Number(row.memory_epoch ?? row.memoryEpoch ?? 0) || 0,
+            created_at:
+              String(row.created_at ?? row.createdAt ?? "") || undefined,
+          };
+        })
+      : [],
   };
 }
 

@@ -490,6 +490,8 @@ class MemoryBuildRunRead(ORMModel):
     idempotency_key: str
     provider_profile_id: str | None = None
     stage: str
+    progress: int | None = Field(default=None, ge=0, le=100)
+    phase_label: str | None = None
     resource_id: str | None = None
     error: str | None = None
     created_at: datetime
@@ -821,7 +823,7 @@ class ProposalBatchRequest(BaseModel):
 class AgentConversationCreate(BaseModel):
     title: str = Field(default="故事设定助手", min_length=1, max_length=255)
     purpose: str = Field(default="setup", min_length=1, max_length=80)
-    apply_mode: Literal["preview", "auto_draft"] = "preview"
+    apply_mode: Literal["preview", "auto_draft"] = "auto_draft"
     provider_profile_id: str | None = None
 
 

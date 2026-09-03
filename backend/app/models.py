@@ -1204,7 +1204,7 @@ class AgentConversation(Base):
     )
     title: Mapped[str] = mapped_column(String(255), default="故事设定助手", nullable=False)
     purpose: Mapped[str] = mapped_column(String(80), default="setup", nullable=False)
-    apply_mode: Mapped[str] = mapped_column(String(40), default="preview", nullable=False)
+    apply_mode: Mapped[str] = mapped_column(String(40), default="auto_draft", nullable=False)
     provider_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     provider_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     context_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)

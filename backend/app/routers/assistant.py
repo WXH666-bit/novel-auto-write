@@ -22,13 +22,16 @@ from ..models import (
     AgentEvent,
     AgentMessage,
     AgentRun,
+    AuditLog,
     ChangeSet,
+    Chapter,
     Job,
     MediaAsset,
     Project,
     Proposal,
     ProviderProfile,
     User,
+    utcnow,
 )
 from ..schemas import (
     AgentConversationCreate,
@@ -49,11 +52,14 @@ from ..services.assistant import (
     ProposalNotEditableError,
     add_event,
     apply_proposal,
+    cancel_assistant_run,
+    conversation_title_from_content,
     create_conversation,
     create_message_run,
     reject_proposal,
     update_proposal,
 )
+from ..services.memory import create_memory_run, memory_run_snapshot
 from ..services.providers import normalize_capabilities, parse_capability_bool
 from . import require_project
 
@@ -175,6 +181,18 @@ def _conversation_payload(
 ) -> AgentConversationRead:
     payload = AgentConversationRead.model_validate(conversation)
     if db is not None:
+        if payload.title in {"故事设定助手", "和 Agent 一起写", "新的写作对话"}:
+            first_user_message = db.scalar(
+                select(AgentMessage.content)
+                .where(
+                    AgentMessage.conversation_id == conversation.id,
+                    AgentMessage.role == "user",
+                )
+                .order_by(AgentMessage.sequence)
+                .limit(1)
+            )
+            if first_user_message:
+                payload.title = conversation_title_from_content(first_user_message)
         provider_name, provider_capabilities = _effective_provider(db, conversation, user)
         payload.provider_name = provider_name
         payload.provider_capabilities = provider_capabilities
@@ -452,6 +470,38 @@ def retry_assistant_run(
     return AgentRunRead.model_validate(run)
 
 
+@router.post(
+    "/projects/{project_id}/assistant/conversations/{conversation_id}/runs/{run_id}/cancel",
+    response_model=AgentRunRead,
+)
+def cancel_run(
+    project_id: str,
+    conversation_id: str,
+    run_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentRunRead:
+    project = require_project(db, project_id, current_user)
+    conversation = _conversation(db, project, conversation_id)
+    run = db.scalar(
+        select(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.conversation_id == conversation.id,
+        )
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="助手运行不存在")
+    try:
+        stopped = cancel_assistant_run(db, conversation, run, current_user)
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return AgentRunRead.model_validate(stopped)
+
+
 def _event_rows(db: Session, conversation_id: str, after: int = 0) -> list[AgentEvent]:
     return db.scalars(
         select(AgentEvent)
@@ -499,6 +549,8 @@ def _wire_event_type(event_type: str) -> str:
         "run_completed": "run.completed",
         "run.failed": "run.failed",
         "run_failed": "run.failed",
+        "run.cancelled": "run.cancelled",
+        "run_cancelled": "run.cancelled",
         "message.delta": "message.delta",
         "message_delta": "message.delta",
         "message.replace": "message.replace",
@@ -1143,13 +1195,64 @@ def _project_proposals(
         "upsert_graph_edge": 3,
         "update_graph_edge": 3,
     }
-    return sorted(rows, key=lambda row: order.get(row.operation, 10))
+    chapter_ids = {
+        str(row.target_id or row.scope_chapter_id)
+        for row in rows
+        if row.operation in {"edit_chapter", "edit_chapter_selection"}
+        and (row.target_id or row.scope_chapter_id)
+    }
+    chapter_order = {
+        str(chapter.id): (int(chapter.sort_order or 0), int(chapter.chapter_number or 0))
+        for chapter in db.scalars(
+            select(Chapter).where(
+                Chapter.project_id == project.id,
+                Chapter.id.in_(chapter_ids),
+            )
+        ).all()
+    } if chapter_ids else {}
+    return sorted(
+        rows,
+        key=lambda row: (
+            order.get(row.operation, 10),
+            chapter_order.get(str(row.target_id or row.scope_chapter_id), (10**9, 10**9)),
+            row.created_at,
+        ),
+    )
+
+
+def _is_global_assistant_batch(db: Session, proposals: list[Proposal]) -> bool:
+    run_ids = {
+        str(row.change_set.source_id)
+        for row in proposals
+        if row.change_set is not None
+        and row.change_set.source_type == "assistant"
+        and row.change_set.source_id
+    }
+    if not run_ids:
+        return False
+    purposes = db.scalars(
+        select(AgentConversation.purpose)
+        .join(AgentRun, AgentRun.conversation_id == AgentConversation.id)
+        .where(AgentRun.id.in_(run_ids))
+        .distinct()
+    ).all()
+    return bool(purposes) and all(
+        str(purpose or "").lower() in {"global", "global_story", "setup_global"}
+        for purpose in purposes
+    )
 
 
 def _apply_batch_for_project(
     db: Session, project: Project, payload: ProposalBatchRequest, current_user: User
 ) -> dict[str, Any]:
     proposals = _project_proposals(db, project, payload.proposal_ids)
+    global_batch = _is_global_assistant_batch(db, proposals)
+    affected_chapter_ids = {
+        str(proposal.target_id or proposal.scope_chapter_id)
+        for proposal in proposals
+        if proposal.operation in {"edit_chapter", "edit_chapter_selection"}
+        and (proposal.target_id or proposal.scope_chapter_id)
+    }
     applied: list[ProposalRead] = []
     for index, proposal in enumerate(proposals):
         expected_epoch = payload.expected_memory_epoch if index == 0 else project.memory_epoch
@@ -1184,12 +1287,63 @@ def _apply_batch_for_project(
             ) from exc
         applied.append(ProposalRead.model_validate(result))
         db.refresh(project)
-    return {
+    memory_run = None
+    if global_batch:
+        chapters = (
+            db.scalars(
+                select(Chapter)
+                .where(
+                    Chapter.project_id == project.id,
+                    Chapter.id.in_(affected_chapter_ids),
+                )
+                .order_by(Chapter.sort_order, Chapter.chapter_number)
+                .with_for_update()
+            ).all()
+            if affected_chapter_ids
+            else []
+        )
+        for chapter in chapters:
+            if not chapter.current_revision_id:
+                continue
+            chapter.accepted_revision_id = chapter.current_revision_id
+            chapter.status = "confirmed"
+            chapter.confirmed_at = utcnow()
+            chapter.summary_status = "unprocessed"
+        if chapters:
+            project.memory_epoch = int(project.memory_epoch or 0) + 1
+        project.needs_rebuild = True
+        db.add(
+            AuditLog(
+                project_id=project.id,
+                actor_user_id=current_user.id,
+                actor=current_user.username or current_user.email or current_user.id,
+                action="assistant.global_diff_accepted",
+                entity_type="project",
+                entity_id=project.id,
+                after_json={
+                    "chapter_ids": [chapter.id for chapter in chapters],
+                    "proposal_ids": [proposal.id for proposal in proposals],
+                },
+            )
+        )
+        created = create_memory_run(
+            db,
+            project,
+            scope="project",
+            actor_user_id=current_user.id,
+            commit=False,
+        )
+        memory_run = created.run
+        db.commit()
+    result_payload = {
         "status": "applied",
         "project_id": project.id,
         "applied_count": len(applied),
         "proposals": applied,
     }
+    if memory_run is not None:
+        result_payload["memory_run"] = memory_run_snapshot(memory_run)
+    return result_payload
 
 
 @router.post("/assistant/proposals/apply-batch", response_model=dict[str, Any])

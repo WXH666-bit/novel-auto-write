@@ -52,4 +52,27 @@ test.describe("新建小说向导", () => {
       }
     });
   }
+
+  test("返回、取消、关闭和遮罩按钮都能退出或回退", async ({ page }) => {
+    await mockStoryApi(page);
+    await page.goto("/");
+
+    await page.getByRole("button", { name: "新建小说" }).first().click();
+    const dialog = page.getByRole("dialog", { name: "新建小说" });
+    await dialog.getByRole("button", { name: "继续" }).click();
+    await dialog.getByRole("button", { name: /返回选择/ }).click();
+    await expect(dialog.getByRole("radio", { name: /空白稿纸/ })).toBeVisible();
+    await dialog.getByRole("button", { name: "取消" }).click();
+    await expect(dialog).toBeHidden();
+
+    await page.getByRole("button", { name: "新建小说" }).first().click();
+    await dialog.getByRole("button", { name: "关闭" }).click();
+    await expect(dialog).toBeHidden();
+
+    await page.getByRole("button", { name: "新建小说" }).first().click();
+    await page
+      .getByRole("button", { name: "关闭新建小说窗口" })
+      .click({ position: { x: 5, y: 5 } });
+    await expect(dialog).toBeHidden();
+  });
 });

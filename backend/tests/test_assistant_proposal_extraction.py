@@ -583,7 +583,7 @@ def test_live_jsonl_extractor_persists_chapter_drafts_field_by_field(
         assert graph_edges[0].relation_type == "互相试探"
 
 
-def test_empty_chapter_proposal_creates_first_revision_and_review_bundle(store: Any) -> None:
+def test_empty_chapter_proposal_creates_saved_draft_without_review_bundle(store: Any) -> None:
     with store() as db:
         user, _profile = seed_tenant(db, with_provider=False)
         project = models.Project(owner_id=user.id, name="空白章节应用")
@@ -638,16 +638,15 @@ def test_empty_chapter_proposal_creates_first_revision_and_review_bundle(store: 
         assert revision.revision_number == 1
         assert revision.content == "新的第一章正文"
         assert revision.parent_revision_id is None
-        assert chapter.status == "needs_review"
+        assert chapter.status == "draft"
+        assert chapter.summary_status == "unprocessed"
         bundle = db.scalar(
             select(models.ReviewBundle).where(
                 models.ReviewBundle.chapter_id == chapter.id,
                 models.ReviewBundle.draft_revision_id == revision.id,
             )
         )
-        assert bundle is not None
-        assert bundle.status == "pending"
-        assert bundle.source_context[0]["empty_chapter_baseline"] is True
+        assert bundle is None
 
 
 def test_empty_baseline_rejects_non_empty_orphan_revision(store: Any) -> None:
@@ -712,3 +711,181 @@ def test_empty_baseline_rejects_non_empty_orphan_revision(store: Any) -> None:
         db.refresh(chapter)
         assert proposal.status == "conflict"
         assert chapter.current_revision_id is None
+
+def test_chapter_reply_fallback_requires_explicit_write_intent() -> None:
+    context = {
+        "chapter_id": "chapter-1",
+        "empty_chapter_baseline": True,
+        "agent_write_intent": True,
+    }
+    proposals = assistant_service._chapter_reply_fallback(
+        "雨落在城门外，少年握紧了刀。",
+        target={"type": "chapter", "id": "chapter-1", "chapter_id": "chapter-1"},
+        context=context,
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0]["operation"] == "edit_chapter_selection"
+    assert proposals[0]["target_id"] == "chapter-1"
+    assert proposals[0]["patch"]["replacement"] == "雨落在城门外，少年握紧了刀。"
+    assert proposals[0]["patch"]["empty_chapter_baseline"] is True
+    assert assistant_service._chapter_reply_fallback(
+        "这章的节奏可以再紧一些。",
+        target={"type": "chapter", "id": "chapter-1"},
+        context={"chapter_id": "chapter-1"},
+    ) == []
+
+
+def test_chapter_work_report_is_never_treated_as_prose() -> None:
+    assert assistant_service._chapter_reply_is_work_report(
+        "已按照设定完成第一章，内容符合开篇定位。"
+    )
+    assert not assistant_service._chapter_reply_is_work_report(
+        "钟声响过三次，少年推开了无人值守的城门。"
+    )
+
+
+def test_write_intent_persists_provider_prose_as_blank_chapter_draft(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prose = "钟声响过三次，少年推开了无人值守的城门。"
+
+    class ProseOnlyProvider:
+        def __init__(self) -> None:
+            self.stream_calls = 0
+
+        async def stream(self, _messages: list[dict[str, Any]], **_kwargs: Any):
+            self.stream_calls += 1
+            if self.stream_calls == 1:
+                yield prose
+
+        async def structured(self, *_args: Any, **_kwargs: Any):
+            raise RuntimeError("structured extraction unavailable")
+
+    provider = ProseOnlyProvider()
+    monkeypatch.setattr(assistant_service, "provider_for", lambda _profile: provider)
+    with store() as db:
+        user, profile = seed_tenant(db)
+        assert profile is not None
+        project = models.Project(owner_id=user.id, name="自动建稿")
+        chapter = models.Chapter(
+            project=project,
+            volume_number=1,
+            chapter_number=1,
+            sort_order=0,
+            title="第一章 · Agent 草稿",
+            status="draft",
+        )
+        db.add_all([project, chapter])
+        db.flush()
+        project.current_chapter_id = chapter.id
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            provider_profile_id=profile.id,
+        )
+        db.add(conversation)
+        db.commit()
+        _message, run, _created = assistant_service.create_message_run(
+            db,
+            conversation,
+            user,
+            "给我写第一章",
+            idempotency_key="chapter-prose-fallback",
+            target={"type": "chapter", "id": chapter.id, "chapter_id": chapter.id},
+            context_snapshot={
+                "chapter_id": chapter.id,
+                "agent_write_intent": True,
+            },
+        )
+
+        assistant_service.execute_agent_run(db, run.id)
+
+        proposal = db.scalar(
+            select(models.Proposal).where(models.Proposal.project_id == project.id)
+        )
+        assert proposal is not None
+        assert proposal.operation == "edit_chapter"
+        assert proposal.target_id == chapter.id
+        assert proposal.patch_json["replacement"] == prose
+        assert proposal.patch_json["empty_chapter_baseline"] is True
+        assert proposal.status == "proposed"
+
+
+def test_write_intent_repairs_work_report_before_building_chapter_proposal(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = "已按照核心设定完成第一章，内容符合开篇定位。"
+    prose = "风从断塔的石缝里钻出来，卷走了少年掌心最后一点余温。"
+
+    class WorkReportProvider:
+        def __init__(self) -> None:
+            self.stream_calls = 0
+
+        async def stream(self, _messages: list[dict[str, Any]], **_kwargs: Any):
+            self.stream_calls += 1
+            if self.stream_calls == 1:
+                yield report
+
+        async def complete(self, _messages: list[dict[str, Any]], **_kwargs: Any):
+            return prose
+
+        async def structured(self, *_args: Any, **_kwargs: Any):
+            raise RuntimeError("structured extraction unavailable")
+
+    monkeypatch.setattr(
+        assistant_service,
+        "provider_for",
+        lambda _profile: WorkReportProvider(),
+    )
+    with store() as db:
+        user, profile = seed_tenant(db)
+        assert profile is not None
+        project = models.Project(owner_id=user.id, name="正文纠偏")
+        chapter = models.Chapter(
+            project=project,
+            volume_number=1,
+            chapter_number=1,
+            sort_order=0,
+            title="第一章",
+            status="draft",
+        )
+        db.add_all([project, chapter])
+        db.flush()
+        project.current_chapter_id = chapter.id
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            provider_profile_id=profile.id,
+        )
+        db.add(conversation)
+        db.commit()
+        _message, run, _created = assistant_service.create_message_run(
+            db,
+            conversation,
+            user,
+            "写第一章正文",
+            idempotency_key="chapter-work-report-repair",
+            target={"type": "chapter", "id": chapter.id, "chapter_id": chapter.id},
+            context_snapshot={
+                "chapter_id": chapter.id,
+                "agent_write_intent": True,
+            },
+        )
+
+        assistant_service.execute_agent_run(db, run.id)
+
+        proposal = db.scalar(
+            select(models.Proposal).where(models.Proposal.project_id == project.id)
+        )
+        assistant_message = db.scalar(
+            select(models.AgentMessage).where(
+                models.AgentMessage.run_id == run.id,
+                models.AgentMessage.role == "assistant",
+            )
+        )
+        assert proposal is not None
+        assert proposal.patch_json["replacement"] == prose
+        assert report not in proposal.patch_json["replacement"]
+        assert assistant_message is not None
+        assert assistant_message.content == f"本章正文已写入当前稿纸，共 {len(prose)} 字，并会自动保存。"

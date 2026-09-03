@@ -1,7 +1,14 @@
 export type View = "library" | "desk" | "studio" | "settings";
 export type LedgerTab = "canon" | "timeline" | "threads" | "foreshadowing";
 export type StartMode = "blank" | "import" | "setup";
-export type StudioMode = "manuscript" | "characters" | "story-map";
+export type StudioMode =
+  | "manuscript"
+  | "characters"
+  | "story-map"
+  | "global-diff"
+  | "memory";
+
+export type AgentWorkMode = "global" | "chapter";
 export type EntityViewMode = "table" | "graph";
 export type SummaryStatus =
   | "not_started"
@@ -295,6 +302,11 @@ export interface StorySummary {
   memory_epoch: number;
   created_at?: string;
   updated_at?: string;
+  revisions?: Array<{
+    id: string;
+    memory_epoch: number;
+    created_at?: string;
+  }>;
 }
 
 export interface ProjectMemory {

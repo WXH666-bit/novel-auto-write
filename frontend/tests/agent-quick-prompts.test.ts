@@ -4,6 +4,8 @@ import {
   getAgentQuickPromptVisibility,
   graphWithAgentDrafts,
   resolveAgentMessageTarget,
+  shouldAutoCreateChapterDraft,
+  spreadOverlappingGraphNodes,
   summarizeAgentBuild,
   visibleAgentMessage,
 } from "../src/StoryStudio";
@@ -114,11 +116,11 @@ describe("resolveAgentMessageTarget", () => {
     ).toEqual({ type: "chapter", id: "chapter-1", chapter_id: "chapter-1" });
   });
 
-  it("keeps the project target when global settings is selected", () => {
+  it("keeps the project target in whole-book collaboration mode", () => {
     expect(
       resolveAgentMessageTarget(
         { type: "project", id: "project-1" },
-        "project",
+        "global",
         chapter,
       ),
     ).toEqual({ type: "project", id: "project-1", chapter_id: null });
@@ -131,21 +133,113 @@ describe("resolveAgentMessageTarget", () => {
         "chapter",
         chapter,
       ),
-    ).toEqual({ type: "character", id: "character-1" });
+    ).toEqual({
+      type: "character",
+      id: "character-1",
+      chapter_id: "chapter-1",
+    });
   });
 
-  it("keeps a graph relationship target above the selection scope", () => {
+  it("keeps a graph relationship target in chapter mode", () => {
     expect(
       resolveAgentMessageTarget(
         { type: "relationship", id: "edge-1" },
-        "selection",
+        "chapter",
         chapter,
       ),
-    ).toEqual({ type: "relationship", id: "edge-1" });
+    ).toEqual({
+      type: "relationship",
+      id: "edge-1",
+      chapter_id: "chapter-1",
+    });
+  });
+});
+
+describe("automatic Agent manuscript drafts", () => {
+  it("creates a manuscript only for explicit chapter-writing requests", () => {
+    expect(shouldAutoCreateChapterDraft("给我仿照这个风格写第一章"))
+      .toBe(true);
+    expect(shouldAutoCreateChapterDraft("续写这一章的正文"))
+      .toBe(true);
+    expect(shouldAutoCreateChapterDraft("帮我分析第一章的节奏"))
+      .toBe(false);
+    expect(shouldAutoCreateChapterDraft("先设计两个人物"))
+      .toBe(false);
   });
 });
 
 describe("Agent graph preview", () => {
+  it("reflows an overlapping graph into a spacious adaptive grid", () => {
+    const nodes = spreadOverlappingGraphNodes([
+      {
+        id: "node-1",
+        type: "character",
+        label: "甲",
+        position: { x: 0, y: 0 },
+      },
+      {
+        id: "node-2",
+        type: "character",
+        label: "乙",
+        position: { x: 0, y: 0 },
+      },
+      {
+        id: "node-3",
+        type: "event",
+        label: "远处事件",
+        position: { x: 900, y: 500 },
+      },
+    ]);
+
+    expect(nodes.map((node) => node.position)).toEqual([
+      { x: 80, y: 80 },
+      { x: 470, y: 80 },
+      { x: 80, y: 270 },
+    ]);
+  });
+
+  it("preserves a manually spaced layout", () => {
+    const nodes = spreadOverlappingGraphNodes([
+      {
+        id: "node-1",
+        type: "character",
+        label: "甲",
+        position: { x: 20, y: 30 },
+      },
+      {
+        id: "node-2",
+        type: "event",
+        label: "远处事件",
+        position: { x: 700, y: 400 },
+      },
+    ]);
+
+    expect(nodes.map((node) => node.position)).toEqual([
+      { x: 20, y: 30 },
+      { x: 700, y: 400 },
+    ]);
+  });
+
+  it("lays out a generated relationship chain in readable layers", () => {
+    const nodes = spreadOverlappingGraphNodes(
+      [
+        { id: "a", type: "character", label: "甲", position: { x: 0, y: 0 } },
+        { id: "b", type: "character", label: "乙", position: { x: 80, y: 0 } },
+        { id: "c", type: "event", label: "事件", position: { x: 160, y: 0 } },
+      ],
+      [
+        { id: "ab", source: "a", target: "b", kind: "related" },
+        { id: "bc", source: "b", target: "c", kind: "related" },
+        { id: "ac", source: "a", target: "c", kind: "related" },
+      ],
+    );
+
+    expect(nodes[1].position.x - nodes[0].position.x).toBeGreaterThanOrEqual(390);
+    expect(nodes[2].position.x - nodes[1].position.x).toBeGreaterThanOrEqual(390);
+    expect(nodes[1].position.y).not.toBe(nodes[0].position.y);
+    expect(nodes[2].position.y).toBe(nodes[0].position.y);
+  });
+
   it("resolves a newest-first relation after its draft characters", () => {
     const proposals: AssistantProposal[] = [
       {
@@ -188,7 +282,7 @@ describe("Agent graph preview", () => {
     });
   });
 
-  it("keeps a relation reviewable after its character drafts are gone", () => {
+  it("keeps a relation visible while its endpoint characters are generated", () => {
     const relation: AssistantProposal = {
       id: "relation-orphaned",
       conversation_id: "conversation-1",
@@ -255,7 +349,9 @@ describe("Agent graph preview", () => {
 
     expect(summarizeAgentBuild(proposals, graph)).toEqual({
       total: 3,
+      readyCount: 1,
       building: true,
+      chapterCount: 0,
       characterCount: 2,
       graphProposalCount: 1,
       nodeCount: 2,

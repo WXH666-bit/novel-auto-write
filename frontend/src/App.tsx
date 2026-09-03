@@ -327,6 +327,9 @@ function Workspace({
 }) {
   const queryClient = useQueryClient();
   const [view, setView] = useState<View>("library");
+  const [settingsReturnView, setSettingsReturnView] = useState<
+    "library" | "studio" | "desk"
+  >("library");
   const [activeProjectId, setActiveProjectId] = useState("");
   const [activeChapterId, setActiveChapterId] = useState("");
   const [ledgerTab, setLedgerTab] = useState<LedgerTab>("canon");
@@ -1184,6 +1187,9 @@ function Workspace({
       providers.find((item) => item.id === selectedProviderId) || provider;
     if (!selectedProvider?.id) {
       setShowGeneration(false);
+      setSettingsReturnView(
+        view === "studio" || view === "desk" ? view : "library",
+      );
       setView("settings");
       setToast({
         tone: "warning",
@@ -1303,10 +1309,25 @@ function Workspace({
     setShowReview(true);
   };
 
+  const openSettings = () => {
+    setSettingsReturnView(
+      view === "studio" || view === "desk" ? view : "library",
+    );
+    setView("settings");
+  };
+
   const openGeneration = () => {
-    if (!activeProject) return;
+    if (!activeProject) {
+      setNewProjectStartMode("setup");
+      setShowNewProject(true);
+      setToast({
+        tone: "info",
+        message: "先创建一本小说，再开始生成章节。",
+      });
+      return;
+    }
     if (!providers.length) {
-      setView("settings");
+      openSettings();
       setToast({
         tone: "warning",
         message: "尚未添加模型。请先配置你自己的 Provider。",
@@ -1318,12 +1339,24 @@ function Workspace({
 
   useEffect(() => {
     const handlers: Record<string, () => void> = {
-      "command-generate": () => setShowGeneration(true),
+      "command-generate": openGeneration,
       "command-review": openReview,
-      "command-save": () =>
-        activeChapter && saveDraft(activeChapter, activeContent),
-      "command-import": () => setShowImport(true),
-      "command-settings": () => setView("settings"),
+      "command-save": () => {
+        if (activeChapter) saveDraft(activeChapter, activeContent);
+        else
+          setToast({
+            tone: "info",
+            message: "当前没有可保存的稿纸。请先新建小说或章节。",
+          });
+      },
+      "command-import": () => {
+        if (activeProject) setShowImport(true);
+        else {
+          setNewProjectStartMode("import");
+          setShowNewProject(true);
+        }
+      },
+      "command-settings": openSettings,
     };
     const listeners = Object.entries(handlers).map(([name, handler]) => {
       const listener = () => handler();
@@ -1334,7 +1367,7 @@ function Workspace({
       listeners.forEach(([name, listener]) =>
         window.removeEventListener(name, listener),
       );
-  }, [activeChapter, activeContent, openReview, saveDraft]);
+  }, [activeChapter, activeContent, activeProject, openGeneration, openReview, openSettings, saveDraft]);
 
   const applyReviewAction = async (
     action: "accept" | "reject" | "reaudit",
@@ -1476,7 +1509,10 @@ function Workspace({
   };
 
   const exportProject = async () => {
-    if (!activeProject) return;
+    if (!activeProject) {
+      setToast({ tone: "info", message: "当前没有可导出的小说。" });
+      return;
+    }
     try {
       const blob = await downloadExport(activeProject.id);
       const url = URL.createObjectURL(blob);
@@ -1733,7 +1769,7 @@ function Workspace({
                     </button>
                   )}
                   {activeProject && (
-                    <button role="menuitem" onClick={() => { setAccountMenuOpen(false); setView("settings"); }}>
+                    <button role="menuitem" onClick={() => { setAccountMenuOpen(false); openSettings(); }}>
                       <Settings size={14} /> 模型设置
                     </button>
                   )}
@@ -1744,7 +1780,7 @@ function Workspace({
                 </>
               )}
               <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onAccount(); }}><UserRound size={14} /> 账号与安全</button>
-              {!workspaceView && <button role="menuitem" onClick={() => { setAccountMenuOpen(false); setView("settings"); }}><Settings size={14} /> 模型与生成</button>}
+              {!workspaceView && <button role="menuitem" onClick={() => { setAccountMenuOpen(false); openSettings(); }}><Settings size={14} /> 模型与生成</button>}
               <div className="account-menu-rule" />
               <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onLogout(); }}><LogOut size={14} /> 退出当前设备</button>
               <button role="menuitem" onClick={() => { setAccountMenuOpen(false); onLogoutAll(); }}><ShieldCheck size={14} /> 退出全部会话</button>
@@ -1769,15 +1805,17 @@ function Workspace({
             activeProjectId={activeProjectId}
             onSelect={selectProject}
             onCreate={() => setShowNewProject(true)}
-            onImport={() => {
-              setNewProjectStartMode("import");
-              setShowNewProject(true);
+            onImport={(project) => {
+              setActiveProjectId(project.id);
+              setActiveChapterId(project.current_chapter_id || "");
+              setImportPreviewData(null);
+              setShowImport(true);
             }}
             onDelete={(project) => {
               setDeleteProjectConfirmation("");
               setProjectPendingDeletion(project);
             }}
-            onSettings={() => setView("settings")}
+            onSettings={openSettings}
           />
         )}
         {view === "settings" && providerQuery.isLoading && (
@@ -1845,10 +1883,10 @@ function Workspace({
             }}
             onExport={exportProject}
             onBack={() => {
-              if (activeProject) {
+              if (activeProject && settingsReturnView !== "library") {
                 setStudioMode("manuscript");
                 setStudioAutoOpenAgent(false);
-                setView("studio");
+                setView(settingsReturnView);
               } else {
                 setView("library");
               }
@@ -1881,6 +1919,7 @@ function Workspace({
              onChapter={(chapter) => setActiveChapterId(chapter.id)}
              onAnalyzeMemory={() => void analyzeMemory()}
              onRetryMemory={() => void retryMemory()}
+             onMemoryRun={setMemoryRun}
              onNotice={(tone, message) => setToast({ tone, message })}
           />
           </>
@@ -1921,7 +1960,7 @@ function Workspace({
             onReview={openReview}
             onImport={() => setShowImport(true)}
             onLibrary={() => setView("library")}
-            onSettings={() => setView("settings")}
+            onSettings={openSettings}
             onRebuild={rebuildMemory}
             onMobileLedger={() => setMobileLedger(true)}
             sidebarCollapsed={sidebarCollapsed}
@@ -2125,7 +2164,7 @@ function LibraryView({
   activeProjectId: string;
   onSelect: (project: Project) => void;
   onCreate: () => void;
-  onImport: () => void;
+  onImport: (project: Project) => void;
   onDelete: (project: Project) => void;
   onSettings: () => void;
 }) {
@@ -2140,14 +2179,14 @@ function LibraryView({
             <em>已经发生过的事上。</em>
           </h1>
           <p className="intro-copy">
-            在一个地方管理正文、人物和剧情。只有你确认的内容，才会用于后续写作。
+            在一个地方管理正文、人物和剧情。Agent 的改动会实时呈现并自动保存。
           </p>
         </div>
         <div className="intro-side-note">
           <span className="note-line" />
-          <span>内容安全</span>
-          <strong>建议先确认，再使用</strong>
-          <small>接受过的改动都会留下版本和来源。</small>
+          <span>持续写作</span>
+          <strong>实时呈现，自动保存</strong>
+          <small>每次改动都会留下版本和来源，需要时仍可回溯。</small>
         </div>
       </section>
 
@@ -2181,7 +2220,7 @@ function LibraryView({
             project={project}
             active={project.id === activeProjectId}
             onOpen={() => onSelect(project)}
-            onImport={onImport}
+            onImport={() => onImport(project)}
             onDelete={() => onDelete(project)}
           />
         ))}
@@ -3670,7 +3709,7 @@ function SettingsView({
           </div>
           {draft && <details className="settings-card advanced-role-card"><summary className="advanced-role-summary"><div><h2>角色模型映射</h2><p>按工作指定模型；留空时沿用连接的默认模型。</p></div><ChevronDown size={16} /></summary><div className="role-grid">{roles.map(([key, label]) => <label className="role-field" key={key}><span>{label}</span><input value={draft.model_roles?.[key] || ""} placeholder={draft.default_model || "沿用默认模型"} onChange={(event) => setDraft({ ...draft, model_roles: { ...(draft.model_roles || {}), [key]: event.target.value } })} /></label>)}</div></details>}
           {draft && <ProviderCapabilityCard draft={draft} onChange={(enabled) => void saveCapability(enabled)} saveState={capabilitySaveState} disabled={busy} />}
-          <div className="settings-card memory-preference-card"><div className="backup-icon"><Sparkles size={18} /></div><div><h2>故事记忆自动整理</h2><p>完成或导入章节后，自动生成章节摘要、人物关系和剧情线。关闭后仍可按需手动分析。</p></div><label className="toggle-control"><input type="checkbox" checked={autoSummaryEnabled} onChange={(event) => onChangeAutoSummary(event.target.checked)} /><span className="toggle-track" aria-hidden="true"><span /></span><strong>{autoSummaryEnabled ? "已开启" : "已关闭"}</strong></label></div>
+          <div className="settings-card memory-preference-card"><div className="backup-icon"><Sparkles size={18} /></div><div><h2>故事记忆自动整理</h2><p>完成或导入章节后，自动生成章节摘要、人物关系和剧情线。关闭后仍可按需手动分析。</p></div><label className="toggle-control"><input type="checkbox" aria-label="故事记忆自动整理" checked={autoSummaryEnabled} onChange={(event) => onChangeAutoSummary(event.target.checked)} /><span className="toggle-track" aria-hidden="true"><span /></span><strong>{autoSummaryEnabled ? "已开启" : "已关闭"}</strong></label></div>
           <div className="settings-card backup-card"><div className="backup-icon"><FileArchive size={18} /></div><div><h2>完整备份</h2><p>导出正文、故事资料、修改历史和原始导入文件；密钥永远不会包含在内。</p></div><button className="button button-secondary" onClick={onExport}><Download size={14} /> 导出项目 ZIP</button></div>
         </section>
       </div>

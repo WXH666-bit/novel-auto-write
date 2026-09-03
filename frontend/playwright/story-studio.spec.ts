@@ -51,7 +51,7 @@ test.describe("双栏协作台核心流程", () => {
     await expect(detail).toBeHidden();
   });
 
-  test("关系图和关系表共享可保存的图谱数据", async ({ page }) => {
+  test("关系图和关系表共享数据并自动保存", async ({ page }) => {
     const mock = await openStudio(page);
 
     await page.getByRole("button", { name: "故事图谱" }).click();
@@ -61,7 +61,7 @@ test.describe("双栏协作台核心流程", () => {
     await expect(page.getByText("章节缩略图", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "关系表" }).click();
     await expect(page.getByRole("table", { name: "人物和情节关系" })).toBeVisible();
-    await page.getByRole("button", { name: "保存图谱" }).click();
+    await page.getByLabel("关系标签").first().fill("自动保存的线索");
 
     await expect.poll(() => mock.graphSaveCount).toBeGreaterThan(0);
     await expect
@@ -69,7 +69,85 @@ test.describe("双栏协作台核心流程", () => {
       .toBeGreaterThan(0);
   });
 
-  test("Agent 改动直接显示在人物字段并可就地修改后接受", async ({ page }) => {
+  test("已保存关系的更新和删除按钮会真正写回同一条关系", async ({ page }) => {
+    const mock = await openStudio(page);
+    await page.getByRole("button", { name: "故事图谱" }).click();
+    await page.getByRole("button", { name: "关系表" }).click();
+
+    await page.getByLabel("关系标签").first().fill("继续追查");
+    await expect.poll(() =>
+      mock.requests.some(
+        (request) =>
+          request.method === "PATCH" &&
+          request.path === "/projects/project-1/story-graph/edges/edge-1" &&
+          JSON.stringify(request.body).includes("继续追查"),
+      ),
+    ).toBe(true);
+
+    await page
+      .getByRole("button", { name: "删除林渡与灯塔秘密的关系" })
+      .click();
+    await expect(page.getByText("0 条连线", { exact: true })).toBeVisible();
+    await page.getByLabel("新关系标签").fill("重新结盟");
+    await page.getByRole("button", { name: "添加", exact: true }).click();
+    await expect(page.getByText("1 条连线", { exact: true })).toBeVisible();
+    await expect.poll(() =>
+      mock.requests.some(
+        (request) =>
+          request.method === "DELETE" &&
+          request.path === "/projects/project-1/story-graph/edges/edge-1",
+      ),
+    ).toBe(true);
+    await expect.poll(() =>
+      mock.requests.some(
+        (request) =>
+          request.method === "POST" &&
+          request.path === "/projects/project-1/story-graph/edges" &&
+          JSON.stringify(request.body).includes("重新结盟"),
+      ),
+    ).toBe(true);
+  });
+
+  test("人物页新增、扩展字段和保存按钮可用", async ({ page }) => {
+    const mock = await openStudio(page);
+    await page.getByRole("button", { name: /^人物/ }).first().click();
+    await page.getByRole("button", { name: "新增人物" }).click();
+    await expect(page.getByRole("heading", { name: "新增人物卷宗" })).toBeVisible();
+
+    await page.getByLabel("姓名").fill("季衡");
+    await page.getByPlaceholder("字段名，例如：秘密").fill("秘密");
+    await page.getByPlaceholder("字段内容").fill("曾在旧港值夜");
+    await page.getByRole("button", { name: "添加字段" }).click();
+    await expect(page.getByRole("button", { name: "删除秘密" })).toBeVisible();
+    await page.getByRole("button", { name: "删除秘密" }).click();
+    await expect(page.getByRole("button", { name: "删除秘密" })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "保存人物卷宗" }).click();
+    await expect.poll(() =>
+      mock.requests.some(
+        (request) =>
+          request.method === "POST" &&
+          request.path === "/projects/project-1/characters" &&
+          JSON.stringify(request.body).includes("季衡"),
+      ),
+    ).toBe(true);
+    await expect(page.getByText("人物卷宗已保存，当前设定已生效。", { exact: true })).toBeVisible();
+  });
+
+  test("关系图缩放和适配按钮可操作", async ({ page }) => {
+    await openStudio(page);
+    await page.getByRole("button", { name: "故事图谱" }).click();
+    const viewport = page.locator(".react-flow__viewport");
+    await expect(viewport).toBeVisible();
+    const before = await viewport.getAttribute("style");
+    await page.getByRole("button", { name: /zoom in/i }).click();
+    await expect.poll(() => viewport.getAttribute("style")).not.toBe(before);
+    await page.getByRole("button", { name: /zoom out/i }).click();
+    await page.getByRole("button", { name: /fit view/i }).click();
+    await expect(page.getByRole("application", { name: "可编辑故事关系图" })).toBeVisible();
+  });
+
+  test("Agent 改动在人物字段中展示后自动保存", async ({ page }) => {
     const mock = await openStudio(page);
     await page.getByRole("button", { name: /^人物/ }).first().click();
     await expect(page.getByRole("button", { name: "打开人物林渡" })).toBeVisible();
@@ -78,34 +156,46 @@ test.describe("双栏协作台核心流程", () => {
     await composer.fill("补充人物动机");
     await page.getByRole("button", { name: "发送" }).click();
 
-    await expect(page.getByText("改动已显示在当前内容", { exact: true })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText("实时提案", { exact: true })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "跟随 Agent 草稿" })).toHaveCount(0);
+    await expect(page.getByText("改动已显示在当前内容", { exact: true })).toBeVisible({
+      timeout: 15_000,
+    });
     const characterField = page
       .locator(".character-field")
       .filter({ hasText: "深层动机" });
     const inlineDraft = characterField.locator(".agent-field-draft");
     await expect(inlineDraft).toBeVisible();
     await expect(inlineDraft).toContainText("守护灯塔");
-    await expect(page.getByLabel("深层动机")).toHaveValue("守住不该被遗忘的真相");
-    await inlineDraft.getByRole("button", { name: "手动修改" }).click();
-    await page
-      .getByRole("textbox", { name: "深层动机 Agent 草稿手动修改" })
-      .fill("守住最后一束灯光");
-    await inlineDraft.getByRole("button", { name: "接受改动" }).click();
+    await expect(page.getByLabel("深层动机")).toHaveValue(
+      "守住不该被遗忘的真相",
+    );
+    await expect(inlineDraft).toContainText("即将自动保存");
     await expect.poll(
-      () => mock.requests.some(
-        (request) =>
-          request.method === "PATCH" &&
-          request.path === "/projects/project-1/assistant/proposals/proposal-1" &&
-          JSON.stringify(request.body).includes("守住最后一束灯光"),
-      ),
-    ).toBe(true);
-    await expect.poll(
-      () => mock.requests.some((request) => request.method === "POST" && request.path.includes("/assistant/proposals/proposal-1/apply")),
+      () =>
+        mock.requests.some(
+          (request) =>
+            request.method === "POST" &&
+            request.path ===
+              "/projects/project-1/assistant/proposals/apply-batch" &&
+            JSON.stringify(request.body).includes("proposal-1"),
+        ),
+      { timeout: 15_000 },
     ).toBe(true);
   });
 
+  test("协作台不再显示 Agent 接受或拒绝按钮", async ({ page }) => {
+    await openStudio(page);
+    await page.getByRole("button", { name: /^人物/ }).first().click();
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("补充人物动机");
+    await page.getByRole("button", { name: "发送" }).click();
+
+    const liveBuild = page.getByRole("region", {
+      name: "Agent 实时制作进度",
+    });
+    await expect(liveBuild).toBeVisible({ timeout: 15_000 });
+    await expect(liveBuild.getByRole("button", { name: /接受|拒绝/ })).toHaveCount(0);
+  });
   test("Agent 制作人物卡时同步铺开故事图谱并显示真实过渡", async ({ page }) => {
     await mockStoryApi(page, {
       initialProjects: [storyProjectFixture],
@@ -220,7 +310,150 @@ test.describe("双栏协作台核心流程", () => {
     await expect(page.getByText("已整理人物设定。", { exact: true })).toBeVisible();
   });
 
-  test("Agent 正文改动在稿纸标题处实时出现并可就地确认", async ({ page }) => {
+  test("Agent 提示固定在状态栏且不会推动输入区", async ({ page }) => {
+    await openStudio(page);
+
+    const dock = page.locator(".agent-dock");
+    const rail = dock.getByLabel("Agent 当前状态");
+    const composer = dock.locator(".agent-compose");
+    await expect(rail).toContainText("Agent 已就位");
+    await expect(rail).toHaveCSS("height", "48px");
+    const before = await composer.boundingBox();
+
+    await dock.getByRole("button", { name: "新建 Agent 对话" }).click();
+    await expect(rail).toContainText("新的章节对话已准备好");
+    const after = await composer.boundingBox();
+
+    expect(before).not.toBeNull();
+    expect(after).not.toBeNull();
+    expect(after?.y).toBe(before?.y);
+    expect(after?.height).toBe(before?.height);
+  });
+
+  test("历史对话使用首条指令命名并在独立面板中检索", async ({ page }) => {
+    await openStudio(page);
+
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("梳理林渡与灯塔守则的冲突");
+    await page.getByRole("button", { name: "发送" }).click();
+    await expect(page.getByText("已整理人物设定。", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "查看历史对话" }).click();
+    const history = page.getByRole("dialog", { name: "历史 Agent 会话" });
+    await expect(history).toBeVisible();
+    await expect(history.getByText("梳理林渡与灯塔守则的冲突", { exact: true })).toBeVisible();
+    await expect(history.getByText("正在使用", { exact: true })).toBeVisible();
+
+    await history.getByRole("textbox", { name: "搜索历史对话" }).fill("不存在");
+    await expect(history.getByText("没有匹配的对话", { exact: true })).toBeVisible();
+    await history.getByRole("button", { name: "关闭历史对话" }).click();
+    await expect(history).toBeHidden();
+    await expect(page.getByRole("textbox", { name: "发送给 Agent 的消息" })).toBeVisible();
+  });
+
+  test("不新建对话时连续消息留在同一个章节会话", async ({ page }) => {
+    const mock = await mockStoryApi(page, {
+      initialProjects: [storyProjectFixture],
+      assistantProposals: [],
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "打开雾中灯塔" }).click();
+
+    const composer = page.getByRole("textbox", { name: "发送给 Agent 的消息" });
+    await composer.fill("先分析这一章的节奏");
+    await page.getByRole("button", { name: "发送" }).click();
+    await expect(page.getByText("已整理人物设定。", { exact: true })).toBeVisible();
+    await composer.fill("继续说说结尾应该怎样收束");
+    await page.getByRole("button", { name: "发送" }).click();
+    await expect(page.getByText("继续说说结尾应该怎样收束", { exact: true })).toBeVisible();
+
+    const conversationCreates = mock.requests.filter(
+      (request) =>
+        request.method === "POST" &&
+        request.path === "/projects/project-1/assistant/conversations",
+    );
+    const messagePosts = mock.requests.filter(
+      (request) =>
+        request.method === "POST" &&
+        request.path === "/projects/project-1/assistant/conversations/assistant-1/messages",
+    );
+    expect(conversationCreates).toHaveLength(1);
+    expect(messagePosts).toHaveLength(2);
+  });
+
+  test("全书协作按章进入左侧 Diff，整批接受后显示记忆进度", async ({ page }) => {
+    const mock = await mockStoryApi(page, {
+      initialProjects: [storyProjectFixture],
+      assistantProposal: {
+        id: "global-chapter-proposal",
+        operation: "edit_chapter",
+        target_type: "chapter",
+        target_id: "chapter-1",
+        target: { type: "chapter", id: "chapter-1", chapter_id: "chapter-1" },
+        summary: "统一第一章伏笔",
+        patches: [
+          {
+            path: "replacement",
+            value: "林渡在雾里看见灯塔亮起，守则上的旧墨也随之浮现。",
+          },
+        ],
+        status: "proposed",
+        base_memory_epoch: 3,
+      },
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "打开雾中灯塔" }).click();
+    await page.getByRole("button", { name: "全书协作" }).click();
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("统一检查第一章的守则伏笔");
+    await page.getByRole("button", { name: "发送" }).click();
+
+    await expect(page.getByRole("region", { name: "全书 Diff 章节索引" })).toContainText(
+      "第 1 章",
+    );
+    await expect(page.getByRole("region", { name: "全书改动 Diff" })).toBeVisible();
+    expect(
+      mock.requests.some(
+        (request) =>
+          request.method === "POST" &&
+          request.path === "/projects/project-1/assistant/proposals/apply-batch",
+      ),
+    ).toBe(false);
+
+    await page.getByRole("button", { name: "全部接受" }).click();
+    await expect(page.getByText("全书记忆正在后台整理", { exact: true })).toBeVisible();
+    await expect(page.getByRole("progressbar", { name: "全书记忆整理进度" })).toHaveAttribute(
+      "aria-valuenow",
+      "48",
+    );
+    await page.getByText("全书记忆正在后台整理", { exact: true }).click();
+    await expect(page.getByText("下一版正在形成", { exact: true })).toBeVisible();
+    await expect(page.getByText(/旧版全书记忆.*仍在安全使用/)).toBeVisible();
+  });
+
+  test("运行中的 Agent 可以停止且保留当前对话", async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    await mockStoryApi(page, {
+      initialProjects: [storyProjectFixture],
+      assistantHoldRun: true,
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "打开雾中灯塔" }).click();
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("先试写一个开场");
+    await page.getByRole("button", { name: "发送" }).click();
+
+    const stop = page.getByRole("button", { name: "停止 Agent 当前任务" });
+    await expect(stop).toBeEnabled();
+    await stop.click();
+    await expect(page.getByLabel("Agent 当前状态")).toContainText("已停止");
+    await expect(page.getByRole("button", { name: "发送" })).toBeVisible();
+  });
+
+  test("Agent 正文在当前稿纸中实时出现并自动保存", async ({ page }) => {
     const mock = await openStudio(page, {
       id: "chapter-proposal-1",
       operation: "edit_chapter",
@@ -245,54 +478,34 @@ test.describe("双栏协作台核心流程", () => {
       .fill("在这一章补一段异响");
     await page.getByRole("button", { name: "发送" }).click();
 
-    const titleReview = page
-      .locator(".manuscript-editor-head")
-      .getByRole("region", { name: "Agent 正文改动操作" });
-    await expect(titleReview).toBeVisible({ timeout: 15_000 });
-    await expect(titleReview).toContainText("Agent 已准备一处改动");
-    await expect(titleReview.getByRole("button", { name: "同意改变" })).toBeVisible();
-    await expect(titleReview.getByRole("button", { name: "拒绝" })).toBeVisible();
-    await expect(page.getByRole("button", { name: /待处理/ })).toHaveCount(0);
+    const manuscript = page.getByRole("textbox", {
+      name: "第一章 · 灯塔亮起正文",
+    });
+    await expect(manuscript).toHaveValue(
+      "林渡在雾里看见灯塔亮起。楼梯深处传来三声敲击。",
+      { timeout: 15_000 },
+    );
+    await expect(manuscript).not.toBeEditable();
+    await expect(page.locator(".manuscript-live-status")).toContainText(
+      /Agent 正在写入正文|正在自动保存正文/,
+    );
+    await expect(page.getByRole("button", { name: /接受|拒绝/ })).toHaveCount(0);
 
-    await titleReview.getByRole("button", { name: "查看改动" }).click();
-    const draft = page.getByRole("region", { name: "Agent 正文草稿对比" });
-    await expect(draft).toBeVisible();
-    await expect(draft).toBeInViewport();
-    await expect(draft).toContainText("楼梯深处传来三声敲击");
-    await draft.getByRole("button", { name: "手动调整" }).click();
-    const editor = draft.getByRole("textbox", { name: "Agent 正文草稿预览" });
-    await expect(editor).toBeEditable();
-    await expect(draft.getByRole("button", { name: "放弃调整" })).toBeVisible();
-    await editor.fill("林渡在雾里看见灯塔亮起。楼梯深处传来两声敲击。");
-    await titleReview.getByRole("button", { name: "同意改变" }).click();
-
-    await expect
-      .poll(
-        () =>
-          mock.requests.some(
-            (request) =>
-              request.method === "PATCH" &&
-              request.path ===
-                "/projects/project-1/assistant/proposals/chapter-proposal-1" &&
-              JSON.stringify(request.body).includes("两声敲击"),
-          ),
-        { timeout: 15_000 },
-      )
-      .toBe(true);
     await expect
       .poll(
         () =>
           mock.requests.some(
             (request) =>
               request.method === "POST" &&
-              request.path.includes("/chapter-proposal-1/apply"),
+              request.path ===
+                "/projects/project-1/assistant/proposals/apply-batch" &&
+              JSON.stringify(request.body).includes("chapter-proposal-1"),
           ),
         { timeout: 15_000 },
       )
       .toBe(true);
   });
-
-  test("Agent 关系草稿直接画进图谱并在图上处理", async ({ page }) => {
+  test("Agent 关系生成过程直接画进图谱并自动保存", async ({ page }) => {
     const mock = await openStudio(page, {
       id: "edge-proposal-1",
       operation: "upsert_graph_edge",
@@ -321,21 +534,117 @@ test.describe("双栏协作台核心流程", () => {
     await expect(page.locator(".react-flow__edge.agent-draft-edge")).toHaveCount(1, {
       timeout: 15_000,
     });
-    await graphDraft.getByRole("button", { name: "手动修改" }).click();
-    await graphDraft
-      .getByRole("textbox", { name: "关系标签 Agent 草稿手动修改" })
-      .fill("隐瞒真相");
-    await graphDraft.getByRole("button", { name: "接受改动" }).click();
+    await expect(graphDraft).toContainText("连线正在自动保存");
 
-    await expect.poll(() =>
-      mock.requests.some(
-        (request) =>
-          request.method === "PATCH" &&
-          request.path ===
-            "/projects/project-1/assistant/proposals/edge-proposal-1" &&
-          JSON.stringify(request.body).includes("隐瞒真相"),
-      ),
-    ).toBe(true);
+    await expect
+      .poll(
+        () =>
+          mock.requests.some(
+            (request) =>
+              request.method === "POST" &&
+              request.path ===
+                "/projects/project-1/assistant/proposals/apply-batch" &&
+              JSON.stringify(request.body).includes("edge-proposal-1"),
+          ),
+        { timeout: 15_000 },
+      )
+      .toBe(true);
+  });
+
+  test("图谱只保留自动写入和自动保存", async ({ page }) => {
+    const mock = await mockStoryApi(page, {
+      initialProjects: [storyProjectFixture],
+      assistantProposal: {
+        id: "auto-edge-proposal",
+        operation: "upsert_graph_edge",
+        target_type: "relationship",
+        target: { type: "relationship", id: "" },
+        summary: "自动纳入关系",
+        patches: [
+          { path: "source_node_id", value: "node-char-1" },
+          { path: "target_node_id", value: "node-thread-1" },
+          { path: "relation_type", value: "守望" },
+        ],
+        status: "proposed",
+        base_memory_epoch: 3,
+      },
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "打开雾中灯塔" }).click();
+    await page.getByRole("button", { name: "故事图谱" }).click();
+    const toolbar = page.locator(".story-graph-toolbar");
+    await expect(toolbar.getByRole("button", { name: /自动接受|需要批准|保存图谱/ })).toHaveCount(0);
+
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("补一条本章人物关系");
+    await page.getByRole("button", { name: "发送" }).click();
+    await expect
+      .poll(
+        () =>
+          mock.requests.some(
+            (request) =>
+              request.method === "POST" &&
+              request.path ===
+                "/projects/project-1/assistant/proposals/apply-batch" &&
+              JSON.stringify(request.body).includes("auto-edge-proposal"),
+          ),
+        { timeout: 15_000 },
+      )
+      .toBe(true);
+
+  });
+
+  test("没有稿纸时写章请求会自动创建 Agent 草稿并落入正文预览", async ({ page }) => {
+    const project = { ...emptyStoryProjectFixture };
+    const mock = await mockStoryApi(page, {
+      initialProjects: [project],
+      assistantProposal: {
+        id: "new-manuscript-proposal",
+        operation: "edit_chapter",
+        target_type: "chapter",
+        target_id: "project-empty-chapter-1",
+        target: {
+          type: "chapter",
+          id: "project-empty-chapter-1",
+          chapter_id: "project-empty-chapter-1",
+        },
+        summary: "写入第一章草稿",
+        patches: [
+          {
+            path: "new_content",
+            value: "钟声响过三次，少年推开了无人值守的城门。",
+          },
+        ],
+        status: "proposed",
+      },
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "打开空白灯塔" }).click();
+    await page
+      .getByRole("textbox", { name: "发送给 Agent 的消息" })
+      .fill("给我仿照这个风格写第一章");
+    await page.getByRole("button", { name: "发送" }).click();
+
+    await expect(page.getByRole("heading", { name: "第1章 · Agent 草稿" })).toBeVisible();
+    await expect(page.getByText("1 张稿纸", { exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("textbox", { name: "第1章 · Agent 草稿正文" }),
+    ).toHaveValue("钟声响过三次，少年推开了无人值守的城门。", {
+      timeout: 15_000,
+    });
+    const chapterCreateIndex = mock.requests.findIndex(
+      (request) =>
+        request.method === "POST" &&
+        request.path === "/projects/project-empty/chapters",
+    );
+    const agentMessageIndex = mock.requests.findIndex(
+      (request) =>
+        request.method === "POST" &&
+        request.path.includes("/assistant/conversations/assistant-1/messages"),
+    );
+    expect(chapterCreateIndex).toBeGreaterThanOrEqual(0);
+    expect(agentMessageIndex).toBeGreaterThan(chapterCreateIndex);
   });
 
   test("空项目保留写作、定人物和导入旧稿三个入口", async ({ page }) => {
@@ -347,6 +656,26 @@ test.describe("双栏协作台核心流程", () => {
     await expect(page.getByRole("button", { name: "开始写正文" })).toBeVisible();
     await expect(page.getByRole("button", { name: "和 Agent 定人物" })).toBeVisible();
     await expect(page.getByRole("button", { name: "导入旧稿" })).toBeVisible();
+  });
+
+  test("空项目的故事图谱按钮给出可执行入口", async ({ page }) => {
+    const mock = await mockStoryApi(page, {
+      initialProjects: [emptyStoryProjectFixture],
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: "打开空白灯塔" }).click();
+    await page.getByRole("button", { name: "故事图谱" }).click();
+
+    await expect(page.getByText("先为本章铺一张稿纸", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "新建稿纸" }).click();
+    await expect(page.getByRole("heading", { name: "第1章 · 未命名稿纸" })).toBeVisible();
+    await expect.poll(() =>
+      mock.requests.some(
+        (request) =>
+          request.method === "POST" &&
+          request.path === "/projects/project-empty/chapters",
+      ),
+    ).toBe(true);
   });
 
   test("1024px 保留内容与 Agent 双栏，390px 使用单栏切换", async ({ page }) => {

@@ -824,6 +824,110 @@ def test_assistant_conversation_reports_effective_provider(api) -> None:
     assert conversation["provider_capabilities"]["vision"] is False
 
 
+def test_first_user_turn_names_default_conversation(api) -> None:
+    client, _factory, _owner_id = api
+    project = _new_project(client, "历史标题")
+    created = client.post(
+        f"/api/projects/{project['id']}/assistant/conversations",
+        json={},
+    )
+    assert created.status_code == 201, created.text
+    conversation = created.json()
+    response = client.post(
+        f"/api/projects/{project['id']}/assistant/conversations/{conversation['id']}/messages",
+        json={
+            "content": "让林渡在本章结尾发现第二座灯塔，然后停在悬念处。",
+            "idempotency_key": "history-title",
+        },
+    )
+    assert response.status_code == 202, response.text
+    assert response.json()["conversation"]["title"] == "让林渡在本章结尾发现第二座灯塔，然后停在悬念…"
+
+
+def test_assistant_compacts_older_turns_into_durable_conversation_memory(store) -> None:
+    _engine, factory = store
+    with factory() as db:
+        user, profile = seed_tenant(db)
+        assert profile is not None
+        project = _project(db, user.id, "长对话")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+            provider_profile_id=profile.id,
+            title="持续写作",
+        )
+        db.add(conversation)
+        db.flush()
+        rows: list[models.AgentMessage] = []
+        for sequence in range(1, 25):
+            row = models.AgentMessage(
+                project_id=project.id,
+                conversation_id=conversation.id,
+                sequence=sequence,
+                role="user" if sequence % 2 else "assistant",
+                content=f"第 {sequence} 轮关于灯塔守则的决定",
+                status="completed",
+            )
+            rows.append(row)
+            db.add(row)
+        db.flush()
+        run = models.AgentRun(
+            project_id=project.id,
+            conversation_id=conversation.id,
+            message_id=rows[-1].id,
+            idempotency_key="long-memory",
+            status="queued",
+            stage="queued",
+        )
+        db.add(run)
+        db.flush()
+
+        messages, _asset_ids = assistant_service._provider_messages(
+            db, conversation, run, project, user, profile
+        )
+
+        memory = conversation.context_snapshot["conversation_memory"]
+        assert "第 1 轮关于灯塔守则的决定" in memory
+        assert conversation.context_snapshot["memory_through_sequence"] == 6
+        assert any("压缩协作记录" in str(item["content"]) for item in messages)
+        assert str(messages[-1]["content"]).startswith("第 24 轮")
+
+
+def test_user_can_cancel_a_queued_assistant_run(store) -> None:
+    _engine, factory = store
+    with factory() as db:
+        user, _profile = seed_tenant(db)
+        project = _project(db, user.id, "停止任务")
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+        )
+        db.add(conversation)
+        db.commit()
+        message, run, _created = assistant_service.create_message_run(
+            db,
+            conversation,
+            user,
+            "先停一下",
+            idempotency_key="cancel-run",
+        )
+
+        stopped = assistant_service.cancel_assistant_run(
+            db, conversation, run, user
+        )
+
+        assert stopped.status == "cancelled"
+        assert stopped.stage == "cancelled"
+        job = db.get(models.Job, stopped.job_id)
+        assert job is not None
+        assert job.state == "cancelled"
+        events = db.scalars(
+            select(models.AgentEvent).where(models.AgentEvent.run_id == stopped.id)
+        ).all()
+        assert events[-1].event_type == "run.cancelled"
+        assert message.content == "先停一下"
+
+
 def test_assistant_message_idempotency_and_last_event_id_resume(api, monkeypatch) -> None:
     client, factory, _owner_id = api
     project = _new_project(client)
@@ -1745,7 +1849,7 @@ def _seed_chapter_proposal(
         return proposal.id, project.memory_epoch
 
 
-def test_assistant_selection_conflict_and_applied_edit_creates_review_bundle(api) -> None:
+def test_assistant_selection_conflict_and_applied_edit_stays_completable(api) -> None:
     client, factory, owner_id = api
     project = _new_project(client, "正文提案项目")
     chapter_response = client.post(
@@ -1806,7 +1910,7 @@ def test_assistant_selection_conflict_and_applied_edit_creates_review_bundle(api
     with factory() as db:
         current = db.get(models.Chapter, chapter["id"])
         assert current is not None
-        assert current.status == "needs_review"
+        assert current.status == "draft"
         new_revision = db.get(models.ChapterRevision, current.current_revision_id)
         old_revision = db.get(models.ChapterRevision, revision.id)
         assert new_revision is not None and old_revision is not None
@@ -1818,9 +1922,125 @@ def test_assistant_selection_conflict_and_applied_edit_creates_review_bundle(api
                 models.ReviewBundle.draft_revision_id == new_revision.id,
             )
         )
-        assert bundle is not None
-        assert bundle.status in {"pending", "needs_review"}
-        assert bundle.draft_revision_id == new_revision.id
+        assert bundle is None
+
+    completed = client.post(
+        f"/api/chapters/{chapter['id']}/complete",
+        json={"analyze": False},
+    )
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["chapter"]["status"] == "confirmed"
+
+
+def test_global_diff_accepts_chapter_and_queues_project_memory(api) -> None:
+    client, factory, owner_id = api
+    project = _new_project(client, "全书协作项目")
+    created = client.post(
+        f"/api/projects/{project['id']}/chapters",
+        json={"chapter_number": 1, "title": "第一章", "content": "旧正文"},
+    )
+    assert created.status_code == 201, created.text
+    chapter = created.json()
+    confirmed = client.post(f"/api/chapters/{chapter['id']}/confirm")
+    assert confirmed.status_code == 200, confirmed.text
+
+    with factory() as db:
+        project_row = db.get(models.Project, project["id"])
+        chapter_row = db.get(models.Chapter, chapter["id"])
+        revision = db.get(models.ChapterRevision, chapter_row.current_revision_id)
+        assert project_row is not None and chapter_row is not None and revision is not None
+        base_epoch = project_row.memory_epoch
+        conversation = models.AgentConversation(
+            project_id=project_row.id,
+            created_by_user_id=owner_id,
+            purpose="global",
+            title="贯穿全书修改",
+        )
+        db.add(conversation)
+        db.flush()
+        user_message = models.AgentMessage(
+            project_id=project_row.id,
+            conversation_id=conversation.id,
+            sequence=1,
+            role="user",
+            content="统一调整第一章伏笔",
+            status="completed",
+        )
+        db.add(user_message)
+        db.flush()
+        run = models.AgentRun(
+            project_id=project_row.id,
+            conversation_id=conversation.id,
+            message_id=user_message.id,
+            idempotency_key="global-diff-test",
+            status="completed",
+            stage="completed",
+        )
+        db.add(run)
+        db.flush()
+        change_set = models.ChangeSet(
+            project_id=project_row.id,
+            source_type="assistant",
+            source_id=run.id,
+            base_memory_epoch=base_epoch,
+            status="proposed",
+            summary="第一章改动",
+            created_by_user_id=owner_id,
+        )
+        db.add(change_set)
+        db.flush()
+        proposal = models.Proposal(
+            project_id=project_row.id,
+            change_set_id=change_set.id,
+            operation="edit_chapter",
+            target_type="chapter",
+            target_id=chapter_row.id,
+            scope_chapter_id=chapter_row.id,
+            patch_json={
+                "base_revision_id": revision.id,
+                "base_content_hash": revision.content_hash,
+                "selection_start": 0,
+                "selection_end": len(revision.content),
+                "selection_hash": revision.content_hash,
+                "replacement": "新正文，伏笔已经统一。",
+            },
+            base_memory_epoch=base_epoch,
+            status="proposed",
+            reason="全书协作",
+            created_by_user_id=owner_id,
+        )
+        db.add(proposal)
+        db.commit()
+        proposal_id = proposal.id
+
+    accepted = client.post(
+        "/api/assistant/proposals/apply-batch",
+        json={
+            "proposal_ids": [proposal_id],
+            "expected_memory_epoch": base_epoch,
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    payload = accepted.json()
+    assert payload["proposals"][0]["status"] == "applied"
+    assert payload["memory_run"]["scope"] == "project"
+    assert payload["memory_run"]["status"] == "queued"
+    assert payload["memory_run"]["progress"] >= 0
+
+    with factory() as db:
+        project_row = db.get(models.Project, project["id"])
+        chapter_row = db.get(models.Chapter, chapter["id"])
+        current = db.get(models.ChapterRevision, chapter_row.current_revision_id)
+        assert project_row is not None and chapter_row is not None and current is not None
+        assert current.content == "新正文，伏笔已经统一。"
+        assert chapter_row.accepted_revision_id == current.id
+        assert chapter_row.status == "confirmed"
+        assert project_row.memory_epoch == base_epoch + 1
+        assert db.scalar(
+            select(models.MemoryBuildRun).where(
+                models.MemoryBuildRun.id == payload["memory_run"]["id"]
+            )
+        ) is not None
 
 
 def test_minimal_0002_sqlite_migrates_to_story_workspace_head(tmp_path: Path) -> None:
@@ -1878,7 +2098,7 @@ def test_minimal_0002_sqlite_migrates_to_story_workspace_head(tmp_path: Path) ->
         }
         with engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                "20260902_0006"
+                "20260903_0008"
             )
     finally:
         engine.dispose()
@@ -2011,7 +2231,7 @@ def test_0005_story_graph_rows_are_backfilled_into_current_chapter(tmp_path: Pat
             )
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "20260902_0006"
+                ).scalar_one() == "20260903_0008"
     finally:
         engine.dispose()
 

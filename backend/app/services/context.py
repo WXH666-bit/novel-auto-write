@@ -158,6 +158,9 @@ def build_context(
     *,
     budget: int | None = None,
     query: str = "",
+    recent_chapter_content_count: int = 2,
+    include_change_overlay: bool = False,
+    include_search_chapter_bodies: bool = False,
 ) -> dict[str, Any]:
     """Build a context snapshot with non-droppable hard/current sections.
 
@@ -166,8 +169,10 @@ def build_context(
     """
 
     from ..models import (
+        AuditLog,
         CanonItem,
         Chapter,
+        ChapterRevision,
         Character,
         PlotThread,
         StoryGraphEdge,
@@ -211,6 +216,68 @@ def build_context(
         mandatory.append(
             _source("story_summary", project_summary, "小说当前总览", project_summary.summary_text)
         )
+
+    # A completed memory snapshot is replaced atomically, so it is safe to
+    # keep using it while the next build runs.  Accepted edits made after that
+    # snapshot form a small, explicit overlay.  This closes the otherwise
+    # dangerous gap where an Agent would see a reliable old summary but miss
+    # the author's most recent confirmed decisions.
+    if include_change_overlay and project_summary is not None:
+        changed_chapters = session.scalars(
+            select(Chapter)
+            .where(
+                Chapter.project_id == project.id,
+                Chapter.accepted_revision_id.is_not(None),
+                Chapter.updated_at > project_summary.updated_at,
+            )
+            .order_by(Chapter.sort_order.desc(), Chapter.chapter_number.desc())
+            .limit(10)
+        ).all()
+        for changed in changed_chapters:
+            revision = _current_revision(session, changed, accepted_only=True)
+            if revision is None or not safe_text(revision.content).strip():
+                continue
+            mandatory.append(
+                _source(
+                    "memory_overlay",
+                    changed,
+                    f"摘要版本后的第{changed.chapter_number}章确认正文",
+                    revision.content,
+                    chapter_id=changed.id,
+                    revision_id=revision.id,
+                )
+            )
+        recent_audits = session.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.project_id == project.id,
+                AuditLog.created_at > project_summary.updated_at,
+            )
+            .order_by(AuditLog.created_at.desc())
+            .limit(30)
+        ).all()
+        audit_lines = []
+        for audit in reversed(recent_audits):
+            if audit.action in {
+                "assistant.chapter_draft_written",
+                "memory.queued",
+                "memory.completed",
+            }:
+                continue
+            detail = safe_text(audit.after_json or {})
+            audit_lines.append(
+                f"{audit.action}｜{audit.entity_type or 'story'}#{audit.entity_id or ''}"
+                + (f"｜{detail[:900]}" if detail else "")
+            )
+        if audit_lines:
+            mandatory.append(
+                ContextSource(
+                    "memory_overlay",
+                    project.id,
+                    "摘要版本后的已确认变更账本",
+                    "\n".join(audit_lines),
+                )
+            )
 
     # Project-level generation requirements are durable story settings, not
     # optional search context.  Keep both lists mandatory and label them
@@ -355,8 +422,12 @@ def build_context(
         if _value(item, "sort_order", _value(item, "chapter_number", 0)) < current_ordinal
         and _value(item, "accepted_revision_id")
     ]
-    # The current chapter and the last two accepted chapters are high priority.
-    for item in ([chapter] if chapter is not None else []) + previous[:2]:
+    recent_count = max(0, min(10, int(recent_chapter_content_count)))
+    # The current chapter and the requested number of previous accepted
+    # chapters are high priority.  Agent conversations request ten so a new
+    # chapter thread has the agreed near-history; other generation paths keep
+    # the conservative default of two.
+    for item in ([chapter] if chapter is not None else []) + previous[:recent_count]:
         if item is None:
             continue
         is_target = chapter is not None and item.id == chapter.id
@@ -387,7 +458,7 @@ def build_context(
             )
 
     # Summaries of older chapters are useful but are the first data to trim.
-    for item in previous[2:]:
+    for item in previous[recent_count:]:
         summary = safe_text(_value(item, "summary", ""))
         if summary and _value(item, "summary_status", "current") == "current":
             optional.append(
@@ -445,11 +516,46 @@ def build_context(
     # Structured/entity search makes distant callbacks discoverable without
     # pulling all old prose into the prompt.
     search_query = query or safe_text(_value(project, "description", ""))[:120]
-    for chapter_id, revision_id, excerpt in _fts_search(
+    search_hits = _fts_search(
         session,
         project,
         search_query,
-    ):
+    )
+    included_chapter_ids = {
+        str(item.chapter_id)
+        for item in mandatory
+        if item.chapter_id
+    }
+    if include_search_chapter_bodies:
+        for chapter_id, revision_id, _excerpt in search_hits[:10]:
+            if str(chapter_id) in included_chapter_ids:
+                continue
+            revision = session.scalar(
+                select(ChapterRevision).where(
+                    ChapterRevision.id == str(revision_id),
+                    ChapterRevision.chapter_id == str(chapter_id),
+                )
+            )
+            matched_chapter = session.scalar(
+                select(Chapter).where(
+                    Chapter.id == str(chapter_id),
+                    Chapter.project_id == project.id,
+                )
+            )
+            if revision is None or matched_chapter is None:
+                continue
+            optional.append(
+                _source(
+                    "retrieved_chapter",
+                    matched_chapter,
+                    f"检索命中的第{matched_chapter.chapter_number}章完整正文",
+                    revision.content,
+                    chapter_id=matched_chapter.id,
+                    revision_id=revision.id,
+                )
+            )
+            included_chapter_ids.add(str(chapter_id))
+    for chapter_id, revision_id, excerpt in search_hits:
         if not excerpt:
             continue
         optional.append(

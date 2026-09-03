@@ -53,6 +53,12 @@ def _require_run(db: Session, run_id: str, user: User) -> MemoryBuildRun:
     return run
 
 
+def _run_read(run: MemoryBuildRun) -> MemoryBuildRunRead:
+    payload = MemoryBuildRunRead.model_validate(run).model_dump()
+    payload.update(memory_run_snapshot(run))
+    return MemoryBuildRunRead.model_validate(payload)
+
+
 @router.get("/projects/{project_id}/memory")
 def get_project_memory(
     project_id: str,
@@ -86,7 +92,7 @@ def get_project_memory(
             for item in summaries
             if item.scope == "chapter"
         ],
-        "runs": [MemoryBuildRunRead.model_validate(item).model_dump(mode="json") for item in runs],
+        "runs": [_run_read(item).model_dump(mode="json") for item in runs],
     }
 
 
@@ -132,7 +138,7 @@ def get_memory_run(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> MemoryBuildRunRead:
-    return MemoryBuildRunRead.model_validate(_require_run(db, run_id, current_user))
+    return _run_read(_require_run(db, run_id, current_user))
 
 
 @router.post("/memory-runs/{run_id}/retry", response_model=MemoryBuildRunRead)
@@ -162,7 +168,7 @@ def retry_memory_run(
     db.commit()
     background.add_task(_run_background, str(run.id))
     db.refresh(run)
-    return MemoryBuildRunRead.model_validate(run)
+    return _run_read(run)
 
 
 def _memory_events(
