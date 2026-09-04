@@ -73,6 +73,69 @@ AGENT_LEASE_HEARTBEAT_SECONDS = 30.0
 AGENT_DELTA_BATCH_CHARS = 220
 AGENT_DELTA_BATCH_SECONDS = 0.2
 
+_CHAPTER_WRITE_ACTION = re.compile(
+    r"(?:写|写作|创作|创造|创建|续写|扩写|改写|重写|起草|生成|仿写|撰写|编写)"
+)
+_CHAPTER_WRITE_OBJECT = re.compile(
+    r"(?:第\s*[一二三四五六七八九十百千万零〇两\d]+\s*章|章节|正文|开篇|序章|草稿)"
+)
+_CHAPTER_NUMBER_REFERENCE = re.compile(
+    r"第\s*([一二三四五六七八九十百千万零〇两\d]+)\s*章"
+)
+
+
+def _message_requests_chapter_write(value: str | None) -> bool:
+    """Recognise an explicit manuscript request independently of the client.
+
+    The browser sends a convenience flag so it can create an empty sheet
+    before dispatch.  The server must still derive the same intent from the
+    durable user message: older browser bundles and alternate clients may not
+    know the latest wording (for example, ``创造第一章``).
+    """
+
+    content = str(value or "").strip()
+    return bool(
+        content
+        and _CHAPTER_WRITE_ACTION.search(content)
+        and _CHAPTER_WRITE_OBJECT.search(content)
+    )
+
+
+def _chapter_numbers_in_message(value: str | None) -> list[int]:
+    """Return unique chapter ordinals mentioned with Arabic or Chinese digits."""
+
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10_000}
+
+    def parse(token: str) -> int | None:
+        if token.isdigit():
+            return int(token)
+        if not token or any(char not in digits and char not in units for char in token):
+            return None
+        if not any(char in units for char in token):
+            return int("".join(str(digits[char]) for char in token))
+        total = section = number = 0
+        for char in token:
+            if char in digits:
+                number = digits[char]
+                continue
+            unit = units[char]
+            if unit == 10_000:
+                total += (section + number) * unit
+                section = number = 0
+            else:
+                section += (number or 1) * unit
+                number = 0
+        return total + section + number
+
+    result: list[int] = []
+    for match in _CHAPTER_NUMBER_REFERENCE.finditer(str(value or "")):
+        parsed = parse(match.group(1))
+        if parsed is not None and parsed > 0 and parsed not in result:
+            result.append(parsed)
+    return result
+
 # SQLite does not implement SELECT ... FOR UPDATE.  The desktop deployment is
 # intentionally a single application process, so keep each conversation's
 # message/event allocation locked through the service commit.  MySQL continues
@@ -135,6 +198,63 @@ def _run_attempt(run: AgentRun | None) -> int:
         return max(1, int((run.input_snapshot or {}).get("attempt", 1)))
     except (TypeError, ValueError):
         return 1
+
+
+def _discard_incomplete_run_proposals(
+    db: Session,
+    conversation: AgentConversation,
+    run: AgentRun,
+    *,
+    reason: str,
+) -> list[str]:
+    """Close previews left by a failed/crashed attempt of the same run."""
+
+    change_sets = list(
+        db.scalars(
+            select(ChangeSet)
+            .where(
+                ChangeSet.project_id == run.project_id,
+                ChangeSet.source_type == "assistant",
+                ChangeSet.source_id == run.id,
+                ChangeSet.status == "building",
+            )
+            .with_for_update()
+        ).all()
+    )
+    if not change_sets:
+        return []
+    now = utcnow()
+    proposal_ids: list[str] = []
+    for change_set in change_sets:
+        proposals = db.scalars(
+            select(Proposal)
+            .where(
+                Proposal.change_set_id == change_set.id,
+                Proposal.status == "building",
+            )
+            .with_for_update()
+        ).all()
+        for proposal in proposals:
+            proposal.status = "rejected"
+            proposal.resolved_at = now
+            proposal.reason = proposal.reason or reason[:2000]
+            proposal_ids.append(proposal.id)
+        change_set.status = "rejected"
+        change_set.rejected_at = now
+    if proposal_ids:
+        add_event(
+            db,
+            conversation,
+            "proposal.discarded",
+            {
+                "proposal_ids": proposal_ids,
+                "reason": reason,
+                "attempt": _run_attempt(run),
+            },
+            run_id=run.id,
+        )
+    db.flush()
+    return proposal_ids
 
 
 class AgentLeaseLost(RuntimeError):
@@ -1111,6 +1231,25 @@ def _provider_messages(
         chapter = db.scalar(
             select(Chapter).where(Chapter.id == str(chapter_id), Chapter.project_id == project.id)
         )
+    message_write_intent = bool(
+        current is not None and _message_requests_chapter_write(current.content)
+    )
+    if chapter is None and message_write_intent and current is not None:
+        referenced_numbers = _chapter_numbers_in_message(current.content)
+        if len(referenced_numbers) == 1:
+            chapter = db.scalar(
+                select(Chapter).where(
+                    Chapter.project_id == project.id,
+                    Chapter.chapter_number == referenced_numbers[0],
+                )
+            )
+        elif not referenced_numbers and project.current_chapter_id:
+            chapter = db.scalar(
+                select(Chapter).where(
+                    Chapter.id == project.current_chapter_id,
+                    Chapter.project_id == project.id,
+                )
+            )
     authoritative_context = dict(current.context_snapshot or {}) if current is not None else {}
     # This marker is server-derived below; never trust a client-supplied
     # context flag while a real revision is present.
@@ -1208,6 +1347,15 @@ def _provider_messages(
         else "chapter"
     )
     authoritative_context["agent_mode"] = conversation_mode
+    if (
+        chapter is not None
+        and current is not None
+        and (
+            authoritative_context.get("agent_write_intent") is True
+            or message_write_intent
+        )
+    ):
+        authoritative_context["agent_write_intent"] = True
     server_context = build_context(
         db,
         project,
@@ -3209,6 +3357,13 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
             db.rollback()
             return
         run, conversation, project, user, _job, lease_owner = claimed
+        _discard_incomplete_run_proposals(
+            db,
+            conversation,
+            run,
+            reason="上一轮生成未完成，已在重新执行前收起临时预览",
+        )
+        db.commit()
         heartbeat = _start_agent_lease_heartbeat(db, run.id, lease_owner)
 
         profile = _provider(db, user, conversation.provider_profile_id)
@@ -3777,6 +3932,12 @@ def execute_assistant_run(run_id: str, session: Session | None = None) -> None:
                     "stream_error": run.error,
                 }
             if conversation is not None:
+                _discard_incomplete_run_proposals(
+                    db,
+                    conversation,
+                    run,
+                    reason="本轮生成中断，临时预览已收起",
+                )
                 _set_agent_stage(db, conversation, run, "failed", status=run.status)
                 add_event(
                     db,

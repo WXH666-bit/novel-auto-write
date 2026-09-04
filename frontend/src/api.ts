@@ -2860,6 +2860,16 @@ export function normalizeAssistantEvent(value: unknown): AssistantEvent {
       proposal_id: String(payload.proposal_id ?? payload.proposalId ?? ""),
     };
   }
+  if (type === "proposal_discarded") {
+    const proposalIds = payload.proposal_ids ?? payload.proposalIds;
+    return {
+      ...meta,
+      type: "proposal_discarded",
+      proposal_ids: Array.isArray(proposalIds)
+        ? proposalIds.map((value) => String(value)).filter(Boolean)
+        : [],
+    };
+  }
   if (type === "run_failed" || type === "error")
     return {
       ...meta,

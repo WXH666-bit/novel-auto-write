@@ -184,7 +184,7 @@ export function resolveAgentMessageTarget(
 export function shouldAutoCreateChapterDraft(message: string): boolean {
   const value = message.trim();
   if (!value) return false;
-  const writingAction = /(写|创作|续写|扩写|改写|重写|起草|生成|仿写)/;
+  const writingAction = /(写|写作|创作|创造|创建|续写|扩写|改写|重写|起草|生成|仿写|撰写|编写)/;
   const chapterObject = /(第\s*[一二三四五六七八九十百千万零〇两\d]+\s*章|章节|正文|开篇|序章|草稿)/;
   return writingAction.test(value) && chapterObject.test(value);
 }
@@ -3540,6 +3540,15 @@ function AgentDock({
         );
         if (latestRun?.status === "cancelled") {
           setNotice("上次任务已停止，你可以沿着这段对话继续说。");
+        } else if (
+          latestRun?.status === "failed" ||
+          latestRun?.status === "needs_retry"
+        ) {
+          setNotice(
+            latestRun.error || "上次任务没有完成，可以从原位置继续重试。",
+          );
+        } else if (!latestIsBusy) {
+          setNotice("");
         }
       } catch (error) {
         notifyFallback(
@@ -3857,7 +3866,24 @@ function AgentDock({
           ) {
             setStatus("idle");
           }
+        } else if (event.type === "proposal_discarded") {
+          const discarded = new Set(event.proposal_ids);
+          const removed = proposalsRef.current.filter((proposal) =>
+            discarded.has(proposal.id),
+          );
+          const nextProposals = proposalsRef.current.filter(
+            (proposal) => !discarded.has(proposal.id),
+          );
+          proposalsRef.current = nextProposals;
+          setProposals(nextProposals);
+          removed.forEach((proposal) => onProposalDismiss(proposal.id));
         } else if (event.type === "status") {
+          if (
+            liveEventMatch === "stale" &&
+            (!event.run_id || event.run_id !== activeRunIdRef.current)
+          ) {
+            return;
+          }
           setStatus(event.status);
           if (event.stage) setActiveStage(event.stage);
           if (event.message) {
@@ -3897,6 +3923,12 @@ function AgentDock({
             setActiveStage("");
           }
         } else if (event.type === "error") {
+          if (
+            liveEventMatch === "stale" &&
+            (!event.run_id || event.run_id !== activeRunIdRef.current)
+          ) {
+            return;
+          }
           setStatus("error");
           setFailedRunId(event.run_id || "");
           setNotice(

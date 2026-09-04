@@ -8,7 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import and_, exists, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from .common import utcnow
 
@@ -204,18 +204,58 @@ class DurableTaskRunner:
         from ..models import Job
 
         now = utcnow()
+        active_sibling = aliased(Job)
+        earlier_candidate = aliased(Job)
+        lease_available = or_(
+            Job.lease_owner.is_(None),
+            Job.lease_expires_at.is_(None),
+            Job.lease_expires_at < now,
+        )
+        earlier_lease_available = or_(
+            earlier_candidate.lease_owner.is_(None),
+            earlier_candidate.lease_expires_at.is_(None),
+            earlier_candidate.lease_expires_at < now,
+        )
         return list(
             session.scalars(
                 select(Job)
                 .where(
                     Job.state == "queued",
-                    or_(
-                        Job.lease_owner.is_(None),
-                        Job.lease_expires_at.is_(None),
-                        Job.lease_expires_at < now,
+                    lease_available,
+                    # Do this filtering in one database query.  The previous
+                    # implementation issued a sibling query for every row and
+                    # could fill its LIMIT with old work from one project,
+                    # leaving workers idle while other projects were queued.
+                    ~exists(
+                        select(active_sibling.id).where(
+                            active_sibling.project_id == Job.project_id,
+                            active_sibling.id != Job.id,
+                            active_sibling.lease_owner.is_not(None),
+                            active_sibling.lease_expires_at > now,
+                            active_sibling.state.notin_(TERMINAL_JOB_STATES),
+                        )
+                    ),
+                    # Return only the oldest runnable job for each project.
+                    # MySQL processes can therefore race for the same job,
+                    # rather than accidentally starting two different jobs
+                    # for the same novel.  Workflow leases remain the final
+                    # cross-process ownership check.
+                    ~exists(
+                        select(earlier_candidate.id).where(
+                            earlier_candidate.project_id == Job.project_id,
+                            earlier_candidate.state == "queued",
+                            earlier_lease_available,
+                            or_(
+                                earlier_candidate.created_at < Job.created_at,
+                                and_(
+                                    earlier_candidate.created_at == Job.created_at,
+                                    earlier_candidate.id < Job.id,
+                                ),
+                            ),
+                        )
                     ),
                 )
-                .order_by(Job.created_at)
+                .order_by(Job.created_at, Job.id)
                 .limit(max(4, self.workers * 4))
             ).all()
         )
@@ -230,23 +270,9 @@ class DurableTaskRunner:
             return 0
         with self.session_factory() as session:
             candidates = self._candidates(session)
-            now = utcnow()
             chosen: list[tuple[str, str]] = []
             for job in candidates:
                 if len(chosen) >= available or job.project_id in local_projects:
-                    continue
-                # A leased sibling means another process already owns this
-                # project's serial execution slot.
-                sibling = session.scalar(
-                    select(type(job).id).where(
-                        type(job).project_id == job.project_id,
-                        type(job).id != job.id,
-                        type(job).lease_owner.is_not(None),
-                        type(job).lease_expires_at > now,
-                        type(job).state.notin_(TERMINAL_JOB_STATES),
-                    )
-                )
-                if sibling is not None:
                     continue
                 chosen.append((str(job.id), str(job.project_id)))
                 local_projects.add(str(job.project_id))
@@ -323,7 +349,7 @@ class DurableTaskRunner:
 
 
 def default_worker_count(database_url: str) -> int:
-    return 2 if str(database_url).lower().startswith("mysql") else 1
+    return 4 if str(database_url).strip().lower().startswith("mysql") else 1
 
 
 __all__ = ["DurableTaskRunner", "default_worker_count"]

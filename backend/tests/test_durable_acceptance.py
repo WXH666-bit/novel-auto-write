@@ -36,7 +36,7 @@ from backend.app.services.providers import (
     ProviderResponse,
     StructuredOutputError,
 )
-from backend.app.services.tasks import DurableTaskRunner
+from backend.app.services.tasks import DurableTaskRunner, default_worker_count
 from backend.tests.helpers import authenticate_client, install_fake_provider, seed_tenant
 
 
@@ -277,6 +277,68 @@ def test_durable_runner_serializes_one_project_and_dispatches_each_job_once(
             for row in db.scalars(select(models.Job).where(models.Job.id.in_([first_id, second_id]))).all()
         }
     assert states == {first_id: "completed", second_id: "completed"}
+
+
+def test_durable_runner_uses_workers_across_projects_without_queue_starvation(
+    store: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _engine, factory = store
+    with factory() as db:
+        user, _profile = seed_tenant(db)
+        crowded_project = _project(db, user.id, "排队较多的小说")
+        other_project = _project(db, user.id, "应并行的小说")
+        crowded_jobs: list[models.Job] = []
+        base_time = models.utcnow() - timedelta(minutes=1)
+        for index in range(12):
+            crowded_jobs.append(
+                models.Job(
+                    project_id=crowded_project.id,
+                    idempotency_key=f"crowded-{index}",
+                    kind="generation",
+                    state="queued",
+                    created_at=base_time + timedelta(seconds=index),
+                )
+            )
+        other_job = models.Job(
+            project_id=other_project.id,
+            idempotency_key="other-project",
+            kind="generation",
+            state="queued",
+            created_at=base_time + timedelta(seconds=30),
+        )
+        db.add_all([*crowded_jobs, other_job])
+        db.commit()
+        expected_ids = {crowded_jobs[0].id, other_job.id}
+
+    dispatched: list[str] = []
+    dispatched_lock = threading.Lock()
+    both_started = threading.Event()
+    release = threading.Event()
+
+    def fake_dispatch(_session: Any, job_id: str) -> None:
+        with dispatched_lock:
+            dispatched.append(job_id)
+            if len(dispatched) == 2:
+                both_started.set()
+        release.wait(timeout=3)
+
+    monkeypatch.setattr(DurableTaskRunner, "_dispatch", staticmethod(fake_dispatch))
+    runner = DurableTaskRunner(factory, workers=2)
+    try:
+        # Only the oldest runnable job from each project is selected.  A large
+        # backlog for one novel must not consume the candidate query's LIMIT.
+        assert runner.run_once() == 2
+        assert both_started.wait(timeout=2)
+        assert set(dispatched) == expected_ids
+        assert runner.run_once() == 0
+    finally:
+        release.set()
+        runner.stop()
+
+
+def test_default_worker_count_parallelizes_mysql_only() -> None:
+    assert default_worker_count(" mysql+pymysql://novel:test@db/novel ") == 4
+    assert default_worker_count("sqlite:///data/novel.sqlite3") == 1
 
 
 def test_durable_runner_recovers_expired_lease_and_linked_memory_run(store: tuple[Any, Any]) -> None:

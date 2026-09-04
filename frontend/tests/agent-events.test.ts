@@ -130,6 +130,23 @@ describe("assistant event protocol", () => {
     expect(event.run_id).toBe("run-live");
   });
 
+  it("normalizes discarded previews so a retry can remove stale writing cards", () => {
+    const event = normalizeAssistantEvent({
+      sequence: 13,
+      run_id: "run-live",
+      event_type: "proposal.discarded",
+      payload_json: {
+        proposal_ids: ["proposal-old-1", "proposal-old-2"],
+        reason: "retry_reset",
+      },
+    });
+
+    expect(event).toMatchObject({
+      type: "proposal_discarded",
+      proposal_ids: ["proposal-old-1", "proposal-old-2"],
+    });
+  });
+
   it("inherits outer metadata when proposal.created nests a partial proposal", () => {
     const event = normalizeAssistantEvent({
       sequence: 8,

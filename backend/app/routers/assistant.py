@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -593,6 +593,8 @@ def _wire_event_type(event_type: str) -> str:
         "proposal_patch": "proposal.patch",
         "proposal.ready": "proposal.ready",
         "proposal_ready": "proposal.ready",
+        "proposal.discarded": "proposal.discarded",
+        "proposal_discarded": "proposal.discarded",
     }.get(event_type, event_type)
 
 
@@ -995,14 +997,22 @@ def list_proposals(
     db: Session = Depends(get_db),
 ) -> list[ProposalRead]:
     project = require_project(db, project_id, current_user)
-    query = select(Proposal).where(Proposal.project_id == project.id)
+    query = (
+        select(Proposal)
+        .join(ChangeSet, ChangeSet.id == Proposal.change_set_id)
+        .outerjoin(AgentRun, AgentRun.id == ChangeSet.source_id)
+        .where(
+            Proposal.project_id == project.id,
+            or_(
+                Proposal.status != "building",
+                ChangeSet.source_type != "assistant",
+                AgentRun.status == "running",
+            ),
+        )
+    )
     if conversation_id:
         _conversation(db, project, conversation_id)
-        query = (
-            query.join(ChangeSet, ChangeSet.id == Proposal.change_set_id)
-            .join(AgentRun, AgentRun.id == ChangeSet.source_id)
-            .where(AgentRun.conversation_id == conversation_id)
-        )
+        query = query.where(AgentRun.conversation_id == conversation_id)
     if status_filter:
         query = query.where(Proposal.status == status_filter)
     rows = db.scalars(query.order_by(Proposal.created_at.desc())).all()

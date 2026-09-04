@@ -498,6 +498,10 @@ export type AssistantEvent =
     })
   | (AssistantEventMeta & { type: "proposal_completed"; proposal_id: string })
   | (AssistantEventMeta & {
+      type: "proposal_discarded";
+      proposal_ids: string[];
+    })
+  | (AssistantEventMeta & {
       type: "status";
       status: AgentRunStatus;
       stage?: string;

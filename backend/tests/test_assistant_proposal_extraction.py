@@ -736,6 +736,86 @@ def test_chapter_reply_fallback_requires_explicit_write_intent() -> None:
     ) == []
 
 
+def test_server_recognises_chapter_write_wording_without_client_flag() -> None:
+    assert assistant_service._message_requests_chapter_write(
+        "以我的二十个六岁女房客为主题创造第一章"
+    )
+    assert assistant_service._message_requests_chapter_write("请撰写序章")
+    assert not assistant_service._message_requests_chapter_write("帮我分析第一章的节奏")
+    assert not assistant_service._message_requests_chapter_write("先创建三个人物卡")
+    assert assistant_service._chapter_numbers_in_message("改写第一百零二章") == [102]
+    assert assistant_service._chapter_numbers_in_message("调整第2章与第二章") == [2]
+
+
+def test_retry_discards_building_proposals_and_emits_cleanup_event(store: Any) -> None:
+    with store() as db:
+        user, _profile = seed_tenant(db)
+        project = models.Project(owner_id=user.id, name="重试清理")
+        db.add(project)
+        db.flush()
+        conversation = models.AgentConversation(
+            project_id=project.id,
+            created_by_user_id=user.id,
+        )
+        db.add(conversation)
+        db.flush()
+        run = models.AgentRun(
+            project_id=project.id,
+            conversation_id=conversation.id,
+            idempotency_key="retry-cleanup",
+            status="running",
+            stage="calling_model",
+            input_snapshot={"attempt": 2},
+        )
+        db.add(run)
+        db.flush()
+        change_set = models.ChangeSet(
+            project_id=project.id,
+            source_type="assistant",
+            source_id=run.id,
+            status="building",
+            summary="未完成的预览",
+            created_by_user_id=user.id,
+        )
+        db.add(change_set)
+        db.flush()
+        proposal = models.Proposal(
+            project_id=project.id,
+            change_set_id=change_set.id,
+            operation="create_character",
+            target_type="character",
+            patch_json={"name": "临时人物"},
+            status="building",
+            created_by_user_id=user.id,
+        )
+        db.add(proposal)
+        db.commit()
+
+        discarded = assistant_service._discard_incomplete_run_proposals(
+            db,
+            conversation,
+            run,
+            reason="retry_reset",
+        )
+        db.commit()
+
+        db.refresh(change_set)
+        db.refresh(proposal)
+        event = db.scalar(
+            select(models.AgentEvent).where(
+                models.AgentEvent.conversation_id == conversation.id,
+                models.AgentEvent.event_type == "proposal.discarded",
+            )
+        )
+        assert discarded == [proposal.id]
+        assert proposal.status == "rejected"
+        assert proposal.resolved_at is not None
+        assert change_set.status == "rejected"
+        assert change_set.rejected_at is not None
+        assert event is not None
+        assert event.payload_json["proposal_ids"] == [proposal.id]
+
+
 def test_chapter_work_report_is_never_treated_as_prose() -> None:
     assert assistant_service._chapter_reply_is_work_report(
         "已按照设定完成第一章，内容符合开篇定位。"
@@ -745,7 +825,7 @@ def test_chapter_work_report_is_never_treated_as_prose() -> None:
     )
 
 
-def test_write_intent_persists_provider_prose_as_blank_chapter_draft(
+def test_server_inferred_write_intent_persists_provider_prose_as_blank_chapter_draft(
     store: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prose = "钟声响过三次，少年推开了无人值守的城门。"
@@ -783,6 +863,7 @@ def test_write_intent_persists_provider_prose_as_blank_chapter_draft(
             project_id=project.id,
             created_by_user_id=user.id,
             provider_profile_id=profile.id,
+            purpose="global_story",
         )
         db.add(conversation)
         db.commit()
@@ -790,13 +871,10 @@ def test_write_intent_persists_provider_prose_as_blank_chapter_draft(
             db,
             conversation,
             user,
-            "给我写第一章",
+            "以我的二十个六岁女房客为主题创造第一章",
             idempotency_key="chapter-prose-fallback",
-            target={"type": "chapter", "id": chapter.id, "chapter_id": chapter.id},
-            context_snapshot={
-                "chapter_id": chapter.id,
-                "agent_write_intent": True,
-            },
+            target={"type": "project", "id": project.id},
+            context_snapshot={},
         )
 
         assistant_service.execute_agent_run(db, run.id)

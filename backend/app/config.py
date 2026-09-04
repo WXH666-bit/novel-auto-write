@@ -25,10 +25,18 @@ def _database_url() -> str:
 
 DATABASE_URL = _database_url()
 JOB_WORKERS = int(
-    os.getenv("NOVEL_JOB_WORKERS", "2" if DATABASE_URL.startswith("mysql") else "1")
+    # Remote model calls are I/O-bound, so a small thread pool improves MySQL
+    # throughput without tying the default to the host's CPU count.  SQLite
+    # remains single-worker because its write lock is database-wide.
+    os.getenv(
+        "NOVEL_JOB_WORKERS",
+        "4" if DATABASE_URL.strip().lower().startswith("mysql") else "1",
+    )
 )
 if JOB_WORKERS < 1:
     raise ValueError("NOVEL_JOB_WORKERS 必须至少为 1")
+if JOB_WORKERS > 32:
+    raise ValueError("NOVEL_JOB_WORKERS 不能超过 32")
 APP_HOST = os.getenv("NOVEL_HOST", "127.0.0.1")
 APP_PORT = int(os.getenv("NOVEL_PORT", "8000"))
 DEBUG = os.getenv("NOVEL_DEBUG", "0").lower() in {"1", "true", "yes", "on"}

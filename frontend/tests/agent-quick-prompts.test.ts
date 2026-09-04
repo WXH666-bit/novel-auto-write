@@ -161,6 +161,10 @@ describe("automatic Agent manuscript drafts", () => {
       .toBe(true);
     expect(shouldAutoCreateChapterDraft("续写这一章的正文"))
       .toBe(true);
+    expect(shouldAutoCreateChapterDraft("以我的二十个六岁女房客为主题创造第一章"))
+      .toBe(true);
+    expect(shouldAutoCreateChapterDraft("撰写序章"))
+      .toBe(true);
     expect(shouldAutoCreateChapterDraft("帮我分析第一章的节奏"))
       .toBe(false);
     expect(shouldAutoCreateChapterDraft("先设计两个人物"))

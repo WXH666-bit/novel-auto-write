@@ -120,6 +120,8 @@ data/
 
 生产必须设置 `NOVEL_ENV=production`、`NOVEL_AUTH_MODE=email` 或 `NOVEL_AUTH_MODE=username`、HTTPS 的公开地址、可信 Host、精确 CORS 来源和安全 Cookie。邮箱模式还必须配置 SMTP；用户名模式不会调用邮件服务。Linux 凭据库使用 Secret Service，服务必须以固定账号运行并拥有可用的 DBus/Secret Service 会话。多应用节点不在首版范围内；扩容前需把凭据迁移到外部 Secrets Manager。
 
+MySQL 默认启用 4 个后台任务 Worker：不同小说可并行调用模型和落库，同一本小说始终按任务创建顺序串行，避免正文、图谱和摘要互相覆盖。可用 `NOVEL_JOB_WORKERS` 在 1–32 之间调整；模型接口限流时应调低。默认数据库连接池为 `NOVEL_DB_POOL_SIZE=10`、`NOVEL_DB_MAX_OVERFLOW=20`，调高 Worker 时应至少为 Web 请求和 SSE 额外预留 4 个连接。SQLite 固定建议使用 1 个 Worker。
+
 执行数据库迁移：
 
 ```bash
